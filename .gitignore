@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Local scratch/generated files
+/tmp/
+
+# IDE and editor settings
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and crash dumps
+*.log
+*.log.old
+*.dmp
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Windows build artifacts emitted outside target/
+*.pdb
+*.ilk
+*.exp

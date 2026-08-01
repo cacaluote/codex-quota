@@ -16,6 +16,8 @@ pub enum AppError {
     Authentication(String),
     #[error("等待 Codex app-server 响应超时")]
     Timeout,
+    #[error("Codex app-server 操作已取消")]
+    Cancelled,
     #[error("Windows 操作失败：{0}")]
     Windows(String),
     #[error("渲染失败：{0}")]

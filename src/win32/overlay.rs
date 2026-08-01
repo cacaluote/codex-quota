@@ -1,0 +1,278 @@
+use std::time::Instant;
+
+use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, KillTimer, SetTimer};
+
+use super::layout::{
+    PanelAnimation, anchored_destination, animation_shape_rect, dip_to_px, expanded_destination,
+    monitor_info, px_to_dip,
+};
+use super::renderer::{TransitionVisual, VisualState};
+use super::{
+    ANIMATION_FRAME_MILLIS, AppWindow, COLLAPSE_ANIMATION_DURATION, COLLAPSED_DIP,
+    EXPAND_ANIMATION_DURATION, PANEL_HEIGHT_DIP, PANEL_WIDTH_DIP, TIMER_ANIMATION,
+};
+use crate::error::AppError;
+
+impl AppWindow {
+    pub(super) fn desired_size(&self) -> (i32, i32) {
+        if self.expanded {
+            (
+                dip_to_px(PANEL_WIDTH_DIP, self.dpi),
+                dip_to_px(PANEL_HEIGHT_DIP, self.dpi),
+            )
+        } else {
+            let side = dip_to_px(COLLAPSED_DIP, self.dpi);
+            (side, side)
+        }
+    }
+
+    pub(super) fn render(&mut self) -> Result<(), AppError> {
+        if !self.overlay_active {
+            return Ok(());
+        }
+        if self.animation.is_some() {
+            return self.render_animation_frame(Instant::now());
+        }
+        let mut rect = RECT::default();
+        // SAFETY: hwnd is live while AppWindow is reachable from the window procedure.
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        self.render_at(
+            POINT {
+                x: rect.left,
+                y: rect.top,
+            },
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
+    }
+
+    pub(super) fn render_at(
+        &mut self,
+        destination: POINT,
+        width: i32,
+        height: i32,
+    ) -> Result<(), AppError> {
+        let visual = if self.expanded {
+            VisualState::Expanded
+        } else {
+            VisualState::Collapsed
+        };
+        self.render_at_visual(destination, width, height, visual)
+    }
+
+    fn render_at_visual(
+        &mut self,
+        destination: POINT,
+        width: i32,
+        height: i32,
+        visual: VisualState,
+    ) -> Result<(), AppError> {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.resize(width, height, self.dpi)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppError::Render("额度状态锁已损坏".to_owned()))?
+                .clone();
+            renderer.render(self.hwnd, destination, visual, &state)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn render_animation_frame(&mut self, now: Instant) -> Result<(), AppError> {
+        let Some(animation) = self.animation else {
+            return self.render();
+        };
+        let sample = animation.sample(now);
+        let shape = animation_shape_rect(
+            animation,
+            sample.expansion,
+            self.dpi,
+            self.config.placement.edge,
+            self.expansion_alignment,
+        );
+        let width = dip_to_px(PANEL_WIDTH_DIP, self.dpi);
+        let height = dip_to_px(PANEL_HEIGHT_DIP, self.dpi);
+        let ball_center = (
+            px_to_dip(
+                animation.ball_center_screen.x - animation.canvas_destination.x,
+                self.dpi,
+            ),
+            px_to_dip(
+                animation.ball_center_screen.y - animation.canvas_destination.y,
+                self.dpi,
+            ),
+        );
+        let shape_bounds = (
+            px_to_dip(shape.left - animation.canvas_destination.x, self.dpi),
+            px_to_dip(shape.top - animation.canvas_destination.y, self.dpi),
+            px_to_dip(shape.right - animation.canvas_destination.x, self.dpi),
+            px_to_dip(shape.bottom - animation.canvas_destination.y, self.dpi),
+        );
+        self.render_at_visual(
+            animation.canvas_destination,
+            width,
+            height,
+            VisualState::Transition(TransitionVisual {
+                expansion: sample.expansion,
+                ball_opacity: sample.ball_opacity,
+                panel_opacity: sample.panel_opacity,
+                ball_center,
+                shape_bounds,
+            }),
+        )?;
+
+        if sample.finished {
+            self.stop_animation_timer();
+            self.animation = None;
+            self.resize_for_state()?;
+            self.update_outside_click_hook();
+        }
+        Ok(())
+    }
+
+    pub(super) fn resize_for_state(&mut self) -> Result<(), AppError> {
+        let mut rect = RECT::default();
+        // SAFETY: hwnd is live and rect is writable.
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        let (width, height) = self.desired_size();
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let work = monitor_info(monitor)?.info.monitorInfo.rcWork;
+        let is_size_transition =
+            rect.right - rect.left != width || rect.bottom - rect.top != height;
+        let destination = if self.expanded && is_size_transition {
+            let (destination, alignment) =
+                expanded_destination(rect, self.config.placement.edge, width, height, work);
+            self.expansion_alignment = alignment;
+            destination
+        } else {
+            anchored_destination(
+                rect,
+                self.config.placement.edge,
+                width,
+                height,
+                work,
+                self.expansion_alignment,
+            )
+        };
+        // UpdateLayeredWindow commits the new pixels, position, and size together. Calling
+        // SetWindowPos first exposes the old 56-DIP bitmap for one compositor frame.
+        self.render_at(destination, width, height)
+    }
+
+    pub(super) fn toggle_expanded(&mut self) -> Result<(), AppError> {
+        self.set_expanded(!self.expanded)
+    }
+
+    pub(super) fn set_expanded(&mut self, expanded: bool) -> Result<(), AppError> {
+        if !self.overlay_active {
+            return Ok(());
+        }
+        if self.animation.is_some() {
+            self.finish_animation()?;
+        }
+        if self.expanded == expanded {
+            return Ok(());
+        }
+        self.expanded = expanded;
+        self.remove_outside_click_hook();
+        if self.animations_enabled && self.visible {
+            return self.start_animation(expanded);
+        }
+        let result = self.resize_for_state();
+        self.update_outside_click_hook();
+        result
+    }
+
+    fn start_animation(&mut self, expanding: bool) -> Result<(), AppError> {
+        let mut rect = RECT::default();
+        // SAFETY: hwnd is live and rect is writable.
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let work_area = monitor_info(monitor)?.info.monitorInfo.rcWork;
+        let canvas_destination = if expanding {
+            let width = dip_to_px(PANEL_WIDTH_DIP, self.dpi);
+            let height = dip_to_px(PANEL_HEIGHT_DIP, self.dpi);
+            let (destination, alignment) =
+                expanded_destination(rect, self.config.placement.edge, width, height, work_area);
+            self.expansion_alignment = alignment;
+            destination
+        } else {
+            POINT {
+                x: rect.left,
+                y: rect.top,
+            }
+        };
+
+        let side = dip_to_px(COLLAPSED_DIP, self.dpi);
+        let ball_center_screen = if expanding {
+            POINT {
+                x: rect.left + (rect.right - rect.left) / 2,
+                y: rect.top + (rect.bottom - rect.top) / 2,
+            }
+        } else {
+            let destination = anchored_destination(
+                rect,
+                self.config.placement.edge,
+                side,
+                side,
+                work_area,
+                self.expansion_alignment,
+            );
+            POINT {
+                x: destination.x + side / 2,
+                y: destination.y + side / 2,
+            }
+        };
+        self.animation = Some(PanelAnimation {
+            started_at: Instant::now(),
+            duration: if expanding {
+                EXPAND_ANIMATION_DURATION
+            } else {
+                COLLAPSE_ANIMATION_DURATION
+            },
+            anchor_rect: rect,
+            work_area,
+            canvas_destination,
+            ball_center_screen,
+            expanding,
+        });
+        // SAFETY: the HWND timer is UI-thread-owned and is stopped at animation completion.
+        if unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                TIMER_ANIMATION,
+                ANIMATION_FRAME_MILLIS,
+                None,
+            )
+        } == 0
+        {
+            self.animation = None;
+            crate::logging::log("无法创建面板动画计时器，已改用即时切换");
+            let result = self.resize_for_state();
+            self.update_outside_click_hook();
+            return result;
+        }
+        self.render_animation_frame(Instant::now())
+    }
+
+    pub(super) fn finish_animation(&mut self) -> Result<(), AppError> {
+        if self.animation.is_none() {
+            return Ok(());
+        }
+        self.stop_animation_timer();
+        self.animation = None;
+        let result = self.resize_for_state();
+        self.update_outside_click_hook();
+        result
+    }
+
+    pub(super) fn stop_animation_timer(&self) {
+        if !self.hwnd.is_invalid() {
+            // SAFETY: removes only this window's fixed animation timer ID.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_ANIMATION) };
+        }
+    }
+}

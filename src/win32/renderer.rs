@@ -7,9 +7,9 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-use windows::Win32::Foundation::{FILETIME, HWND, POINT, RECT, SIZE, SYSTEMTIME};
+use windows::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW,
     D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
@@ -34,13 +34,16 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
     HGDIOBJ, SelectObject,
 };
-use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
+use super::presentation::{
+    PlanColor, classify_quota_windows, format_local_timestamp, format_today_token_usage,
+    panel_title, plan_type_color, plan_type_label,
+};
 use crate::error::AppError;
-use crate::quota::{AppState, ConnectionStatus, QuotaColor, QuotaSnapshot, QuotaWindow};
+use crate::quota::{AppState, QuotaColor, QuotaWindow};
 
 const BACKGROUND: D2D1_COLOR_F = rgba(0x12, 0x17, 0x20, 0.94);
 const TRACK: D2D1_COLOR_F = rgba(0x42, 0x4a, 0x57, 0.88);
@@ -73,17 +76,6 @@ pub(super) struct TransitionVisual {
     pub panel_opacity: f32,
     pub ball_center: (f32, f32),
     pub shape_bounds: (f32, f32, f32, f32),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlanColor {
-    Neutral,
-    Plus,
-    Pro,
-    Business,
-    Enterprise,
-    Edu,
-    Unknown,
 }
 
 const fn rgba(red: u8, green: u8, blue: u8, alpha: f32) -> D2D1_COLOR_F {
@@ -373,13 +365,7 @@ impl Renderer {
         let scale = self.dpi as f32 / 96.0;
         let width = self.surface.width as f32 / scale;
 
-        let status = match &state.status {
-            ConnectionStatus::Connecting => "正在连接 Codex",
-            ConnectionStatus::Online => "Codex 额度",
-            ConnectionStatus::Reconnecting { .. } => "正在重新连接",
-            ConnectionStatus::Error { .. } => "Codex 暂不可用",
-        };
-        let plan_type = state.plan_type.as_deref();
+        let (status, plan_type) = panel_title(state);
         self.draw_text_with_opacity(
             status,
             &self.title_format,
@@ -388,7 +374,7 @@ impl Renderer {
                 left: 18.0,
                 top: 14.0,
                 right: if plan_type.is_some() {
-                    width - 116.0
+                    64.0
                 } else {
                     width - 18.0
                 },
@@ -399,10 +385,10 @@ impl Renderer {
         if let Some(plan_type) = plan_type {
             self.draw_text_with_opacity(
                 plan_type_label(plan_type),
-                &self.body_format,
+                &self.title_format,
                 self.brush_for_plan_type(plan_type),
                 D2D_RECT_F {
-                    left: width - 106.0,
+                    left: 64.0,
                     top: 14.0,
                     right: width - 18.0,
                     bottom: 36.0,
@@ -417,7 +403,8 @@ impl Renderer {
             .map_or((None, None), classify_quota_windows);
         self.draw_quota_row("5h额度", five_hour, 42.0, width, opacity);
         self.draw_quota_row("周额度", weekly, 69.0, width, opacity);
-        self.draw_update_row(state, 98.0, width, opacity);
+        self.draw_today_tokens_row(state.today_tokens, 96.0, width, opacity);
+        self.draw_update_row(state, 125.0, width, opacity);
     }
 
     fn draw_quota_row(
@@ -446,7 +433,7 @@ impl Renderer {
                 &self.body_format,
                 &self.brushes.unknown,
                 D2D_RECT_F {
-                    left: 96.0,
+                    left: TIME_COLUMN_LEFT,
                     top,
                     right: width - 18.0,
                     bottom: top + 23.0,
@@ -513,6 +500,37 @@ impl Renderer {
                 &self.brushes.yellow
             } else {
                 &self.brushes.secondary_text
+            },
+            D2D_RECT_F {
+                left: TIME_COLUMN_LEFT,
+                top,
+                right: width - 18.0,
+                bottom: top + 23.0,
+            },
+            opacity,
+        );
+    }
+
+    fn draw_today_tokens_row(&self, today_tokens: Option<u64>, top: f32, width: f32, opacity: f32) {
+        self.draw_text_with_opacity(
+            "今日使用",
+            &self.body_format,
+            &self.brushes.secondary_text,
+            D2D_RECT_F {
+                left: 18.0,
+                top,
+                right: TIME_COLUMN_LEFT,
+                bottom: top + 23.0,
+            },
+            opacity,
+        );
+        self.draw_text_with_opacity(
+            &format_today_token_usage(today_tokens),
+            &self.body_format,
+            if today_tokens.is_some() {
+                &self.brushes.secondary_text
+            } else {
+                &self.brushes.unknown
             },
             D2D_RECT_F {
                 left: TIME_COLUMN_LEFT,
@@ -811,167 +829,4 @@ impl Drop for DibSurface {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
-}
-
-fn classify_quota_windows(
-    snapshot: &QuotaSnapshot,
-) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
-    let primary = &snapshot.primary;
-    let Some(secondary) = snapshot.secondary.as_ref() else {
-        return if primary.window_duration <= Duration::from_hours(24) {
-            (Some(primary), None)
-        } else {
-            (None, Some(primary))
-        };
-    };
-    if primary.window_duration <= secondary.window_duration {
-        (Some(primary), Some(secondary))
-    } else {
-        (Some(secondary), Some(primary))
-    }
-}
-
-fn format_local_timestamp(time: SystemTime) -> String {
-    try_format_local_timestamp(time).unwrap_or_else(|| "--".to_owned())
-}
-
-fn try_format_local_timestamp(time: SystemTime) -> Option<String> {
-    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
-    const TICKS_PER_SECOND: u64 = 10_000_000;
-
-    let duration = time.duration_since(UNIX_EPOCH).ok()?;
-    let ticks = duration
-        .as_secs()
-        .checked_add(WINDOWS_EPOCH_OFFSET_SECONDS)?
-        .checked_mul(TICKS_PER_SECOND)?
-        .checked_add(u64::from(duration.subsec_nanos()) / 100)?;
-    let file_time = FILETIME {
-        dwLowDateTime: u32::try_from(ticks & u64::from(u32::MAX)).ok()?,
-        dwHighDateTime: u32::try_from(ticks >> 32).ok()?,
-    };
-    let mut utc = SYSTEMTIME::default();
-    let mut local = SYSTEMTIME::default();
-    // SAFETY: both output structures are initialized and exclusively borrowed for their calls.
-    unsafe {
-        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
-        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
-    }
-    Some(format_calendar_time(&local))
-}
-
-fn format_calendar_time(time: &SYSTEMTIME) -> String {
-    format!(
-        "{:02}/{:02} {:02}:{:02}",
-        time.wMonth, time.wDay, time.wHour, time.wMinute
-    )
-}
-
-fn plan_type_label(plan_type: &str) -> &str {
-    match plan_type {
-        "free" => "Free",
-        "go" => "Go",
-        "plus" => "Plus",
-        "pro" => "Pro",
-        "prolite" => "Pro Lite",
-        "team" => "Team",
-        "self_serve_business_usage_based" | "business" => "Business",
-        "ent26" | "enterprise_cbp_usage_based" | "enterprise" => "Enterprise",
-        "edu" => "Edu",
-        "unknown" => "未知方案",
-        value => value,
-    }
-}
-
-fn plan_type_color(plan_type: &str) -> PlanColor {
-    match plan_type {
-        "free" | "go" => PlanColor::Neutral,
-        "plus" => PlanColor::Plus,
-        "pro" | "prolite" => PlanColor::Pro,
-        "team" | "self_serve_business_usage_based" | "business" => PlanColor::Business,
-        "ent26" | "enterprise_cbp_usage_based" | "enterprise" => PlanColor::Enterprise,
-        "edu" => PlanColor::Edu,
-        _ => PlanColor::Unknown,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn window(duration: Duration) -> QuotaWindow {
-        QuotaWindow {
-            used_percent: 10.0,
-            window_duration: duration,
-            resets_at: UNIX_EPOCH,
-        }
-    }
-
-    #[test]
-    fn calendar_time_omits_year_and_seconds() {
-        let value = format_calendar_time(&SYSTEMTIME {
-            wYear: 2026,
-            wMonth: 8,
-            wDay: 6,
-            wHour: 0,
-            wMinute: 1,
-            wSecond: 2,
-            ..Default::default()
-        });
-        assert_eq!(value, "08/06 00:01");
-    }
-
-    #[test]
-    fn plan_type_uses_friendly_pro_label() {
-        assert_eq!(plan_type_label("pro"), "Pro");
-    }
-
-    #[test]
-    fn usage_based_business_plan_uses_short_label() {
-        assert_eq!(
-            plan_type_label("self_serve_business_usage_based"),
-            "Business"
-        );
-    }
-
-    #[test]
-    fn plus_plan_uses_blue_accent() {
-        assert_eq!(plan_type_color("plus"), PlanColor::Plus);
-    }
-
-    #[test]
-    fn enterprise_alias_uses_enterprise_accent() {
-        assert_eq!(plan_type_color("ent26"), PlanColor::Enterprise);
-    }
-
-    #[test]
-    fn unrecognized_plan_uses_unknown_accent() {
-        assert_eq!(plan_type_color("future_plan"), PlanColor::Unknown);
-    }
-
-    #[test]
-    fn lone_weekly_window_leaves_five_hour_slot_empty() {
-        let snapshot = QuotaSnapshot {
-            limit_id: "codex".to_owned(),
-            primary: window(Duration::from_hours(168)),
-            secondary: None,
-            received_at: UNIX_EPOCH,
-        };
-        let (five_hour, weekly) = classify_quota_windows(&snapshot);
-        assert!(five_hour.is_none() && weekly.is_some());
-    }
-
-    #[test]
-    fn shorter_window_is_classified_as_five_hour_quota() {
-        let snapshot = QuotaSnapshot {
-            limit_id: "codex".to_owned(),
-            primary: window(Duration::from_hours(168)),
-            secondary: Some(window(Duration::from_hours(5))),
-            received_at: UNIX_EPOCH,
-        };
-        let (five_hour, weekly) = classify_quota_windows(&snapshot);
-        assert!(
-            five_hour.is_some_and(|value| value.window_duration == Duration::from_hours(5))
-                && weekly.is_some_and(|value| value.window_duration == Duration::from_hours(168))
-        );
-    }
 }

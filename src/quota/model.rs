@@ -67,6 +67,7 @@ pub struct AppState {
     pub status: ConnectionStatus,
     pub snapshot: Option<QuotaSnapshot>,
     pub plan_type: Option<String>,
+    pub today_tokens: Option<u64>,
     pub last_error: Option<String>,
     pub quota_refresh_interval: Duration,
 }
@@ -77,6 +78,7 @@ impl Default for AppState {
             status: ConnectionStatus::Connecting,
             snapshot: None,
             plan_type: None,
+            today_tokens: None,
             last_error: None,
             quota_refresh_interval: Duration::from_mins(5),
         }

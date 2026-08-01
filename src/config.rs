@@ -47,11 +47,16 @@ impl Default for WindowPlacement {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these booleans are independent persisted user-facing switches"
+)]
 pub struct AppConfigV1 {
     pub version: u32,
     pub placement: WindowPlacement,
     pub always_on_top: bool,
     pub start_with_windows: bool,
+    pub follow_codex: bool,
     pub collapse_on_outside_click: bool,
     pub quota_refresh_interval_secs: u64,
 }
@@ -63,6 +68,7 @@ impl Default for AppConfigV1 {
             placement: WindowPlacement::default(),
             always_on_top: true,
             start_with_windows: false,
+            follow_codex: false,
             collapse_on_outside_click: true,
             quota_refresh_interval_secs: DEFAULT_QUOTA_REFRESH_INTERVAL_SECS,
         }
@@ -235,6 +241,23 @@ mod tests {
             config.ok().map(|value| value.collapse_on_outside_click),
             Some(true)
         );
+    }
+
+    #[test]
+    fn legacy_config_disables_follow_codex_by_default() {
+        let config = serde_json::from_str::<AppConfigV1>(
+            r#"{
+                "version": 1,
+                "placement": {
+                    "monitor_device": "",
+                    "edge": "right",
+                    "offset_dip": 96.0
+                },
+                "always_on_top": true,
+                "start_with_windows": false
+            }"#,
+        );
+        assert_eq!(config.ok().map(|value| value.follow_codex), Some(false));
     }
 
     #[test]

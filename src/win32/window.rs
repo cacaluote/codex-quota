@@ -153,18 +153,21 @@ impl AppWindow {
         self.presence_generation = self.presence_generation.wrapping_add(1);
         let generation = self.presence_generation;
         let notify_hwnd = self.hwnd.0 as usize;
-        self.presence_watcher = Some(CodexPresenceWatcher::spawn(move |present| {
-            let target = HWND(notify_hwnd as *mut c_void);
-            // SAFETY: the message carries only scalar state and a generation number.
-            let _ = unsafe {
-                PostMessageW(
-                    Some(target),
-                    WM_APP_PRESENCE_CHANGED,
-                    WPARAM(usize::from(present)),
-                    LPARAM(generation as isize),
-                )
-            };
-        })?);
+        self.presence_watcher = Some(CodexPresenceWatcher::spawn(
+            self.config.follow_codex_check_interval(),
+            move |present| {
+                let target = HWND(notify_hwnd as *mut c_void);
+                // SAFETY: the message carries only scalar state and a generation number.
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(target),
+                        WM_APP_PRESENCE_CHANGED,
+                        WPARAM(usize::from(present)),
+                        LPARAM(generation as isize),
+                    )
+                };
+            },
+        )?);
         self.codex_present = false;
         Ok(())
     }
@@ -270,7 +273,7 @@ impl AppWindow {
             dwInfoFlags: NIIF_NONE,
             ..Default::default()
         };
-        copy_wide_fixed("Codex 额度", &mut data.szTip);
+        copy_wide_fixed("Codex Quota", &mut data.szTip);
         // SAFETY: data is fully initialized and remains alive for both shell calls.
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             return Err(AppError::Windows("无法添加托盘图标".to_owned()));

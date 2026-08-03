@@ -86,7 +86,7 @@ fn format_token_count(tokens: u64) -> String {
     }
 }
 
-pub(super) fn format_today_token_usage(tokens: Option<u64>) -> String {
+pub(super) fn format_token_usage(tokens: Option<u64>) -> String {
     tokens.map_or_else(
         || "--".to_owned(),
         |value| format!("{} Token", format_token_count(value)),
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn today_usage_appends_token_unit() {
-        assert_eq!(format_today_token_usage(Some(42_803_000)), "4280.3万 Token");
+        assert_eq!(format_token_usage(Some(42_803_000)), "4280.3万 Token");
     }
 
     #[test]

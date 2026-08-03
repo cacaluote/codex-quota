@@ -47,7 +47,14 @@ unsafe_op_in_unsafe_fn = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -2 }
 
+#[profile.release]
+#lto = "thin"
+#codegen-units = 1
+#strip = "symbols"
+
 [profile.release]
-lto = "thin"
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = "symbols"

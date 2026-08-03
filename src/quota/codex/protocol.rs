@@ -51,8 +51,15 @@ struct RawAccount {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawUsageReadResult {
+    summary: Option<RawUsageSummary>,
     #[serde(default)]
     daily_usage_buckets: Option<Vec<RawDailyUsageBucket>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawUsageSummary {
+    lifetime_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +67,12 @@ struct RawUsageReadResult {
 struct RawDailyUsageBucket {
     start_date: String,
     tokens: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TokenUsage {
+    pub(super) today: Option<u64>,
+    pub(super) lifetime: Option<u64>,
 }
 
 pub(super) fn parse_rate_limits_result(
@@ -97,14 +110,18 @@ pub(super) fn parse_account_result(value: Value) -> Result<Option<String>, AppEr
     Ok(result.account.and_then(|account| account.plan_type))
 }
 
-pub(super) fn parse_today_tokens(value: Value, today: &str) -> Result<Option<u64>, AppError> {
+pub(super) fn parse_token_usage(value: Value, today: &str) -> Result<TokenUsage, AppError> {
     let result: RawUsageReadResult = serde_json::from_value(value)?;
-    Ok(result.daily_usage_buckets.and_then(|buckets| {
+    let today = result.daily_usage_buckets.and_then(|buckets| {
         buckets
             .into_iter()
             .find(|bucket| bucket.start_date == today)
             .map(|bucket| bucket.tokens)
-    }))
+    });
+    Ok(TokenUsage {
+        today,
+        lifetime: result.summary.and_then(|summary| summary.lifetime_tokens),
+    })
 }
 
 pub(super) fn local_calendar_date() -> String {
@@ -271,8 +288,11 @@ mod tests {
         });
 
         assert_eq!(
-            parse_today_tokens(result, "2026-07-31").ok(),
-            Some(Some(67_890))
+            parse_token_usage(result, "2026-07-31").ok(),
+            Some(TokenUsage {
+                today: Some(67_890),
+                lifetime: Some(900_000),
+            })
         );
     }
 
@@ -284,7 +304,13 @@ mod tests {
             ]
         });
 
-        assert_eq!(parse_today_tokens(result, "2026-07-31").ok(), Some(None));
+        assert_eq!(
+            parse_token_usage(result, "2026-07-31").ok(),
+            Some(TokenUsage {
+                today: None,
+                lifetime: None,
+            })
+        );
     }
 
     #[test]
@@ -294,7 +320,13 @@ mod tests {
             "dailyUsageBuckets": null
         });
 
-        assert_eq!(parse_today_tokens(result, "2026-07-31").ok(), Some(None));
+        assert_eq!(
+            parse_token_usage(result, "2026-07-31").ok(),
+            Some(TokenUsage {
+                today: None,
+                lifetime: None,
+            })
+        );
     }
 
     #[test]

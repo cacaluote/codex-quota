@@ -11,7 +11,7 @@ use app_server::AppServerSession;
 pub(crate) use app_server::find_codex_executable;
 use protocol::{
     is_rate_limit_notification, local_calendar_date, parse_account_result,
-    parse_account_updated_notification, parse_rate_limits_result, parse_today_tokens,
+    parse_account_updated_notification, parse_rate_limits_result, parse_token_usage,
 };
 use serde_json::json;
 
@@ -255,8 +255,8 @@ where
         Ok(()) => Ok(()),
         Err(AppError::Cancelled) => Err(AppError::Cancelled),
         Err(error) => {
-            publish_today_tokens(state, None, notify);
-            crate::logging::log(&format!("无法读取今日 Token：{error}"));
+            publish_token_usage(state, None, None, notify);
+            crate::logging::log(&format!("无法读取 Token 用量：{error}"));
             Ok(())
         }
     }
@@ -303,8 +303,8 @@ where
         "id": id
     }))?;
     let result = session.wait_for_response(id, REQUEST_TIMEOUT)?;
-    let tokens = parse_today_tokens(result, &local_calendar_date())?;
-    publish_today_tokens(state, tokens, notify);
+    let usage = parse_token_usage(result, &local_calendar_date())?;
+    publish_token_usage(state, usage.today, usage.lifetime, notify);
     Ok(())
 }
 
@@ -339,12 +339,17 @@ where
     notify();
 }
 
-fn publish_today_tokens<F>(state: &Arc<Mutex<AppState>>, tokens: Option<u64>, notify: &Arc<F>)
-where
+fn publish_token_usage<F>(
+    state: &Arc<Mutex<AppState>>,
+    today: Option<u64>,
+    lifetime: Option<u64>,
+    notify: &Arc<F>,
+) where
     F: Fn() + Send + Sync + 'static,
 {
     if let Ok(mut current) = state.lock() {
-        current.today_tokens = tokens;
+        current.today_tokens = today;
+        current.lifetime_tokens = lifetime;
     }
     notify();
 }

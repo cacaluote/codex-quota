@@ -29,7 +29,6 @@ use crate::error::AppError;
 use crate::quota::find_codex_executable;
 
 const CODEX_APP_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
-const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const CLI_MINIMUM_LIFETIME: Duration = Duration::from_millis(800);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const CLI_PATH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -49,7 +48,7 @@ pub(crate) struct CodexPresenceWatcher {
 }
 
 impl CodexPresenceWatcher {
-    pub(crate) fn spawn<F>(notify: F) -> Result<Self, AppError>
+    pub(crate) fn spawn<F>(check_interval: Duration, notify: F) -> Result<Self, AppError>
     where
         F: Fn(bool) + Send + Sync + 'static,
     {
@@ -60,7 +59,9 @@ impl CodexPresenceWatcher {
         let worker_event = Arc::clone(&wake_event);
         let (command_tx, command_rx) = mpsc::channel();
         let notify = Arc::new(notify);
-        let join = thread::spawn(move || watcher_loop(&command_rx, &worker_event, &notify));
+        let join = thread::spawn(move || {
+            watcher_loop(&command_rx, &worker_event, check_interval, &notify);
+        });
         Ok(Self {
             command_tx,
             wake_event,
@@ -129,6 +130,7 @@ struct ResolvedCliPath {
 fn watcher_loop<F>(
     command_rx: &Receiver<WatcherCommand>,
     wake_event: &Arc<OwnedHandle>,
+    check_interval: Duration,
     notify: &Arc<F>,
 ) where
     F: Fn(bool) + Send + Sync + 'static,
@@ -159,7 +161,7 @@ fn watcher_loop<F>(
                     crate::logging::log(&format!("Codex 进程扫描失败：{error}"));
                     last_error_log = Some(now);
                 }
-                if wait_after_scan_error(command_rx) {
+                if wait_after_scan_error(command_rx, check_interval) {
                     return;
                 }
                 continue;
@@ -172,7 +174,13 @@ fn watcher_loop<F>(
                 notify(true);
                 published_presence = true;
             }
-            if wait_until_rescan(command_rx, wake_event, &scan.active_handles, None) {
+            if wait_until_rescan(
+                command_rx,
+                wake_event,
+                &scan.active_handles,
+                check_interval,
+                None,
+            ) {
                 return;
             }
             continue;
@@ -194,15 +202,12 @@ fn watcher_loop<F>(
             None
         };
 
-        let timeout = minimum_timeout(
-            grace_remaining,
-            scan.next_cli_activation,
-            IDLE_SCAN_INTERVAL,
-        );
+        let timeout = minimum_timeout(grace_remaining, scan.next_cli_activation, check_interval);
         if wait_until_rescan(
             command_rx,
             wake_event,
             &scan.pending_cli_handles,
+            check_interval,
             Some(timeout),
         ) {
             return;
@@ -220,8 +225,8 @@ fn should_shutdown(command_rx: &Receiver<WatcherCommand>) -> bool {
     }
 }
 
-fn wait_after_scan_error(command_rx: &Receiver<WatcherCommand>) -> bool {
-    match command_rx.recv_timeout(IDLE_SCAN_INTERVAL) {
+fn wait_after_scan_error(command_rx: &Receiver<WatcherCommand>, check_interval: Duration) -> bool {
+    match command_rx.recv_timeout(check_interval) {
         Ok(WatcherCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => true,
         Ok(WatcherCommand::Recheck) | Err(RecvTimeoutError::Timeout) => false,
     }
@@ -231,10 +236,11 @@ fn wait_until_rescan(
     command_rx: &Receiver<WatcherCommand>,
     wake_event: &OwnedHandle,
     process_handles: &[OwnedHandle],
+    check_interval: Duration,
     requested_timeout: Option<Duration>,
 ) -> bool {
     let timeout = if process_handles.len() > MAX_PROCESS_WAIT_HANDLES {
-        Some(requested_timeout.map_or(IDLE_SCAN_INTERVAL, |value| value.min(IDLE_SCAN_INTERVAL)))
+        Some(requested_timeout.map_or(check_interval, |value| value.min(check_interval)))
     } else {
         requested_timeout
     };
@@ -246,7 +252,7 @@ fn wait_until_rescan(
 
     if let Err(error) = wait_for_handles(wake_event, &handles, timeout) {
         crate::logging::log(&format!("等待 Codex 进程状态失败：{error}"));
-        return wait_after_scan_error(command_rx);
+        return wait_after_scan_error(command_rx, check_interval);
     }
     false
 }
@@ -582,9 +588,9 @@ mod tests {
     }
 
     #[test]
-    fn grace_period_wins_over_idle_interval_when_equal() {
+    fn grace_period_wins_over_configured_check_interval_when_equal() {
         assert_eq!(
-            minimum_timeout(Some(EXIT_GRACE_PERIOD), None, IDLE_SCAN_INTERVAL),
+            minimum_timeout(Some(EXIT_GRACE_PERIOD), None, Duration::from_secs(2)),
             EXIT_GRACE_PERIOD
         );
     }

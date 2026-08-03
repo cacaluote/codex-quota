@@ -39,8 +39,8 @@ use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
 use super::presentation::{
-    PlanColor, classify_quota_windows, format_local_timestamp, format_today_token_usage,
-    panel_title, plan_type_color, plan_type_label,
+    PlanColor, classify_quota_windows, format_local_timestamp, format_token_usage, panel_title,
+    plan_type_color, plan_type_label,
 };
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
@@ -403,8 +403,9 @@ impl Renderer {
             .map_or((None, None), classify_quota_windows);
         self.draw_quota_row("5h额度", five_hour, 42.0, width, opacity);
         self.draw_quota_row("周额度", weekly, 69.0, width, opacity);
-        self.draw_today_tokens_row(state.today_tokens, 96.0, width, opacity);
-        self.draw_update_row(state, 125.0, width, opacity);
+        self.draw_token_usage_row("今日使用", state.today_tokens, 96.0, width, opacity);
+        self.draw_token_usage_row("累计使用", state.lifetime_tokens, 123.0, width, opacity);
+        self.draw_update_row(state, 152.0, width, opacity);
     }
 
     fn draw_quota_row(
@@ -511,9 +512,16 @@ impl Renderer {
         );
     }
 
-    fn draw_today_tokens_row(&self, today_tokens: Option<u64>, top: f32, width: f32, opacity: f32) {
+    fn draw_token_usage_row(
+        &self,
+        label: &str,
+        tokens: Option<u64>,
+        top: f32,
+        width: f32,
+        opacity: f32,
+    ) {
         self.draw_text_with_opacity(
-            "今日使用",
+            label,
             &self.body_format,
             &self.brushes.secondary_text,
             D2D_RECT_F {
@@ -525,9 +533,9 @@ impl Renderer {
             opacity,
         );
         self.draw_text_with_opacity(
-            &format_today_token_usage(today_tokens),
+            &format_token_usage(tokens),
             &self.body_format,
-            if today_tokens.is_some() {
+            if tokens.is_some() {
                 &self.brushes.secondary_text
             } else {
                 &self.brushes.unknown

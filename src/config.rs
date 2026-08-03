@@ -16,6 +16,9 @@ const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_QUOTA_REFRESH_INTERVAL_SECS: u64 = 5 * 60;
 pub const MIN_QUOTA_REFRESH_INTERVAL_SECS: u64 = 60;
 pub const MAX_QUOTA_REFRESH_INTERVAL_SECS: u64 = 60 * 60;
+pub const DEFAULT_FOLLOW_CODEX_CHECK_INTERVAL_SECS: u64 = 2;
+pub const MIN_FOLLOW_CODEX_CHECK_INTERVAL_SECS: u64 = 1;
+pub const MAX_FOLLOW_CODEX_CHECK_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +62,7 @@ pub struct AppConfigV1 {
     pub follow_codex: bool,
     pub collapse_on_outside_click: bool,
     pub quota_refresh_interval_secs: u64,
+    pub follow_codex_check_interval_secs: u64,
 }
 
 impl Default for AppConfigV1 {
@@ -71,6 +75,7 @@ impl Default for AppConfigV1 {
             follow_codex: false,
             collapse_on_outside_click: true,
             quota_refresh_interval_secs: DEFAULT_QUOTA_REFRESH_INTERVAL_SECS,
+            follow_codex_check_interval_secs: DEFAULT_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
         }
     }
 }
@@ -91,9 +96,25 @@ impl AppConfigV1 {
         );
     }
 
+    #[must_use]
+    pub fn follow_codex_check_interval(&self) -> Duration {
+        Duration::from_secs(self.follow_codex_check_interval_secs.clamp(
+            MIN_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
+            MAX_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
+        ))
+    }
+
+    pub fn set_follow_codex_check_interval(&mut self, interval: Duration) {
+        self.follow_codex_check_interval_secs = interval.as_secs().clamp(
+            MIN_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
+            MAX_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
+        );
+    }
+
     fn normalize(&mut self) {
         self.version = CONFIG_VERSION;
         self.set_quota_refresh_interval(self.quota_refresh_interval());
+        self.set_follow_codex_check_interval(self.follow_codex_check_interval());
     }
 }
 
@@ -143,9 +164,17 @@ fn load_from(path: &Path) -> Result<AppConfigV1, AppError> {
     }
 
     let content = fs::read_to_string(path).map_err(|error| AppError::Config(error.to_string()))?;
-    match serde_json::from_str::<AppConfigV1>(&content) {
-        Ok(mut config) => {
-            config.normalize();
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).and_then(|raw| {
+        let mut config = serde_json::from_value::<AppConfigV1>(raw.clone())?;
+        config.normalize();
+        let normalized = serde_json::to_value(&config)?;
+        Ok((config, raw != normalized))
+    });
+    match parsed {
+        Ok((config, needs_writeback)) => {
+            if needs_writeback && let Err(error) = save_to(path, &config) {
+                crate::logging::log(&format!("无法写回补全后的配置：{error}"));
+            }
             Ok(config)
         }
         Err(error) => {
@@ -218,6 +247,7 @@ mod tests {
             ..AppConfigV1::default()
         };
         config.set_quota_refresh_interval(Duration::from_mins(10));
+        config.set_follow_codex_check_interval(Duration::from_secs(7));
         let result = save_to(&path, &config).and_then(|()| load_from(&path));
         let _ = fs::remove_dir_all(&directory);
         assert_eq!(result.ok(), Some(config));
@@ -281,6 +311,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_uses_two_second_follow_codex_check_interval() {
+        let config = serde_json::from_str::<AppConfigV1>(
+            r#"{
+                "version": 1,
+                "follow_codex": true
+            }"#,
+        );
+        assert_eq!(
+            config.ok().map(|value| value.follow_codex_check_interval()),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn loading_legacy_config_persists_defaulted_fields() {
+        let directory = unique_test_dir("legacy-writeback");
+        let path = directory.join("config.json");
+        let _ = fs::remove_dir_all(&directory);
+        assert!(fs::create_dir_all(&directory).is_ok());
+        assert!(fs::write(&path, r#"{ "version": 1, "follow_codex": true }"#).is_ok());
+        let _ = load_from(&path);
+        let persisted_interval = fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| {
+                value
+                    .get("follow_codex_check_interval_secs")
+                    .and_then(serde_json::Value::as_u64)
+            });
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(
+            persisted_interval,
+            Some(DEFAULT_FOLLOW_CODEX_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
     fn loaded_refresh_interval_is_clamped_to_supported_range() {
         let directory = unique_test_dir("refresh-clamp");
         let path = directory.join("config.json");
@@ -309,6 +376,37 @@ mod tests {
         let mut config = AppConfigV1::default();
         config.set_quota_refresh_interval(Duration::from_hours(2));
         assert_eq!(config.quota_refresh_interval(), Duration::from_hours(1));
+    }
+
+    #[test]
+    fn loaded_follow_codex_check_interval_is_clamped_to_one_second() {
+        let directory = unique_test_dir("follow-check-clamp");
+        let path = directory.join("config.json");
+        let _ = fs::remove_dir_all(&directory);
+        assert!(fs::create_dir_all(&directory).is_ok());
+        assert!(
+            fs::write(
+                &path,
+                r#"{
+                    "version": 1,
+                    "follow_codex_check_interval_secs": 0
+                }"#,
+            )
+            .is_ok()
+        );
+        let loaded = load_from(&path);
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(
+            loaded.ok().map(|value| value.follow_codex_check_interval()),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn follow_codex_check_interval_setter_clamps_values_above_one_minute() {
+        let mut config = AppConfigV1::default();
+        config.set_follow_codex_check_interval(Duration::from_mins(2));
+        assert_eq!(config.follow_codex_check_interval(), Duration::from_mins(1));
     }
 
     #[test]

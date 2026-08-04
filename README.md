@@ -80,6 +80,8 @@ cargo run
 
 `config.json` 中的 `follow_codex_check_interval_secs` 控制“跟随 Codex”的空闲检查间隔，默认 2 秒，可设置为 1–60 秒。修改后需重启应用生效。
 
+程序不包含文本输入控件，因此会在创建首个窗口前禁用 UI 线程的 IME，避免原生托盘菜单首次弹出时加载第三方输入法组件。
+
 ## 开发检查
 
 ```powershell

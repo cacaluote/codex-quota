@@ -40,7 +40,7 @@ use windows_numerics::Vector2;
 
 use super::presentation::{
     PlanColor, classify_quota_windows, format_local_timestamp, format_token_usage, panel_title,
-    plan_type_color, plan_type_label,
+    plan_type_color, plan_type_label, quota_window_label,
 };
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
@@ -397,12 +397,14 @@ impl Renderer {
             );
         }
 
-        let (five_hour, weekly) = state
+        let (short_term, long_term) = state
             .snapshot
             .as_ref()
             .map_or((None, None), classify_quota_windows);
-        self.draw_quota_row("5h额度", five_hour, 42.0, width, opacity);
-        self.draw_quota_row("周额度", weekly, 69.0, width, opacity);
+        let short_term_label = quota_window_label(short_term, state.plan_type.as_deref(), true);
+        let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
+        self.draw_quota_row(&short_term_label, short_term, 42.0, width, opacity);
+        self.draw_quota_row(&long_term_label, long_term, 69.0, width, opacity);
         self.draw_token_usage_row("今日使用", state.today_tokens, 96.0, width, opacity);
         self.draw_token_usage_row("累计使用", state.lifetime_tokens, 123.0, width, opacity);
         self.draw_update_row(state, 152.0, width, opacity);

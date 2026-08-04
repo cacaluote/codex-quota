@@ -9,7 +9,8 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
 };
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, HICON, IDC_ARROW, LoadCursorW, LoadIconW, RegisterClassExW, WNDCLASSEXW,
 };
@@ -39,6 +40,14 @@ impl Drop for SingleInstance {
         // SAFETY: handle is owned by this guard and closed exactly once.
         let _ = unsafe { CloseHandle(self.handle) };
     }
+}
+
+pub(super) fn disable_ime_for_current_thread() -> bool {
+    // SAFETY: GetCurrentThreadId has no caller-side preconditions.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    // SAFETY: run calls this on the UI thread before creating its first top-level window, as
+    // required by ImmDisableIME. This app has no text input controls that require an IME.
+    unsafe { ImmDisableIME(thread_id) }.as_bool()
 }
 
 pub(super) fn register_window_class(instance: HINSTANCE) -> Result<(), AppError> {

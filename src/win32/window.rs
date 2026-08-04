@@ -7,8 +7,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::{
-    NIF_GUID, NIIF_NONE, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIIF_NONE, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, KillTimer, MA_NOACTIVATE,
@@ -29,7 +29,7 @@ use super::tray::{
 };
 use super::{
     AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_PANEL_PERSISTENT, CMD_REFRESH,
-    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW, TRAY_GUID, TRAY_ID, WM_APP_COLLAPSE,
+    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW, TRAY_ID, WM_APP_COLLAPSE,
     WM_APP_PRESENCE_CHANGED, WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
 };
 use crate::config::{self, AppConfigV1};
@@ -269,7 +269,6 @@ impl AppWindow {
             uFlags: tray_icon_flags(),
             uCallbackMessage: WM_APP_TRAY,
             hIcon: icon,
-            guidItem: TRAY_GUID,
             dwInfoFlags: NIIF_NONE,
             ..Default::default()
         };
@@ -293,11 +292,9 @@ impl AppWindow {
             cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>()).unwrap_or(0),
             hWnd: self.hwnd,
             uID: TRAY_ID,
-            uFlags: NIF_GUID,
-            guidItem: TRAY_GUID,
             ..Default::default()
         };
-        // SAFETY: this removes only our fixed-GUID icon.
+        // SAFETY: this removes only the icon identified by this window and its fixed ID.
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
         self.tray_added = false;
         self.tray_uses_v4 = false;

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT};
 use windows::Win32::UI::Shell::{
-    NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFY_ICON_DATA_FLAGS,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EndMenu, GetCursorPos, HMENU, MF_CHECKED, MF_GRAYED,
@@ -260,7 +260,7 @@ fn tray_event_action(event: u32, uses_v4: bool) -> TrayEventAction {
 }
 
 pub(super) fn tray_icon_flags() -> NOTIFY_ICON_DATA_FLAGS {
-    NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_GUID
+    NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
 }
 
 fn refresh_command_is_enabled(state: TrayMenuState) -> bool {
@@ -290,6 +290,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::UI::Shell::NIF_GUID;
     use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_RBUTTONUP};
 
     use super::*;
@@ -326,6 +327,11 @@ mod tests {
     #[test]
     fn version_four_tray_icon_requests_standard_tooltip() {
         assert!(tray_icon_flags().contains(NIF_SHOWTIP));
+    }
+
+    #[test]
+    fn portable_tray_icon_does_not_use_path_bound_guid() {
+        assert!(!tray_icon_flags().contains(NIF_GUID));
     }
 
     #[test]

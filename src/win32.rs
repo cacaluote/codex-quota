@@ -29,7 +29,7 @@ use layout::{
 };
 use presence::CodexPresenceWatcher;
 use renderer::Renderer;
-use system::{SingleInstance, register_window_class};
+use system::{SingleInstance, disable_ime_for_current_thread, register_window_class};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_APP, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
-use windows::core::{GUID, PCWSTR, w};
+use windows::core::{PCWSTR, w};
 
 use crate::config::{self, AppConfigV1};
 use crate::error::AppError;
@@ -61,7 +61,6 @@ const EXPAND_ANIMATION_DURATION: Duration = Duration::from_millis(160);
 const COLLAPSE_ANIMATION_DURATION: Duration = Duration::from_millis(130);
 const TRAY_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 1;
-const TRAY_GUID: GUID = GUID::from_u128(0x8b7c4c57_30cc_4c8d_a114_8764698645c1);
 const CMD_SHOW: usize = 1001;
 const CMD_REFRESH: usize = 1002;
 const CMD_TOPMOST: usize = 1004;
@@ -89,6 +88,9 @@ static OUTSIDE_CLICK_HWND: AtomicUsize = AtomicUsize::new(0);
 pub fn run() -> Result<(), AppError> {
     let app_dir = config::app_data_dir()?;
     crate::logging::init(&app_dir);
+    if !disable_ime_for_current_thread() {
+        crate::logging::log("无法禁用 UI 线程输入法，将继续启动");
+    }
     // SAFETY: the process manifest already declares Per-Monitor V2. This call is an idempotent
     // fallback for development launches where a manifest may not have been embedded yet.
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };

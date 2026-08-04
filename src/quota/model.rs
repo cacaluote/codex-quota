@@ -120,7 +120,13 @@ pub fn format_elapsed(then: SystemTime, now: SystemTime) -> String {
 
 fn format_duration_label(duration: Duration) -> String {
     let minutes = duration.as_secs() / 60;
-    if minutes != 0 && minutes.is_multiple_of(10_080) {
+    if minutes == 300 {
+        "5h额度".to_owned()
+    } else if (40_320..=44_640).contains(&minutes) {
+        "月额度".to_owned()
+    } else if minutes == 10_080 {
+        "周额度".to_owned()
+    } else if minutes != 0 && minutes.is_multiple_of(10_080) {
         format!("{}周额度", minutes / 10_080)
     } else if minutes != 0 && minutes.is_multiple_of(1_440) {
         format!("{}天额度", minutes / 1_440)
@@ -176,8 +182,24 @@ mod tests {
     }
 
     #[test]
-    fn weekly_window_has_localized_label() {
-        assert_eq!(window(10.0).window_label(), "1周额度");
+    fn weekly_window_has_compact_label() {
+        assert_eq!(window(10.0).window_label(), "周额度");
+    }
+
+    #[test]
+    fn thirty_day_window_has_monthly_label() {
+        let mut monthly = window(10.0);
+        monthly.window_duration = Duration::from_hours(24 * 30);
+
+        assert_eq!(monthly.window_label(), "月额度");
+    }
+
+    #[test]
+    fn five_hour_window_keeps_compact_label() {
+        let mut five_hour = window(10.0);
+        five_hour.window_duration = Duration::from_hours(5);
+
+        assert_eq!(five_hour.window_label(), "5h额度");
     }
 
     #[test]

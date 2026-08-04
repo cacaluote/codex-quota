@@ -34,6 +34,26 @@ pub(super) fn classify_quota_windows(
     }
 }
 
+pub(super) fn quota_window_label(
+    window: Option<&QuotaWindow>,
+    plan_type: Option<&str>,
+    short_term: bool,
+) -> String {
+    window.map_or_else(
+        || {
+            if short_term {
+                "5h额度"
+            } else if plan_type == Some("free") {
+                "月额度"
+            } else {
+                "周额度"
+            }
+            .to_owned()
+        },
+        QuotaWindow::window_label,
+    )
+}
+
 pub(super) fn panel_title(state: &AppState) -> (&str, Option<&str>) {
     match &state.status {
         ConnectionStatus::Connecting => ("正在连接 Codex", None),
@@ -227,15 +247,15 @@ mod tests {
     }
 
     #[test]
-    fn lone_weekly_window_leaves_five_hour_slot_empty() {
+    fn lone_long_window_leaves_short_term_slot_empty() {
         let snapshot = QuotaSnapshot {
             limit_id: "codex".to_owned(),
             primary: window(Duration::from_hours(168)),
             secondary: None,
             received_at: UNIX_EPOCH,
         };
-        let (five_hour, weekly) = classify_quota_windows(&snapshot);
-        assert!(five_hour.is_none() && weekly.is_some());
+        let (short_term, long_term) = classify_quota_windows(&snapshot);
+        assert!(short_term.is_none() && long_term.is_some());
     }
 
     #[test]
@@ -246,10 +266,25 @@ mod tests {
             secondary: Some(window(Duration::from_hours(5))),
             received_at: UNIX_EPOCH,
         };
-        let (five_hour, weekly) = classify_quota_windows(&snapshot);
+        let (short_term, long_term) = classify_quota_windows(&snapshot);
         assert!(
-            five_hour.is_some_and(|value| value.window_duration == Duration::from_hours(5))
-                && weekly.is_some_and(|value| value.window_duration == Duration::from_hours(168))
+            short_term.is_some_and(|value| value.window_duration == Duration::from_hours(5))
+                && long_term
+                    .is_some_and(|value| value.window_duration == Duration::from_hours(168))
+        );
+    }
+
+    #[test]
+    fn free_plan_uses_monthly_fallback_for_missing_long_window() {
+        assert_eq!(quota_window_label(None, Some("free"), false), "月额度");
+    }
+
+    #[test]
+    fn window_duration_overrides_plan_fallback_label() {
+        let monthly = window(Duration::from_hours(24 * 30));
+        assert_eq!(
+            quota_window_label(Some(&monthly), Some("plus"), false),
+            "月额度"
         );
     }
 }

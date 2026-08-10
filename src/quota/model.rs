@@ -54,6 +54,25 @@ pub struct QuotaSnapshot {
     pub received_at: SystemTime,
 }
 
+impl QuotaSnapshot {
+    #[must_use]
+    pub fn quota_windows(&self) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
+        let primary = &self.primary;
+        let Some(secondary) = self.secondary.as_ref() else {
+            return if primary.window_duration <= Duration::from_hours(24) {
+                (Some(primary), None)
+            } else {
+                (None, Some(primary))
+            };
+        };
+        if primary.window_duration <= secondary.window_duration {
+            (Some(primary), Some(secondary))
+        } else {
+            (Some(secondary), Some(primary))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,
@@ -68,6 +87,7 @@ pub struct AppState {
     pub snapshot: Option<QuotaSnapshot>,
     pub plan_type: Option<String>,
     pub today_tokens: Option<u64>,
+    pub current_period_tokens: Option<u64>,
     pub lifetime_tokens: Option<u64>,
     pub last_error: Option<String>,
     pub quota_refresh_interval: Duration,
@@ -80,6 +100,7 @@ impl Default for AppState {
             snapshot: None,
             plan_type: None,
             today_tokens: None,
+            current_period_tokens: None,
             lifetime_tokens: None,
             last_error: None,
             quota_refresh_interval: Duration::from_mins(5),

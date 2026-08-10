@@ -3,7 +3,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
+use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 use crate::error::AppError;
 use crate::quota::{QuotaSnapshot, QuotaWindow};
@@ -72,6 +74,7 @@ struct RawDailyUsageBucket {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TokenUsage {
     pub(super) today: Option<u64>,
+    pub(super) current_period: Option<u64>,
     pub(super) lifetime: Option<u64>,
 }
 
@@ -110,16 +113,33 @@ pub(super) fn parse_account_result(value: Value) -> Result<Option<String>, AppEr
     Ok(result.account.and_then(|account| account.plan_type))
 }
 
-pub(super) fn parse_token_usage(value: Value, today: &str) -> Result<TokenUsage, AppError> {
+pub(super) fn parse_token_usage(
+    value: Value,
+    today: &str,
+    period_start: Option<&str>,
+) -> Result<TokenUsage, AppError> {
     let result: RawUsageReadResult = serde_json::from_value(value)?;
-    let today = result.daily_usage_buckets.and_then(|buckets| {
+    let buckets = result.daily_usage_buckets.as_deref();
+    let today_tokens = buckets.and_then(|buckets| {
         buckets
-            .into_iter()
+            .iter()
             .find(|bucket| bucket.start_date == today)
             .map(|bucket| bucket.tokens)
     });
+    let current_period = period_start.and_then(|start| {
+        buckets.map(|buckets| {
+            buckets
+                .iter()
+                .filter(|bucket| {
+                    bucket.start_date.as_str() >= start && bucket.start_date.as_str() <= today
+                })
+                .map(|bucket| bucket.tokens)
+                .fold(0_u64, u64::saturating_add)
+        })
+    });
     Ok(TokenUsage {
-        today,
+        today: today_tokens,
+        current_period,
         lifetime: result.summary.and_then(|summary| summary.lifetime_tokens),
     })
 }
@@ -128,6 +148,33 @@ pub(super) fn local_calendar_date() -> String {
     // SAFETY: GetLocalTime returns a SYSTEMTIME value without borrowing caller-owned storage.
     let local = unsafe { GetLocalTime() };
     format!("{:04}-{:02}-{:02}", local.wYear, local.wMonth, local.wDay)
+}
+
+pub(super) fn local_calendar_date_at(time: SystemTime) -> Option<String> {
+    const WINDOWS_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let ticks = duration
+        .as_secs()
+        .checked_add(WINDOWS_EPOCH_OFFSET_SECONDS)?
+        .checked_mul(TICKS_PER_SECOND)?
+        .checked_add(u64::from(duration.subsec_nanos()) / 100)?;
+    let file_time = FILETIME {
+        dwLowDateTime: u32::try_from(ticks & u64::from(u32::MAX)).ok()?,
+        dwHighDateTime: u32::try_from(ticks >> 32).ok()?,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: both output structures are initialized and exclusively borrowed for their calls.
+    unsafe {
+        FileTimeToSystemTime(&raw const file_time, &raw mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &raw const utc, &raw mut local).ok()?;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        local.wYear, local.wMonth, local.wDay
+    ))
 }
 
 fn convert_window(raw: &RawWindow) -> Result<QuotaWindow, AppError> {
@@ -281,16 +328,19 @@ mod tests {
                 "unknownFutureField": true
             },
             "dailyUsageBuckets": [
+                { "startDate": "2026-07-29", "tokens": 1_000 },
                 { "startDate": "2026-07-30", "tokens": 12_345 },
-                { "startDate": "2026-07-31", "tokens": 67_890 }
+                { "startDate": "2026-07-31", "tokens": 67_890 },
+                { "startDate": "2026-08-01", "tokens": 2_000 }
             ],
             "unknownFutureField": true
         });
 
         assert_eq!(
-            parse_token_usage(result, "2026-07-31").ok(),
+            parse_token_usage(result, "2026-07-31", Some("2026-07-30")).ok(),
             Some(TokenUsage {
                 today: Some(67_890),
+                current_period: Some(80_235),
                 lifetime: Some(900_000),
             })
         );
@@ -305,9 +355,10 @@ mod tests {
         });
 
         assert_eq!(
-            parse_token_usage(result, "2026-07-31").ok(),
+            parse_token_usage(result, "2026-07-31", None).ok(),
             Some(TokenUsage {
                 today: None,
+                current_period: None,
                 lifetime: None,
             })
         );
@@ -321,9 +372,10 @@ mod tests {
         });
 
         assert_eq!(
-            parse_token_usage(result, "2026-07-31").ok(),
+            parse_token_usage(result, "2026-07-31", Some("2026-07-25")).ok(),
             Some(TokenUsage {
                 today: None,
+                current_period: None,
                 lifetime: None,
             })
         );

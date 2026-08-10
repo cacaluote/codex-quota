@@ -11,9 +11,9 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetCursorPos, GetSystemMetrics, GetWindowRect, HTCLIENT, HTTRANSPARENT,
-    MSLLHOOKSTRUCT, PostMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_RBUTTONDOWN, WM_XBUTTONDOWN,
+    MSLLHOOKSTRUCT, PostMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
 };
 
 use super::layout::{
@@ -117,7 +117,7 @@ impl AppWindow {
                 self.drag_window_origin.y + dy,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOSIZE,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
             )?;
         }
         self.render()
@@ -176,7 +176,15 @@ impl AppWindow {
         y = y.clamp(work.top, work.bottom - height);
         // SAFETY: moving without activation preserves the host application's focus.
         unsafe {
-            SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE)?;
+            SetWindowPos(
+                self.hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            )?;
         }
         self.config.placement.edge = edge;
         self.config.placement.monitor_device = monitor_device(&info);

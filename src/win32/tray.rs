@@ -117,7 +117,7 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
         "显示悬浮球"
     });
     let refresh = wide("立即刷新");
-    let refresh_interval = wide("额度刷新间隔");
+    let refresh_interval = wide("刷新间隔");
     let one_minute_label = wide("1 分钟");
     let two_minute_label = wide("2 分钟");
     let five_minute_label = wide("5 分钟");

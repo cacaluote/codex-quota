@@ -75,7 +75,7 @@ const CMD_FOLLOW_CODEX: usize = 1012;
 const CMD_REFRESH_2_MIN: usize = 1013;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 276.0;
-const PANEL_HEIGHT_DIP: f32 = 202.0;
+const PANEL_HEIGHT_DIP: f32 = 229.0;
 const TRAY_REOPEN_GUARD: Duration = Duration::from_millis(500);
 static OUTSIDE_CLICK_HWND: AtomicUsize = AtomicUsize::new(0);
 

@@ -11,12 +11,13 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, KillTimer, MA_NOACTIVATE,
-    PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
+    CREATESTRUCTW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA, GetWindowLongPtrW,
+    KillTimer, MA_NOACTIVATE, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_TIMER,
+    WS_EX_TOPMOST,
 };
 use windows::core::w;
 
@@ -112,6 +113,7 @@ impl AppWindow {
         self.visible = true;
         // SAFETY: no-activate show leaves focus with the current foreground window.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        self.ensure_topmost("激活悬浮窗")?;
         Ok(())
     }
 
@@ -220,6 +222,7 @@ impl AppWindow {
         self.visible = true;
         // SAFETY: no-activate show leaves focus with the current foreground window.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        self.ensure_topmost("重新显示悬浮窗")?;
         let result = self.resize_for_state();
         self.update_outside_click_hook();
         result
@@ -257,6 +260,19 @@ impl AppWindow {
             )?;
         }
         Ok(())
+    }
+
+    fn ensure_topmost(&self, context: &str) -> Result<(), AppError> {
+        if !self.config.always_on_top {
+            return Ok(());
+        }
+        // SAFETY: hwnd is a live top-level window owned by this UI thread.
+        let extended_style = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) };
+        if extended_style & WS_EX_TOPMOST.0 as isize != 0 {
+            return Ok(());
+        }
+        crate::logging::log(&format!("检测到始终置顶状态丢失（{context}），正在恢复"));
+        self.apply_topmost()
     }
 
     fn add_tray_icon(&mut self) -> Result<(), AppError> {
@@ -298,6 +314,16 @@ impl AppWindow {
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
         self.tray_added = false;
         self.tray_uses_v4 = false;
+    }
+
+    fn handle_taskbar_created(&mut self) {
+        self.tray_added = false;
+        if let Err(error) = self.add_tray_icon() {
+            crate::logging::log(&error.to_string());
+        }
+        if let Err(error) = self.ensure_topmost("任务栏重建") {
+            crate::logging::log(&error.to_string());
+        }
     }
 
     fn command(&mut self, command: usize) -> Result<(), AppError> {
@@ -410,10 +436,7 @@ pub(super) unsafe extern "system" fn window_proc(
     let app = unsafe { &mut *app_ptr };
 
     if message == app.taskbar_created && app.taskbar_created != 0 {
-        app.tray_added = false;
-        if let Err(error) = app.add_tray_icon() {
-            crate::logging::log(&error.to_string());
-        }
+        app.handle_taskbar_created();
         return LRESULT(0);
     }
 
@@ -442,9 +465,10 @@ pub(super) unsafe extern "system" fn window_proc(
         WM_NCHITTEST => return app.hit_test(),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_DPICHANGED => handle_window_dpi_changed(app, wparam, lparam),
-        WM_DISPLAYCHANGE if app.overlay_active => {
-            app.finish_animation().and_then(|()| app.snap_to_edge())
-        }
+        WM_DISPLAYCHANGE if app.overlay_active => app
+            .finish_animation()
+            .and_then(|()| app.snap_to_edge())
+            .and_then(|()| app.ensure_topmost("显示器配置变化")),
         WM_SETTINGCHANGE => {
             app.animations_enabled = system_animations_enabled();
             if app.animations_enabled {
@@ -460,9 +484,11 @@ pub(super) unsafe extern "system" fn window_proc(
             if let Some(worker) = &app.worker {
                 worker.refresh();
             }
-            Ok(())
+            app.ensure_topmost("系统唤醒")
         }
-        WM_TIMER if wparam.0 == TIMER_REDRAW => app.render(),
+        WM_TIMER if wparam.0 == TIMER_REDRAW => {
+            app.ensure_topmost("定时检查").and_then(|()| app.render())
+        }
         WM_TIMER if wparam.0 == TIMER_ANIMATION && app.overlay_active => {
             app.render_animation_frame(Instant::now())
         }

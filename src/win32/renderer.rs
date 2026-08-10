@@ -406,8 +406,15 @@ impl Renderer {
         self.draw_quota_row(&short_term_label, short_term, 42.0, width, opacity);
         self.draw_quota_row(&long_term_label, long_term, 69.0, width, opacity);
         self.draw_token_usage_row("今日使用", state.today_tokens, 96.0, width, opacity);
-        self.draw_token_usage_row("累计使用", state.lifetime_tokens, 123.0, width, opacity);
-        self.draw_update_row(state, 152.0, width, opacity);
+        self.draw_token_usage_row(
+            "本期使用",
+            state.current_period_tokens,
+            123.0,
+            width,
+            opacity,
+        );
+        self.draw_token_usage_row("累计使用", state.lifetime_tokens, 150.0, width, opacity);
+        self.draw_update_row(state, 179.0, width, opacity);
     }
 
     fn draw_quota_row(

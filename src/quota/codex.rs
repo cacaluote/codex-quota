@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use app_server::AppServerSession;
 pub(crate) use app_server::find_codex_executable;
 use protocol::{
-    is_rate_limit_notification, local_calendar_date, parse_account_result,
+    is_rate_limit_notification, local_calendar_date, local_calendar_date_at, parse_account_result,
     parse_account_updated_notification, parse_rate_limits_result, parse_token_usage,
 };
 use serde_json::json;
@@ -255,7 +255,7 @@ where
         Ok(()) => Ok(()),
         Err(AppError::Cancelled) => Err(AppError::Cancelled),
         Err(error) => {
-            publish_token_usage(state, None, None, notify);
+            publish_token_usage(state, None, None, None, notify);
             crate::logging::log(&format!("无法读取 Token 用量：{error}"));
             Ok(())
         }
@@ -303,9 +303,24 @@ where
         "id": id
     }))?;
     let result = session.wait_for_response(id, REQUEST_TIMEOUT)?;
-    let usage = parse_token_usage(result, &local_calendar_date())?;
-    publish_token_usage(state, usage.today, usage.lifetime, notify);
+    let period_start = current_period_start_date(state);
+    let usage = parse_token_usage(result, &local_calendar_date(), period_start.as_deref())?;
+    publish_token_usage(
+        state,
+        usage.today,
+        usage.current_period,
+        usage.lifetime,
+        notify,
+    );
     Ok(())
+}
+
+fn current_period_start_date(state: &Arc<Mutex<AppState>>) -> Option<String> {
+    let current = state.lock().ok()?;
+    let (_, long_term) = current.snapshot.as_ref()?.quota_windows();
+    let window = long_term?;
+    let start = window.resets_at.checked_sub(window.window_duration)?;
+    local_calendar_date_at(start)
 }
 
 fn read_account_and_publish<F>(
@@ -342,6 +357,7 @@ where
 fn publish_token_usage<F>(
     state: &Arc<Mutex<AppState>>,
     today: Option<u64>,
+    current_period: Option<u64>,
     lifetime: Option<u64>,
     notify: &Arc<F>,
 ) where
@@ -349,6 +365,7 @@ fn publish_token_usage<F>(
 {
     if let Ok(mut current) = state.lock() {
         current.today_tokens = today;
+        current.current_period_tokens = current_period;
         current.lifetime_tokens = lifetime;
     }
     notify();

@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -19,19 +19,7 @@ pub(super) enum PlanColor {
 pub(super) fn classify_quota_windows(
     snapshot: &QuotaSnapshot,
 ) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
-    let primary = &snapshot.primary;
-    let Some(secondary) = snapshot.secondary.as_ref() else {
-        return if primary.window_duration <= Duration::from_hours(24) {
-            (Some(primary), None)
-        } else {
-            (None, Some(primary))
-        };
-    };
-    if primary.window_duration <= secondary.window_duration {
-        (Some(primary), Some(secondary))
-    } else {
-        (Some(secondary), Some(primary))
-    }
+    snapshot.quota_windows()
 }
 
 pub(super) fn quota_window_label(
@@ -153,6 +141,8 @@ pub(super) fn plan_type_color(plan_type: &str) -> PlanColor {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn window(duration: Duration) -> QuotaWindow {

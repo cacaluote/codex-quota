@@ -73,6 +73,7 @@ cargo run
 其中：
 
 - `config.json`：窗口位置和应用设置
+- `usage-cache-v1.json`：本机 Codex 会话用量的增量解析缓存，不包含对话正文或凭据
 - `codex-quota.log`：运行日志
 - `codex-quota.log.old`：轮换后的上一份日志
 
@@ -92,7 +93,9 @@ cargo test
 
 ## 隐私说明
 
-程序不会要求单独填写 OpenAI 凭据。它仅在本机启动 `codex app-server --stdio`，并复用 Codex CLI 当前的登录状态读取账户额度与 Token 用量。
+程序不会要求单独填写 OpenAI 凭据。它在本机启动 `codex app-server --stdio`，并复用 Codex CLI 当前的登录状态读取账户额度、本期及累计 Token 用量。
+
+“今日使用”优先从 `%CODEX_HOME%\sessions`（未设置时为 `%USERPROFILE%\.codex\sessions`）及 `archived_sessions` 中只读解析官方 OpenAI 会话的 `token_count` 元数据，RPC 仅在本地结果不可靠时兜底。“本期使用”按精确额度开始时刻组合本地开始日边界、RPC 中间完整日和本地今日值；开始日日志缺失或不可靠时回退为完整 RPC 本期值，可能包含边界日重叠误差。该本地数值代表本机留下日志的使用量，不包含其他设备、临时会话或已删除日志；因此其他设备今天的使用也不会进入本地可靠时的本期值。同一天切换多个官方账号时，本地日志也可能无法区分账号。程序不会读取或缓存会话中的提示词、回复和工具输出。
 
 ## 许可证
 

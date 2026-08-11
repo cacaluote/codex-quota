@@ -10,6 +10,7 @@ build = "build.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 windows = { version = "0.62.2", features = [
     "Foundation_Numerics",
     "Win32_Foundation",

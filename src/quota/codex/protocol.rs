@@ -74,6 +74,7 @@ struct RawDailyUsageBucket {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TokenUsage {
     pub(super) today: Option<u64>,
+    pub(super) current_period_middle_days: Option<u64>,
     pub(super) current_period: Option<u64>,
     pub(super) lifetime: Option<u64>,
 }
@@ -137,8 +138,20 @@ pub(super) fn parse_token_usage(
                 .fold(0_u64, u64::saturating_add)
         })
     });
+    let current_period_middle_days = period_start.and_then(|start| {
+        buckets.map(|buckets| {
+            buckets
+                .iter()
+                .filter(|bucket| {
+                    bucket.start_date.as_str() > start && bucket.start_date.as_str() < today
+                })
+                .map(|bucket| bucket.tokens)
+                .fold(0_u64, u64::saturating_add)
+        })
+    });
     Ok(TokenUsage {
         today: today_tokens,
+        current_period_middle_days,
         current_period,
         lifetime: result.summary.and_then(|summary| summary.lifetime_tokens),
     })
@@ -340,9 +353,28 @@ mod tests {
             parse_token_usage(result, "2026-07-31", Some("2026-07-30")).ok(),
             Some(TokenUsage {
                 today: Some(67_890),
+                current_period_middle_days: Some(0),
                 current_period: Some(80_235),
                 lifetime: Some(900_000),
             })
+        );
+    }
+
+    #[test]
+    fn usage_parser_keeps_only_complete_days_between_period_boundaries() {
+        let result = json!({
+            "dailyUsageBuckets": [
+                { "startDate": "2026-07-29", "tokens": 1_000 },
+                { "startDate": "2026-07-30", "tokens": 12_345 },
+                { "startDate": "2026-07-31", "tokens": 67_890 }
+            ]
+        });
+
+        assert_eq!(
+            parse_token_usage(result, "2026-07-31", Some("2026-07-29"))
+                .ok()
+                .and_then(|usage| usage.current_period_middle_days),
+            Some(12_345)
         );
     }
 
@@ -358,7 +390,46 @@ mod tests {
             parse_token_usage(result, "2026-07-31", None).ok(),
             Some(TokenUsage {
                 today: None,
+                current_period_middle_days: None,
                 current_period: None,
+                lifetime: None,
+            })
+        );
+    }
+
+    #[test]
+    fn usage_parser_exposes_history_when_today_bucket_is_missing() {
+        let result = json!({
+            "dailyUsageBuckets": [
+                { "startDate": "2026-07-30", "tokens": 12_345 }
+            ]
+        });
+
+        assert_eq!(
+            parse_token_usage(result, "2026-07-31", Some("2026-07-30")).ok(),
+            Some(TokenUsage {
+                today: None,
+                current_period_middle_days: Some(0),
+                current_period: Some(12_345),
+                lifetime: None,
+            })
+        );
+    }
+
+    #[test]
+    fn usage_parser_returns_zero_history_when_period_starts_today() {
+        let result = json!({
+            "dailyUsageBuckets": [
+                { "startDate": "2026-07-31", "tokens": 67_890 }
+            ]
+        });
+
+        assert_eq!(
+            parse_token_usage(result, "2026-07-31", Some("2026-07-31")).ok(),
+            Some(TokenUsage {
+                today: Some(67_890),
+                current_period_middle_days: Some(0),
+                current_period: Some(67_890),
                 lifetime: None,
             })
         );
@@ -375,6 +446,7 @@ mod tests {
             parse_token_usage(result, "2026-07-31", Some("2026-07-25")).ok(),
             Some(TokenUsage {
                 today: None,
+                current_period_middle_days: None,
                 current_period: None,
                 lifetime: None,
             })

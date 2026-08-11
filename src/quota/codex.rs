@@ -1,5 +1,6 @@
 mod app_server;
 mod protocol;
+mod session_usage;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -14,6 +15,7 @@ use protocol::{
     parse_account_updated_notification, parse_rate_limits_result, parse_token_usage,
 };
 use serde_json::json;
+use session_usage::SessionUsageTracker;
 
 use super::model::{AppState, ConnectionStatus};
 use crate::error::AppError;
@@ -87,6 +89,107 @@ struct SessionFailure {
     had_successful_read: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeriodBoundary {
+    start: SystemTime,
+    local_date: String,
+    start_nanos: i64,
+}
+
+impl PeriodBoundary {
+    fn from_start(start: SystemTime) -> Option<Self> {
+        let local_date = local_calendar_date_at(start)?;
+        let start_nanos = i64::try_from(
+            start
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+        )
+        .ok()?;
+        Some(Self {
+            start,
+            local_date,
+            start_nanos,
+        })
+    }
+
+    fn local_date(&self) -> &str {
+        &self.local_date
+    }
+
+    fn start_nanos(&self) -> i64 {
+        self.start_nanos
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalUsageStatus {
+    date: String,
+    today_reliable: bool,
+    period_boundary: Option<PeriodBoundary>,
+    period_boundary_tokens: u64,
+    period_boundary_reliable: bool,
+    last_error: Option<String>,
+    period_baseline: Option<PeriodUsageBaseline>,
+}
+
+#[derive(Debug)]
+struct PeriodUsageBaseline {
+    date: String,
+    boundary: PeriodBoundary,
+    middle_days_tokens: u64,
+}
+
+impl LocalUsageStatus {
+    fn set_period_baseline(
+        &mut self,
+        date: &str,
+        period_boundary: Option<PeriodBoundary>,
+        middle_days_tokens: Option<u64>,
+    ) {
+        self.period_baseline =
+            period_boundary
+                .zip(middle_days_tokens)
+                .map(|(boundary, middle_days_tokens)| PeriodUsageBaseline {
+                    date: date.to_owned(),
+                    boundary,
+                    middle_days_tokens,
+                });
+    }
+
+    fn synchronize_period_boundary(&mut self, period_boundary: Option<PeriodBoundary>) -> bool {
+        if self.period_boundary == period_boundary {
+            false
+        } else {
+            self.period_boundary = period_boundary;
+            self.period_boundary_tokens = 0;
+            self.period_boundary_reliable = false;
+            self.period_baseline = None;
+            true
+        }
+    }
+
+    fn current_period_with_local_today(&self, local_today: u64) -> Option<u64> {
+        let baseline = self.period_baseline.as_ref()?;
+        let needs_today = baseline.boundary.local_date() != self.date;
+        if (needs_today && !self.today_reliable)
+            || !self.period_boundary_reliable
+            || baseline.date != self.date
+            || Some(&baseline.boundary) != self.period_boundary.as_ref()
+        {
+            return None;
+        }
+        let boundary_and_middle = self
+            .period_boundary_tokens
+            .saturating_add(baseline.middle_days_tokens);
+        Some(if needs_today {
+            boundary_and_middle.saturating_add(local_today)
+        } else {
+            boundary_and_middle
+        })
+    }
+}
+
 impl SessionFailure {
     fn after_success(error: AppError) -> Self {
         Self {
@@ -114,8 +217,11 @@ fn worker_loop<F>(
     F: Fn() + Send + Sync + 'static,
 {
     let mut failure_count = 0_usize;
+    let mut usage_tracker = SessionUsageTracker::new();
+    let mut local_usage = LocalUsageStatus::default();
 
     loop {
+        refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
         update_status(
             state,
             if failure_count == 0 {
@@ -129,7 +235,14 @@ fn worker_loop<F>(
             notify,
         );
 
-        match run_session(state, command_rx, notify, cancelled) {
+        match run_session(
+            state,
+            command_rx,
+            notify,
+            cancelled,
+            &mut usage_tracker,
+            &mut local_usage,
+        ) {
             Ok(SessionOutcome::Shutdown) => break,
             Err(failure) => {
                 if matches!(&failure.error, AppError::Cancelled) {
@@ -166,6 +279,8 @@ fn run_session<F>(
     command_rx: &Receiver<WorkerCommand>,
     notify: &Arc<F>,
     cancelled: &Arc<AtomicBool>,
+    usage_tracker: &mut SessionUsageTracker,
+    local_usage: &mut LocalUsageStatus,
 ) -> Result<SessionOutcome, SessionFailure>
 where
     F: Fn() + Send + Sync + 'static,
@@ -189,7 +304,14 @@ where
     session.wait_for_response(initialize_id, INITIALIZE_TIMEOUT)?;
     session.send(&json!({ "method": "initialized", "params": {} }))?;
 
-    read_and_publish(&mut session, &mut next_id, state, notify)?;
+    read_and_publish(
+        &mut session,
+        &mut next_id,
+        state,
+        notify,
+        usage_tracker,
+        local_usage,
+    )?;
     if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
         crate::logging::log(&format!("无法读取 Codex 方案类型：{error}"));
     }
@@ -212,8 +334,15 @@ where
         let due = notification_refresh
             .map_or(next_refresh, |notification| notification.min(next_refresh));
         if now >= due {
-            read_and_publish(&mut session, &mut next_id, state, notify)
-                .map_err(SessionFailure::after_success)?;
+            read_and_publish(
+                &mut session,
+                &mut next_id,
+                state,
+                notify,
+                usage_tracker,
+                local_usage,
+            )
+            .map_err(SessionFailure::after_success)?;
             next_refresh = refresh_deadline(state);
             notification_refresh = None;
             continue;
@@ -246,16 +375,18 @@ fn read_and_publish<F>(
     next_id: &mut u64,
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
+    usage_tracker: &mut SessionUsageTracker,
+    local_usage: &mut LocalUsageStatus,
 ) -> Result<(), AppError>
 where
     F: Fn() + Send + Sync + 'static,
 {
     read_rate_limits_and_publish(session, next_id, state, notify)?;
-    match read_usage_and_publish(session, next_id, state, notify) {
+    refresh_local_usage(usage_tracker, local_usage, state, notify);
+    match read_usage_and_publish(session, next_id, state, notify, local_usage) {
         Ok(()) => Ok(()),
         Err(AppError::Cancelled) => Err(AppError::Cancelled),
         Err(error) => {
-            publish_token_usage(state, None, None, None, notify);
             crate::logging::log(&format!("无法读取 Token 用量：{error}"));
             Ok(())
         }
@@ -293,6 +424,7 @@ fn read_usage_and_publish<F>(
     next_id: &mut u64,
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
+    local_usage: &mut LocalUsageStatus,
 ) -> Result<(), AppError>
 where
     F: Fn() + Send + Sync + 'static,
@@ -303,24 +435,34 @@ where
         "id": id
     }))?;
     let result = session.wait_for_response(id, REQUEST_TIMEOUT)?;
-    let period_start = current_period_start_date(state);
-    let usage = parse_token_usage(result, &local_calendar_date(), period_start.as_deref())?;
-    publish_token_usage(
+    let today = local_calendar_date();
+    let period_boundary = current_period_boundary(state);
+    let usage = parse_token_usage(
+        result,
+        &today,
+        period_boundary.as_ref().map(PeriodBoundary::local_date),
+    )?;
+    local_usage.set_period_baseline(&today, period_boundary, usage.current_period_middle_days);
+    publish_rpc_token_usage(
         state,
         usage.today,
         usage.current_period,
         usage.lifetime,
+        &today,
+        local_usage,
         notify,
     );
     Ok(())
 }
 
-fn current_period_start_date(state: &Arc<Mutex<AppState>>) -> Option<String> {
+fn current_period_boundary(state: &Arc<Mutex<AppState>>) -> Option<PeriodBoundary> {
     let current = state.lock().ok()?;
     let (_, long_term) = current.snapshot.as_ref()?.quota_windows();
     let window = long_term?;
-    let start = window.resets_at.checked_sub(window.window_duration)?;
-    local_calendar_date_at(start)
+    window
+        .resets_at
+        .checked_sub(window.window_duration)
+        .and_then(PeriodBoundary::from_start)
 }
 
 fn read_account_and_publish<F>(
@@ -354,21 +496,151 @@ where
     notify();
 }
 
-fn publish_token_usage<F>(
+fn publish_rpc_token_usage<F>(
     state: &Arc<Mutex<AppState>>,
     today: Option<u64>,
-    current_period: Option<u64>,
+    rpc_current_period: Option<u64>,
     lifetime: Option<u64>,
+    usage_date: &str,
+    local_usage: &LocalUsageStatus,
     notify: &Arc<F>,
 ) where
     F: Fn() + Send + Sync + 'static,
 {
+    let mut changed = false;
+    let local_today_reliable = local_usage.today_reliable && local_usage.date == usage_date;
     if let Ok(mut current) = state.lock() {
-        current.today_tokens = today;
-        current.current_period_tokens = current_period;
-        current.lifetime_tokens = lifetime;
+        if !local_today_reliable
+            && let Some(today) = today
+            && current.today_tokens != Some(today)
+        {
+            current.today_tokens = Some(today);
+            changed = true;
+        }
+        let local_current_period =
+            local_usage.current_period_with_local_today(current.today_tokens.unwrap_or(0));
+        let current_period = local_current_period.or(rpc_current_period);
+        if let Some(current_period) = current_period
+            && current.current_period_tokens != Some(current_period)
+        {
+            current.current_period_tokens = Some(current_period);
+            changed = true;
+        }
+        if let Some(lifetime) = lifetime
+            && current.lifetime_tokens != Some(lifetime)
+        {
+            current.lifetime_tokens = Some(lifetime);
+            changed = true;
+        }
     }
-    notify();
+    if changed {
+        notify();
+    }
+}
+
+fn refresh_local_usage<F>(
+    tracker: &mut SessionUsageTracker,
+    status: &mut LocalUsageStatus,
+    state: &Arc<Mutex<AppState>>,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let today = local_calendar_date();
+    let mut identity_changed = false;
+    if status.date != today {
+        status.date.clone_from(&today);
+        status.today_reliable = false;
+        status.last_error = None;
+        status.period_baseline = None;
+        if let Ok(mut current) = state.lock()
+            && current.today_tokens.take().is_some()
+        {
+            identity_changed = true;
+        }
+    }
+    let period_boundary = current_period_boundary(state);
+    if status.synchronize_period_boundary(period_boundary)
+        && let Ok(mut current) = state.lock()
+        && current.current_period_tokens.take().is_some()
+    {
+        identity_changed = true;
+    }
+    if identity_changed {
+        notify();
+    }
+
+    match tracker.refresh(status.period_boundary.as_ref()) {
+        Ok((snapshot, diagnostics)) => {
+            status.today_reliable = snapshot.today_reliable;
+            status.period_boundary_tokens = snapshot.period_boundary_tokens;
+            status.period_boundary_reliable = snapshot.period_boundary_reliable;
+            status.last_error = None;
+            if snapshot.today_reliable || snapshot.period_boundary_reliable {
+                publish_local_token_usage(
+                    state,
+                    snapshot.today_reliable.then_some(snapshot.today_tokens),
+                    status,
+                    notify,
+                );
+            }
+            if diagnostics.parse_errors > 0
+                || diagnostics.discovery_errors > 0
+                || diagnostics.deferred_files > 0
+                || diagnostics.cache_write_failed
+            {
+                crate::logging::log(&format!(
+                    "Codex 本地用量扫描：候选文件 {}，读取文件 {}，Token 事件 {}，发现错误 {}，解析错误 {}，待定文件 {}，缓存写入失败 {}",
+                    diagnostics.files_scanned,
+                    diagnostics.files_read,
+                    diagnostics.token_events,
+                    diagnostics.discovery_errors,
+                    diagnostics.parse_errors,
+                    diagnostics.deferred_files,
+                    diagnostics.cache_write_failed
+                ));
+            }
+        }
+        Err(error) => {
+            status.today_reliable = false;
+            status.period_boundary_reliable = false;
+            let message = error.to_string();
+            if status.last_error.as_deref() != Some(message.as_str()) {
+                crate::logging::log(&format!("无法读取 Codex 本地用量：{message}"));
+                status.last_error = Some(message);
+            }
+        }
+    }
+}
+
+fn publish_local_token_usage<F>(
+    state: &Arc<Mutex<AppState>>,
+    today: Option<u64>,
+    local_usage: &LocalUsageStatus,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut changed = false;
+    if let Ok(mut current) = state.lock() {
+        if let Some(today) = today
+            && current.today_tokens != Some(today)
+        {
+            current.today_tokens = Some(today);
+            changed = true;
+        }
+        let current_period =
+            local_usage.current_period_with_local_today(current.today_tokens.unwrap_or(0));
+        if let Some(current_period) = current_period
+            && current.current_period_tokens != Some(current_period)
+        {
+            current.current_period_tokens = Some(current_period);
+            changed = true;
+        }
+    }
+    if changed {
+        notify();
+    }
 }
 
 fn update_status<F>(
@@ -432,6 +704,42 @@ fn next_refresh_delay(refresh_interval: Duration, until_reset: Option<Duration>)
 mod tests {
     use super::*;
 
+    fn period_start() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
+    }
+
+    fn period_boundary(local_date: &str) -> PeriodBoundary {
+        let start = period_start();
+        PeriodBoundary {
+            start,
+            local_date: local_date.to_owned(),
+            start_nanos: i64::try_from(
+                start
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn local_usage_status(reliable: bool, middle_days_tokens: Option<u64>) -> LocalUsageStatus {
+        let period_boundary = period_boundary("2026-08-01");
+        LocalUsageStatus {
+            date: "2026-08-10".to_owned(),
+            today_reliable: reliable,
+            period_boundary: Some(period_boundary.clone()),
+            period_boundary_tokens: 0,
+            period_boundary_reliable: reliable,
+            period_baseline: middle_days_tokens.map(|middle_days_tokens| PeriodUsageBaseline {
+                date: "2026-08-10".to_owned(),
+                boundary: period_boundary,
+                middle_days_tokens,
+            }),
+            ..LocalUsageStatus::default()
+        }
+    }
+
     #[test]
     fn repeated_notification_pushes_debounce_deadline_forward() {
         let first = Instant::now();
@@ -459,5 +767,292 @@ mod tests {
     fn reconnect_backoff_caps_at_thirty_seconds() {
         assert_eq!(reconnect_backoff(0), Duration::from_secs(1));
         assert_eq!(reconnect_backoff(99), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rpc_usage_does_not_override_reliable_local_today_value() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(10),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(true, Some(30));
+
+        publish_rpc_token_usage(
+            &state,
+            Some(20),
+            Some(50),
+            Some(40),
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state.lock().ok().map(|state| (
+                state.today_tokens,
+                state.current_period_tokens,
+                state.lifetime_tokens
+            )),
+            Some((Some(10), Some(40), Some(40)))
+        );
+    }
+
+    #[test]
+    fn rpc_usage_fills_today_when_local_snapshot_is_unreliable() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(false, Some(30));
+
+        publish_rpc_token_usage(
+            &state,
+            Some(20),
+            Some(50),
+            None,
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .map(|state| (state.today_tokens, state.current_period_tokens)),
+            Some((Some(20), Some(50)))
+        );
+    }
+
+    #[test]
+    fn rpc_period_is_used_when_start_day_boundary_is_unreliable() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(25),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let mut local_usage = local_usage_status(true, Some(20));
+        local_usage.period_boundary_reliable = false;
+
+        publish_rpc_token_usage(
+            &state,
+            Some(30),
+            Some(100),
+            None,
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .map(|state| (state.today_tokens, state.current_period_tokens)),
+            Some((Some(25), Some(100)))
+        );
+    }
+
+    #[test]
+    fn missing_rpc_usage_preserves_last_successful_values() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(10),
+            current_period_tokens: Some(30),
+            lifetime_tokens: Some(40),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(false, None);
+
+        publish_rpc_token_usage(
+            &state,
+            None,
+            None,
+            None,
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state.lock().ok().map(|state| (
+                state.today_tokens,
+                state.current_period_tokens,
+                state.lifetime_tokens
+            )),
+            Some((Some(10), Some(30), Some(40)))
+        );
+    }
+
+    #[test]
+    fn missing_rpc_today_bucket_still_combines_history_with_local_today() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(25),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(true, Some(100));
+
+        publish_rpc_token_usage(
+            &state,
+            None,
+            Some(100),
+            None,
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .and_then(|state| state.current_period_tokens),
+            Some(125)
+        );
+    }
+
+    #[test]
+    fn current_period_combines_local_boundary_rpc_middle_and_local_today() {
+        let mut local_usage = local_usage_status(true, Some(20));
+        local_usage.period_boundary_tokens = 15;
+
+        assert_eq!(local_usage.current_period_with_local_today(25), Some(60));
+    }
+
+    #[test]
+    fn missing_rpc_middle_days_does_not_publish_partial_local_period() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(25),
+            current_period_tokens: Some(90),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let mut local_usage = local_usage_status(true, None);
+        local_usage.period_boundary_tokens = 15;
+
+        publish_rpc_token_usage(
+            &state,
+            None,
+            None,
+            None,
+            "2026-08-10",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .and_then(|state| state.current_period_tokens),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn local_refresh_advances_current_period_without_another_rpc_read() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(10),
+            current_period_tokens: Some(110),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(true, Some(100));
+
+        publish_local_token_usage(&state, Some(25), &local_usage, &notify);
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .map(|state| (state.today_tokens, state.current_period_tokens)),
+            Some((Some(25), Some(125)))
+        );
+    }
+
+    #[test]
+    fn mismatched_baseline_date_does_not_change_current_period() {
+        let state = Arc::new(Mutex::new(AppState {
+            current_period_tokens: Some(110),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let mut local_usage = local_usage_status(true, Some(100));
+        local_usage.date = "2026-08-11".to_owned();
+
+        publish_local_token_usage(&state, Some(25), &local_usage, &notify);
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .and_then(|state| state.current_period_tokens),
+            Some(110)
+        );
+    }
+
+    #[test]
+    fn changed_period_boundary_invalidates_historical_baseline() {
+        let mut local_usage = local_usage_status(true, Some(100));
+
+        let changed = local_usage.synchronize_period_boundary(PeriodBoundary::from_start(
+            period_start() + Duration::from_secs(1),
+        ));
+
+        assert!(changed && local_usage.period_baseline.is_none());
+    }
+
+    #[test]
+    fn rpc_usage_is_used_when_local_reliability_belongs_to_previous_date() {
+        let state = Arc::new(Mutex::new(AppState {
+            today_tokens: Some(10),
+            current_period_tokens: Some(110),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+        let local_usage = local_usage_status(true, Some(100));
+
+        publish_rpc_token_usage(
+            &state,
+            Some(20),
+            Some(120),
+            None,
+            "2026-08-11",
+            &local_usage,
+            &notify,
+        );
+
+        assert_eq!(
+            state
+                .lock()
+                .ok()
+                .map(|state| (state.today_tokens, state.current_period_tokens)),
+            Some((Some(20), Some(120)))
+        );
+    }
+
+    #[test]
+    fn period_starting_today_uses_only_boundary_slice() {
+        let mut local_usage = local_usage_status(true, Some(0));
+        local_usage.period_boundary_tokens = 25;
+        if let Some(baseline) = local_usage.period_baseline.as_mut() {
+            baseline.boundary.local_date = "2026-08-10".to_owned();
+        }
+        if let Some(boundary) = local_usage.period_boundary.as_mut() {
+            boundary.local_date = "2026-08-10".to_owned();
+        }
+
+        let current_period = local_usage.current_period_with_local_today(100);
+
+        assert_eq!(current_period, Some(25));
+    }
+
+    #[test]
+    fn hybrid_current_period_uses_saturating_addition() {
+        let local_usage = local_usage_status(true, Some(u64::MAX));
+
+        let current_period = local_usage.current_period_with_local_today(1);
+
+        assert_eq!(current_period, Some(u64::MAX));
     }
 }

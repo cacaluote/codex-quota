@@ -99,4 +99,8 @@ cargo test
 
 ## 许可证
 
-MIT
+本项目源代码采用 [MIT License](LICENSE) 发布，完整许可文本见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 Codex Quota contributors
+
+本项目是独立的第三方工具，与 OpenAI 或 Codex 官方无隶属、代理或背书关系。OpenAI、Codex 等名称及相关标识归各自权利人所有。

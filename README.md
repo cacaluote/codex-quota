@@ -3,6 +3,11 @@
 一个轻量的 Windows 原生 Codex 额度悬浮窗。它通过本机已登录的 Codex CLI 读取账户额度，在桌面边缘持续显示剩余额度、重置时间和连接状态。
 
 ## 功能
+<img width="459" height="429" alt="CodexQ-ball" width="200" src="https://github.com/user-attachments/assets/334533e0-cbc9-43cb-a95d-215cac1bf3cb" />
+<img width="459" height="429" alt="codexQ-panel" width="200" src="https://github.com/user-attachments/assets/50cbdb82-90dc-44a7-8125-ff72ead31d16" />
+<img width="458" height="429" alt="CodexQ-menu" width="200" src="https://github.com/user-attachments/assets/f7b2e359-5621-412f-b479-ae421fe41736" />
+
+
 
 - 以悬浮球显示额度状态，单击可展开或收起详情面板
 - 显示主、次额度窗口的剩余百分比、重置时间，以及今日、本期和累计 Token 用量

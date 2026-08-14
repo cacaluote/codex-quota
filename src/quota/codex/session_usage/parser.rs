@@ -87,9 +87,11 @@ fn parse_file_append(candidate: &CandidateFile, cache: &mut FileCache) -> io::Re
     let mut previous_signature = cache.events.last().map(|event| event.signature.clone());
     let mut signatures_by_source: HashMap<Option<String>, TokenSignature> = HashMap::new();
     for event in &cache.events {
-        if event.signature.total.is_some() {
-            signatures_by_source.insert(event.source.clone(), event.signature.clone());
-        }
+        remember_source_signature(
+            &mut signatures_by_source,
+            event.source.clone(),
+            &event.signature,
+        );
     }
 
     loop {
@@ -200,10 +202,15 @@ fn parse_token_event(
         .map(str::to_owned);
     let total = signature.total.as_ref();
     let last = signature.last.as_ref();
+    let previous_for_source = signatures_by_source.get(&source);
     let duplicate = total.is_some()
-        && (signatures_by_source.get(&source) == Some(&signature)
+        && (previous_for_source == Some(&signature)
             || previous_signature.as_ref() == Some(&signature));
-    let delta_total = if duplicate {
+    // A later event can change last_token_usage while repeating the same
+    // cumulative total. That is a replayed snapshot, not a new turn.
+    let stale_snapshot =
+        !duplicate && last.is_some() && cumulative_did_not_advance(previous_for_source, total);
+    let delta_total = if duplicate || stale_snapshot {
         0
     } else if let Some(last) = last {
         last.effective_total()
@@ -214,8 +221,8 @@ fn parse_token_event(
     };
     if let Some(total) = total {
         update_high_water(&mut cache.high_water, total);
-        signatures_by_source.insert(source.clone(), signature.clone());
     }
+    remember_source_signature(signatures_by_source, source.clone(), &signature);
     *previous_signature = Some(signature.clone());
     if timestamp.is_none() {
         cache.token_without_timestamp = true;
@@ -304,6 +311,39 @@ fn parse_counters(value: Option<&Value>) -> Option<TokenCounters> {
         total: value.get("total_tokens").and_then(Value::as_u64),
     };
     counters.has_value().then_some(counters)
+}
+
+fn remember_source_signature(
+    signatures_by_source: &mut HashMap<Option<String>, TokenSignature>,
+    source: Option<String>,
+    signature: &TokenSignature,
+) {
+    let Some(total) = signature.total.as_ref() else {
+        return;
+    };
+    // Older snapshots can arrive after a higher cumulative total. Keep the
+    // peak so a later partial recovery is not treated as a new turn.
+    if signatures_by_source.get(&source).is_some_and(|previous| {
+        previous.total.as_ref().is_some_and(|previous_total| {
+            total.effective_total() <= previous_total.effective_total()
+        })
+    }) {
+        return;
+    }
+    signatures_by_source.insert(source, signature.clone());
+}
+
+fn cumulative_did_not_advance(
+    previous: Option<&TokenSignature>,
+    total: Option<&TokenCounters>,
+) -> bool {
+    let Some(total) = total else {
+        return false;
+    };
+    let Some(previous_total) = previous.and_then(|signature| signature.total.as_ref()) else {
+        return false;
+    };
+    total.effective_total() <= previous_total.effective_total()
 }
 
 fn cumulative_delta(high_water: Option<&UsageHighWater>, total: &TokenCounters) -> u64 {
@@ -456,6 +496,81 @@ mod tests {
             result.ok().map(|value| value.0.today_tokens),
             Some(u64::MAX)
         );
+    }
+
+    #[test]
+    fn refresh_ignores_last_usage_when_cumulative_total_does_not_advance() {
+        let context = TestContext::new("stale-last");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 1_000, Some(200), Some("codex")),
+                token_count(&context.at(2), 1_000, Some(50), Some("codex")),
+                token_count(&context.at(3), 1_080, Some(80), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(280));
+    }
+
+    #[test]
+    fn refresh_ignores_partial_recovery_below_source_high_water() {
+        let context = TestContext::new("partial-recovery");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 1_000, Some(100), Some("codex")),
+                token_count(&context.at(2), 900, Some(80), Some("codex")),
+                token_count(&context.at(3), 950, Some(50), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(100));
+    }
+
+    #[test]
+    fn refresh_counts_last_usage_after_source_total_passes_high_water() {
+        let context = TestContext::new("pass-high-water");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 1_000, Some(100), Some("codex")),
+                token_count(&context.at(2), 900, Some(80), Some("codex")),
+                token_count(&context.at(3), 1_100, Some(100), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(200));
+    }
+
+    #[test]
+    fn refresh_keeps_last_usage_when_other_source_has_lower_cumulative_total() {
+        let context = TestContext::new("interleaved-lower-total");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 1_000, Some(100), Some("codex")),
+                token_count(&context.at(2), 500, Some(50), Some("other")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(150));
     }
 
     #[test]

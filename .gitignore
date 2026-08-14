@@ -30,3 +30,6 @@ Desktop.ini
 *.pdb
 *.ilk
 *.exp
+
+# Release artifacts
+/dist/

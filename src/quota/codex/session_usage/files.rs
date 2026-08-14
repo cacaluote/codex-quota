@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -20,6 +21,12 @@ const MAX_DISCOVERY_DEPTH: usize = 3;
 
 pub(super) struct Discovery {
     pub(super) candidates: Vec<CandidateFile>,
+    pub(super) errors: usize,
+}
+
+pub(super) struct ChangedDiscovery {
+    pub(super) candidates: Vec<CandidateFile>,
+    pub(super) missing: Vec<PathBuf>,
     pub(super) errors: usize,
 }
 
@@ -72,6 +79,33 @@ pub(super) fn discover_candidates(codex_dir: &Path) -> Result<Discovery, Session
     Ok(Discovery { candidates, errors })
 }
 
+pub(super) fn inspect_changed_candidates(paths: &HashSet<PathBuf>) -> ChangedDiscovery {
+    let mut candidates = Vec::with_capacity(paths.len());
+    let mut missing = Vec::new();
+    let mut errors = 0usize;
+    for path in paths {
+        match path.metadata() {
+            Ok(metadata) if metadata.is_file() && is_jsonl(path) => {
+                candidates.push(CandidateFile {
+                    thread_id: thread_id_from_filename(path),
+                    creation_time: metadata.creation_time(),
+                    last_write_time: metadata.last_write_time(),
+                    length: metadata.file_size(),
+                    path: path.clone(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(path.clone()),
+            Err(_) => errors = errors.saturating_add(1),
+        }
+    }
+    ChangedDiscovery {
+        candidates,
+        missing,
+        errors,
+    }
+}
+
 fn existing_directory(path: &Path) -> io::Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_dir()),
@@ -112,19 +146,27 @@ fn is_jsonl(path: &Path) -> bool {
 }
 
 pub(super) fn is_date_partition(path: &Path, date: &str) -> bool {
-    let mut parts = date.split('-');
-    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
+    session_partition_date(path).as_deref() == Some(date)
+}
+
+pub(super) fn is_date_partition_in_range(path: &Path, start: &str, end: &str) -> bool {
+    session_partition_date(path).is_some_and(|date| date.as_str() >= start && date.as_str() <= end)
+}
+
+fn session_partition_date(path: &Path) -> Option<String> {
     let components: Vec<_> = path
         .components()
         .filter_map(|component| component.as_os_str().to_str())
         .collect();
-    components.windows(4).any(|window| {
-        window[0].eq_ignore_ascii_case("sessions")
-            && window[1] == year
-            && window[2] == month
-            && window[3] == day
+    components.windows(4).find_map(|window| {
+        (window[0].eq_ignore_ascii_case("sessions")
+            && window[1].len() == 4
+            && window[2].len() == 2
+            && window[3].len() == 2
+            && window[1].bytes().all(|value| value.is_ascii_digit())
+            && window[2].bytes().all(|value| value.is_ascii_digit())
+            && window[3].bytes().all(|value| value.is_ascii_digit()))
+        .then(|| format!("{}-{}-{}", window[1], window[2], window[3]))
     })
 }
 
@@ -216,6 +258,24 @@ mod tests {
     use super::*;
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn session_partition_inside_period_is_selected() {
+        let path = Path::new("C:\\Users\\test\\.codex\\sessions\\2026\\08\\10\\rollout.jsonl");
+
+        assert!(is_date_partition_in_range(path, "2026-08-09", "2026-08-11"));
+    }
+
+    #[test]
+    fn session_partition_before_period_is_not_selected() {
+        let path = Path::new("C:\\Users\\test\\.codex\\sessions\\2026\\08\\08\\rollout.jsonl");
+
+        assert!(!is_date_partition_in_range(
+            path,
+            "2026-08-09",
+            "2026-08-11"
+        ));
+    }
 
     #[test]
     fn shared_reader_allows_session_to_be_appended_and_archived() {

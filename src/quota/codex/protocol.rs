@@ -54,8 +54,6 @@ struct RawAccount {
 #[serde(rename_all = "camelCase")]
 struct RawUsageReadResult {
     summary: Option<RawUsageSummary>,
-    #[serde(default)]
-    daily_usage_buckets: Option<Vec<RawDailyUsageBucket>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,18 +62,8 @@ struct RawUsageSummary {
     lifetime_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawDailyUsageBucket {
-    start_date: String,
-    tokens: u64,
-}
-
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct TokenUsage {
-    pub(super) today: Option<u64>,
-    pub(super) current_period_middle_days: Option<u64>,
-    pub(super) current_period: Option<u64>,
+pub(super) struct LifetimeUsage {
     pub(super) lifetime: Option<u64>,
 }
 
@@ -114,45 +102,9 @@ pub(super) fn parse_account_result(value: Value) -> Result<Option<String>, AppEr
     Ok(result.account.and_then(|account| account.plan_type))
 }
 
-pub(super) fn parse_token_usage(
-    value: Value,
-    today: &str,
-    period_start: Option<&str>,
-) -> Result<TokenUsage, AppError> {
+pub(super) fn parse_lifetime_usage(value: Value) -> Result<LifetimeUsage, AppError> {
     let result: RawUsageReadResult = serde_json::from_value(value)?;
-    let buckets = result.daily_usage_buckets.as_deref();
-    let today_tokens = buckets.and_then(|buckets| {
-        buckets
-            .iter()
-            .find(|bucket| bucket.start_date == today)
-            .map(|bucket| bucket.tokens)
-    });
-    let current_period = period_start.and_then(|start| {
-        buckets.map(|buckets| {
-            buckets
-                .iter()
-                .filter(|bucket| {
-                    bucket.start_date.as_str() >= start && bucket.start_date.as_str() <= today
-                })
-                .map(|bucket| bucket.tokens)
-                .fold(0_u64, u64::saturating_add)
-        })
-    });
-    let current_period_middle_days = period_start.and_then(|start| {
-        buckets.map(|buckets| {
-            buckets
-                .iter()
-                .filter(|bucket| {
-                    bucket.start_date.as_str() > start && bucket.start_date.as_str() < today
-                })
-                .map(|bucket| bucket.tokens)
-                .fold(0_u64, u64::saturating_add)
-        })
-    });
-    Ok(TokenUsage {
-        today: today_tokens,
-        current_period_middle_days,
-        current_period,
+    Ok(LifetimeUsage {
         lifetime: result.summary.and_then(|summary| summary.lifetime_tokens),
     })
 }
@@ -334,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_parser_reads_matching_local_date() {
+    fn usage_parser_reads_lifetime_and_ignores_daily_buckets() {
         let result = json!({
             "summary": {
                 "lifetimeTokens": 900_000,
@@ -350,106 +302,23 @@ mod tests {
         });
 
         assert_eq!(
-            parse_token_usage(result, "2026-07-31", Some("2026-07-30")).ok(),
-            Some(TokenUsage {
-                today: Some(67_890),
-                current_period_middle_days: Some(0),
-                current_period: Some(80_235),
+            parse_lifetime_usage(result).ok(),
+            Some(LifetimeUsage {
                 lifetime: Some(900_000),
             })
         );
     }
 
     #[test]
-    fn usage_parser_keeps_only_complete_days_between_period_boundaries() {
-        let result = json!({
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-29", "tokens": 1_000 },
-                { "startDate": "2026-07-30", "tokens": 12_345 },
-                { "startDate": "2026-07-31", "tokens": 67_890 }
-            ]
-        });
-
-        assert_eq!(
-            parse_token_usage(result, "2026-07-31", Some("2026-07-29"))
-                .ok()
-                .and_then(|usage| usage.current_period_middle_days),
-            Some(12_345)
-        );
-    }
-
-    #[test]
-    fn usage_parser_does_not_fall_back_to_another_date() {
-        let result = json!({
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-30", "tokens": 12_345 }
-            ]
-        });
-
-        assert_eq!(
-            parse_token_usage(result, "2026-07-31", None).ok(),
-            Some(TokenUsage {
-                today: None,
-                current_period_middle_days: None,
-                current_period: None,
-                lifetime: None,
-            })
-        );
-    }
-
-    #[test]
-    fn usage_parser_exposes_history_when_today_bucket_is_missing() {
-        let result = json!({
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-30", "tokens": 12_345 }
-            ]
-        });
-
-        assert_eq!(
-            parse_token_usage(result, "2026-07-31", Some("2026-07-30")).ok(),
-            Some(TokenUsage {
-                today: None,
-                current_period_middle_days: Some(0),
-                current_period: Some(12_345),
-                lifetime: None,
-            })
-        );
-    }
-
-    #[test]
-    fn usage_parser_returns_zero_history_when_period_starts_today() {
-        let result = json!({
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-31", "tokens": 67_890 }
-            ]
-        });
-
-        assert_eq!(
-            parse_token_usage(result, "2026-07-31", Some("2026-07-31")).ok(),
-            Some(TokenUsage {
-                today: Some(67_890),
-                current_period_middle_days: Some(0),
-                current_period: Some(67_890),
-                lifetime: None,
-            })
-        );
-    }
-
-    #[test]
-    fn usage_parser_accepts_null_daily_buckets() {
+    fn usage_parser_accepts_null_summary() {
         let result = json!({
             "summary": null,
             "dailyUsageBuckets": null
         });
 
         assert_eq!(
-            parse_token_usage(result, "2026-07-31", Some("2026-07-25")).ok(),
-            Some(TokenUsage {
-                today: None,
-                current_period_middle_days: None,
-                current_period: None,
-                lifetime: None,
-            })
+            parse_lifetime_usage(result).ok(),
+            Some(LifetimeUsage { lifetime: None })
         );
     }
 

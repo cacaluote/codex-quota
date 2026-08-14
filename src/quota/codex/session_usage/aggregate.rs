@@ -21,15 +21,22 @@ pub(super) fn aggregate_today(
     })
 }
 
-pub(super) fn aggregate_period_boundary(
-    date: &str,
+pub(super) fn aggregate_period(
     start_nanos: i64,
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
 ) -> (u64, bool, usize) {
     aggregate_usage(selected, caches, rollout_index, |event| {
-        event_is_on_date(event, date)
+        event
+            .timestamp_nanos
+            .is_some_and(|timestamp| timestamp >= start_nanos)
+    })
+}
+
+pub(super) fn cache_has_tokens_in_period(cache: &FileCache, start_nanos: i64) -> bool {
+    cache.events.iter().any(|event| {
+        event.delta_total > 0
             && event
                 .timestamp_nanos
                 .is_some_and(|timestamp| timestamp >= start_nanos)
@@ -74,10 +81,8 @@ where
             continue;
         }
         if cache.uncertain || cache.token_without_timestamp {
-            if has_usage || cache.uncertain {
-                reliable = false;
-                deferred_files = deferred_files.saturating_add(1);
-            }
+            reliable = false;
+            deferred_files = deferred_files.saturating_add(1);
             continue;
         }
         let Some(thread_id) = root.thread_id.as_ref() else {

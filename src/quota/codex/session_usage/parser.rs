@@ -18,8 +18,9 @@ pub(super) fn update_candidate_cache(
     candidate: &CandidateFile,
     caches: &mut HashMap<String, FileCache>,
     diagnostics: &mut RefreshDiagnostics,
-) {
+) -> bool {
     let key = path_key(&candidate.path);
+    let mut cache_dirty = false;
     if !caches.contains_key(&key)
         && let Some(old_key) = caches.iter().find_map(|(old_key, cache)| {
             cache.has_same_identity(candidate).then(|| old_key.clone())
@@ -28,28 +29,55 @@ pub(super) fn update_candidate_cache(
     {
         moved.path.clone_from(&key);
         caches.insert(key.clone(), moved);
+        cache_dirty = true;
     }
 
-    let mut cache = caches
-        .remove(&key)
-        .unwrap_or_else(|| FileCache::empty(candidate));
+    let existing = caches.remove(&key);
+    cache_dirty |= existing.is_none();
+    let mut cache = existing.unwrap_or_else(|| FileCache::empty(candidate));
     if !cache.can_resume(candidate) {
         cache = FileCache::empty(candidate);
+        cache_dirty = true;
     }
+    cache_dirty |= cache.path != key
+        || cache.filename_thread_id != candidate.thread_id
+        || cache.creation_time != candidate.creation_time
+        || cache.length != candidate.length
+        || cache.last_write_time != candidate.last_write_time;
     cache.path.clone_from(&key);
     cache.filename_thread_id.clone_from(&candidate.thread_id);
     cache.creation_time = candidate.creation_time;
 
     if candidate.length > cache.offset {
+        let previous_offset = cache.offset;
+        let previous_root = cache.root.clone();
+        let previous_events = cache.events.len();
+        let previous_high_water = cache.high_water.clone();
+        let previous_max_timestamp = cache.max_timestamp_nanos;
+        let previous_token_without_timestamp = cache.token_without_timestamp;
+        let previous_uncertain = cache.uncertain;
+        let previous_parse_errors = cache.parse_errors;
         diagnostics.files_read = diagnostics.files_read.saturating_add(1);
         if parse_file_append(candidate, &mut cache).is_err() {
             cache.uncertain = true;
             cache.parse_errors = cache.parse_errors.saturating_add(1);
         }
+        diagnostics.token_events_added = diagnostics
+            .token_events_added
+            .saturating_add(cache.events.len().saturating_sub(previous_events));
+        cache_dirty |= previous_offset != cache.offset
+            || previous_root != cache.root
+            || previous_events != cache.events.len()
+            || previous_high_water != cache.high_water
+            || previous_max_timestamp != cache.max_timestamp_nanos
+            || previous_token_without_timestamp != cache.token_without_timestamp
+            || previous_uncertain != cache.uncertain
+            || previous_parse_errors != cache.parse_errors;
     }
     cache.length = candidate.length;
     cache.last_write_time = candidate.last_write_time;
     caches.insert(key, cache);
+    cache_dirty
 }
 
 fn parse_file_append(candidate: &CandidateFile, cache: &mut FileCache) -> io::Result<()> {

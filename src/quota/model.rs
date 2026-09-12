@@ -122,6 +122,12 @@ pub struct AppState {
     pub lifetime_tokens: Option<u64>,
     pub last_error: Option<String>,
     pub quota_refresh_interval: Duration,
+    /// 今日已用 token 的 API 牌价等价价值（分桶计价；不可靠/无价格表为 None）。
+    pub today_cost: Option<f64>,
+    /// 本期已用 token 的 API 牌价等价价值。
+    pub current_period_cost: Option<f64>,
+    /// 本期窗口满额的 API 等价价值估算 = 本期已用 ÷ 周额度已用%。
+    pub period_total_value_estimate: Option<f64>,
 }
 
 impl Default for AppState {
@@ -135,6 +141,9 @@ impl Default for AppState {
             lifetime_tokens: None,
             last_error: None,
             quota_refresh_interval: Duration::from_mins(5),
+            today_cost: None,
+            current_period_cost: None,
+            period_total_value_estimate: None,
         }
     }
 }

@@ -39,8 +39,9 @@ use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
 use super::presentation::{
-    PlanColor, ball_quota, display_windows, format_local_timestamp, format_token_usage,
-    panel_title, plan_type_color, plan_type_label, quota_window_label,
+    PlanColor, ball_quota, display_period_total_value, display_windows, format_local_timestamp,
+    format_token_usage, format_usd, panel_title, plan_type_color, plan_type_label,
+    quota_window_label,
 };
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
@@ -395,16 +396,32 @@ impl Renderer {
         let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
         self.draw_quota_row(&short_term_label, short_term, 42.0, width, opacity);
         self.draw_quota_row(&long_term_label, long_term, 69.0, width, opacity);
-        self.draw_token_usage_row("今日使用", state.today_tokens, 96.0, width, opacity);
+        self.draw_token_usage_row(
+            "今日使用",
+            state.today_tokens,
+            Some(state.today_cost),
+            96.0,
+            width,
+            opacity,
+        );
         self.draw_token_usage_row(
             "本期使用",
             state.current_period_tokens,
+            Some(state.current_period_cost),
             123.0,
             width,
             opacity,
         );
-        self.draw_token_usage_row("累计使用", state.lifetime_tokens, 150.0, width, opacity);
-        self.draw_update_row(state, 179.0, width, opacity);
+        self.draw_period_total_value_row(state, 150.0, opacity);
+        self.draw_token_usage_row(
+            "累计使用",
+            state.lifetime_tokens,
+            None,
+            177.0,
+            width,
+            opacity,
+        );
+        self.draw_update_row(state, 204.0, width, opacity);
     }
 
     fn draw_quota_row(
@@ -511,14 +528,24 @@ impl Renderer {
         );
     }
 
+    /// `cost` 外层 `None` 表示该行没有价值列（累计行，tokens 占满宽度）；
+    /// 内层 `None` 表示价值未知（价值列显示 `--`，同额度行的未知态）。
+    /// 有价值列时布局与额度行对齐：label | $价值(96→140) | tokens(140→)。
+    #[allow(clippy::option_option)] // 三态（无价值列 / 未知 / 有值）用双 Option 语义最直接。
     fn draw_token_usage_row(
         &self,
         label: &str,
         tokens: Option<u64>,
+        cost: Option<Option<f64>>,
         top: f32,
         width: f32,
         opacity: f32,
     ) {
+        let label_right = if cost.is_some() {
+            94.0
+        } else {
+            TIME_COLUMN_LEFT
+        };
         self.draw_text_with_opacity(
             label,
             &self.body_format,
@@ -526,11 +553,30 @@ impl Renderer {
             D2D_RECT_F {
                 left: 18.0,
                 top,
-                right: TIME_COLUMN_LEFT,
+                right: label_right,
                 bottom: top + 23.0,
             },
             opacity,
         );
+        if let Some(cost) = cost {
+            // 价值列与额度百分比同色（健康绿），视觉上与额度行成组。
+            self.draw_text_with_opacity(
+                &format_usd(cost),
+                &self.body_format,
+                if cost.is_some() {
+                    &self.brushes.green
+                } else {
+                    &self.brushes.unknown
+                },
+                D2D_RECT_F {
+                    left: 96.0,
+                    top,
+                    right: 140.0,
+                    bottom: top + 23.0,
+                },
+                opacity,
+            );
+        }
         self.draw_text_with_opacity(
             &format_token_usage(tokens),
             &self.body_format,
@@ -543,6 +589,38 @@ impl Renderer {
                 left: TIME_COLUMN_LEFT,
                 top,
                 right: width - 18.0,
+                bottom: top + 23.0,
+            },
+            opacity,
+        );
+    }
+
+    fn draw_period_total_value_row(&self, state: &AppState, top: f32, opacity: f32) {
+        let estimate = display_period_total_value(state, SystemTime::now());
+        self.draw_text_with_opacity(
+            "本期估值",
+            &self.body_format,
+            &self.brushes.secondary_text,
+            D2D_RECT_F {
+                left: 18.0,
+                top,
+                right: 94.0,
+                bottom: top + 23.0,
+            },
+            opacity,
+        );
+        self.draw_text_with_opacity(
+            &format_usd(estimate),
+            &self.body_format,
+            if estimate.is_some() {
+                &self.brushes.green
+            } else {
+                &self.brushes.unknown
+            },
+            D2D_RECT_F {
+                left: 96.0,
+                top,
+                right: 140.0,
                 bottom: top + 23.0,
             },
             opacity,

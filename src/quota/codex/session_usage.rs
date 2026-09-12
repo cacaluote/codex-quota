@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aggregate::{
-    aggregate_lifetime, aggregate_period, aggregate_today, cache_has_tokens_in_period,
-    cache_has_tokens_on_date,
+    ModelVolumes, aggregate_lifetime, aggregate_period, aggregate_today,
+    cache_has_tokens_in_period, cache_has_tokens_on_date,
 };
 use files::{
     codex_home, discover_candidates, inspect_changed_candidates, is_date_partition,
@@ -29,7 +29,8 @@ use super::PeriodBoundary;
 use super::protocol::{local_calendar_date, local_calendar_date_at};
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-const CACHE_VERSION: u32 = 2;
+// Reparse persisted deltas calculated before model-aware duplicate detection.
+const CACHE_VERSION: u32 = 4;
 const CACHE_FILENAME: &str = "usage-cache-v1.json";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +39,9 @@ pub(super) struct LocalUsageSnapshot {
     pub(super) today_reliable: bool,
     pub(super) current_period_tokens: u64,
     pub(super) current_period_reliable: bool,
+    /// 分桶用量（reliable 才有），用于按模型计价。
+    pub(super) today_volume: Option<ModelVolumes>,
+    pub(super) period_volume: Option<ModelVolumes>,
     pub(super) quota: Option<QuotaSnapshot>,
     pub(super) plan_type: Option<String>,
     pub(super) lifetime_tokens: Option<u64>,
@@ -423,32 +427,26 @@ impl ScanContext {
             self.diagnostics.deferred_files = deferred_files;
             snapshot
         } else {
-            let (today_tokens, today_aggregate_reliable, today_deferred) = aggregate_today(
-                today,
-                &self.today_selected,
-                &self.caches,
-                &self.rollout_index,
-            );
+            let (today_tokens, today_aggregate_reliable, today_deferred, today_volumes) =
+                aggregate_today(
+                    today,
+                    &self.today_selected,
+                    &self.caches,
+                    &self.rollout_index,
+                );
             let today_reliable = today_aggregate_reliable && self.diagnostics.discovery_errors == 0;
-            let (current_period_tokens, current_period_reliable, period_deferred) = boundary
-                .map_or((0, false, 0), |boundary| {
-                    let has_openai_start_file = self.period_selected.iter().any(|key| {
-                        self.caches.get(key).is_some_and(|cache| {
-                            cache.root.as_ref().is_some_and(|root| {
-                                root.provider.as_deref() == Some("openai")
-                                    && (root
-                                        .timestamp_nanos
-                                        .and_then(system_time_from_unix_nanos)
-                                        .and_then(local_calendar_date_at)
-                                        .as_deref()
-                                        == Some(boundary.local_date())
-                                        || cache.events.iter().any(|event| {
-                                            event_is_on_date(event, boundary.local_date())
-                                        }))
-                            })
-                        })
-                    });
-                    let (tokens, reliable, deferred) = aggregate_period(
+            let (current_period_tokens, current_period_reliable, period_deferred, period_volumes) =
+                boundary.map_or((0, false, 0, ModelVolumes::default()), |boundary| {
+                    // 窗口内本机没有任何会话文件痕迹时，本期就是可靠的 0
+                    // （与今日口径一致）；只有存在文件却锚定不到窗口起点时
+                    // 才保守显示 --（日志可能未覆盖窗口开头）。
+                    let anchored = self.period_selected.is_empty()
+                        || period_has_openai_start_file(
+                            &self.caches,
+                            &self.period_selected,
+                            boundary,
+                        );
+                    let (tokens, reliable, deferred, period_volumes) = aggregate_period(
                         boundary.start_nanos(),
                         &self.period_selected,
                         &self.caches,
@@ -456,8 +454,9 @@ impl ScanContext {
                     );
                     (
                         tokens,
-                        has_openai_start_file && reliable && self.diagnostics.discovery_errors == 0,
+                        anchored && reliable && self.diagnostics.discovery_errors == 0,
                         deferred,
+                        period_volumes,
                     )
                 });
             self.diagnostics.deferred_files = today_deferred.saturating_add(period_deferred);
@@ -466,6 +465,8 @@ impl ScanContext {
                 today_reliable,
                 current_period_tokens,
                 current_period_reliable,
+                today_volume: today_reliable.then_some(today_volumes),
+                period_volume: current_period_reliable.then_some(period_volumes),
                 quota: None,
                 plan_type: None,
                 lifetime_tokens: None,
@@ -517,6 +518,32 @@ impl ScanContext {
             cache_dirty: self.cache_dirty,
         }
     }
+}
+
+/// 本期窗口起点当天是否存在 openai 会话痕迹：没有锚定痕迹时“本期”的
+/// 可靠性无从谈起，宁可显示 --。
+fn period_has_openai_start_file(
+    caches: &HashMap<String, FileCache>,
+    period_selected: &HashSet<String>,
+    boundary: &PeriodBoundary,
+) -> bool {
+    period_selected.iter().any(|key| {
+        caches.get(key).is_some_and(|cache| {
+            cache.root.as_ref().is_some_and(|root| {
+                root.provider.as_deref() == Some("openai")
+                    && (root
+                        .timestamp_nanos
+                        .and_then(system_time_from_unix_nanos)
+                        .and_then(local_calendar_date_at)
+                        .as_deref()
+                        == Some(boundary.local_date())
+                        || cache
+                            .events
+                            .iter()
+                            .any(|event| event_is_on_date(event, boundary.local_date())))
+            })
+        })
+    })
 }
 
 impl SessionUsageTracker {
@@ -1079,6 +1106,47 @@ mod test_support {
         })
     }
 
+    pub(super) fn turn_context_model(timestamp: &str, model: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "turn_context",
+            "payload": { "model": model }
+        })
+    }
+
+    /// 带分桶明细的 `token_count`：`total` 与 `last` 相同（单次请求快照）。
+    pub(super) fn token_count_buckets(
+        timestamp: &str,
+        input: u64,
+        cached_input: u64,
+        output: u64,
+        reasoning_output: u64,
+        source: Option<&str>,
+    ) -> Value {
+        let usage = json!({
+            "input_tokens": input,
+            "cached_input_tokens": cached_input,
+            "output_tokens": output,
+            "reasoning_output_tokens": reasoning_output,
+            "total_tokens": input + output
+        });
+        json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": usage,
+                    "last_token_usage": usage
+                },
+                "rate_limits": source.map_or_else(
+                    || Value::Null,
+                    |limit_id| json!({ "limit_id": limit_id })
+                )
+            }
+        })
+    }
+
     pub(super) fn turn_context(timestamp: &str) -> Value {
         json!({
             "timestamp": timestamp,
@@ -1163,7 +1231,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_start_day_log_keeps_today_reliable_but_period_unreliable() {
+    fn missing_start_day_log_shows_zero_period_usage() {
+        // 窗口起点已知且本机窗口内没有任何会话文件：本期与今日一致地
+        // 显示可靠的 0（本机口径），而不是 --。
         let context = TestContext::new("missing-period-boundary");
         let period_boundary =
             timestamp_as_system_time(&context.timestamp).and_then(PeriodBoundary::from_start);
@@ -1176,8 +1246,9 @@ mod tests {
                 value.0.today_tokens,
                 value.0.today_reliable,
                 value.0.current_period_reliable,
+                value.0.current_period_tokens,
             )),
-            Some((0, true, false))
+            Some((0, true, true, 0))
         );
     }
 
@@ -2147,6 +2218,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::quota::AppState;
+        use crate::quota::pricing::PriceTable;
 
         use super::super::{LocalUsageStatus, refresh_local_usage};
 
@@ -2174,10 +2246,79 @@ mod tests {
         let mut tracker = context.tracker();
         let mut local_usage = LocalUsageStatus::default();
 
-        refresh_local_usage(&mut tracker, &mut local_usage, &state, &notify);
+        refresh_local_usage(
+            &mut tracker,
+            &mut local_usage,
+            &PriceTable::default(),
+            &state,
+            &notify,
+        );
 
         let current = state.lock().unwrap();
         assert!(current.snapshot.is_some());
         assert_eq!(current.current_period_tokens, Some(150));
+    }
+
+    #[test]
+    fn local_refresh_shows_zero_period_usage_for_empty_fresh_window() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::quota::AppState;
+        use crate::quota::pricing::PriceTable;
+
+        use super::super::{LocalUsageStatus, refresh_local_usage};
+
+        let context = TestContext::new("empty-fresh-window");
+        let file = context.rollout(PARENT_ID);
+        // 周窗口起点在所有事件之后（模拟外部重置后的全新窗口），本机窗口内
+        // 零用量：本期应显示可靠的 0 而不是 --。
+        let resets_at = epoch_seconds(&context.at(5)) + 7 * 24 * 3600;
+        let rate_limits = serde_json::json!({
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": 0.0,
+                "window_minutes": 300,
+                "resets_at": epoch_seconds(&context.at(4)) + 5 * 3600
+            },
+            "secondary": {
+                "used_percent": 0.0,
+                "window_minutes": 10_080,
+                "resets_at": resets_at
+            },
+            "plan_type": "plus"
+        });
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+                token_count_with_rate_limits(&context.at(2), 100, Some(100), rate_limits),
+            ],
+        );
+        // 文件改动时间留在窗口起点之前，保证 period_selected 为空。
+        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .and_then(|handle| handle.set_times(old_times))
+                .is_ok()
+        );
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let mut tracker = context.tracker();
+        let mut local_usage = LocalUsageStatus::default();
+        let prices = PriceTable::from_models_dev(
+            r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
+        )
+        .unwrap();
+
+        refresh_local_usage(&mut tracker, &mut local_usage, &prices, &state, &notify);
+
+        let current = state.lock().unwrap();
+        assert_eq!(current.current_period_tokens, Some(0));
+        assert_eq!(current.current_period_cost, Some(0.0));
+        // 本机零用量时满额估算没有意义。
+        assert_eq!(current.period_total_value_estimate, None);
     }
 }

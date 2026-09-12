@@ -53,6 +53,12 @@ pub(super) fn display_windows(
         .map_or((None, None), |snapshot| snapshot.active_windows(now))
 }
 
+pub(super) fn display_period_total_value(state: &AppState, now: SystemTime) -> Option<f64> {
+    let (_, long_term) = display_windows(state, now);
+    long_term?;
+    state.period_total_value_estimate
+}
+
 /// The floating ball's glanceable quota: the primary window's remaining, or
 /// the only window of single-window accounts. It reads 0 while any active
 /// window is exhausted — the account cannot serve requests regardless of the
@@ -129,6 +135,23 @@ pub(super) fn format_token_usage(tokens: Option<u64>) -> String {
     tokens.map_or_else(
         || "--".to_owned(),
         |value| format!("{} Token", format_token_count(value)),
+    )
+}
+
+/// 价值列宽度有限（96→140 dip）：≥$100 去小数，避免长数字被裁剪。
+/// cost 不可能为负，负零/零统一显示 $0.00。
+pub(super) fn format_usd(cost: Option<f64>) -> String {
+    cost.map_or_else(
+        || "--".to_owned(),
+        |value| {
+            if value <= 0.0 {
+                "$0.00".to_owned()
+            } else if value >= 100.0 {
+                format!("${value:.0}")
+            } else {
+                format!("${value:.2}")
+            }
+        },
     )
 }
 
@@ -212,6 +235,17 @@ mod tests {
     #[test]
     fn today_usage_appends_token_unit() {
         assert_eq!(format_token_usage(Some(42_803_000)), "4280.3万 Token");
+    }
+
+    #[test]
+    fn usd_format_drops_cents_at_hundred_dollars_and_above() {
+        assert_eq!(format_usd(Some(1.234)), "$1.23");
+        assert_eq!(format_usd(Some(123.4)), "$123");
+        assert_eq!(format_usd(Some(0.004)), "$0.00");
+        // 负零与零统一显示 $0.00。
+        assert_eq!(format_usd(Some(-0.0)), "$0.00");
+        assert_eq!(format_usd(Some(0.0)), "$0.00");
+        assert_eq!(format_usd(None), "--");
     }
 
     #[test]
@@ -406,6 +440,39 @@ mod tests {
             ("--".to_owned(), 0.0, QuotaColor::Unknown)
         );
         assert_eq!(display_windows(&state, now), (None, None));
+    }
+
+    #[test]
+    fn cached_period_estimate_disappears_when_snapshot_becomes_stale() {
+        let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(168)), None);
+        state.period_total_value_estimate = Some(100.0);
+        assert_eq!(display_period_total_value(&state, UNIX_EPOCH), Some(100.0));
+        assert_eq!(
+            display_period_total_value(&state, UNIX_EPOCH + Duration::from_mins(31)),
+            None,
+        );
+    }
+
+    #[test]
+    fn cached_period_estimate_disappears_when_long_window_expires() {
+        let mut long_term = quota_window(10.0, Duration::from_hours(168));
+        long_term.resets_at = UNIX_EPOCH + Duration::from_mins(1);
+        let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(5)), Some(long_term));
+        state.period_total_value_estimate = Some(100.0);
+        assert_eq!(display_period_total_value(&state, UNIX_EPOCH), Some(100.0));
+        assert_eq!(
+            display_period_total_value(&state, UNIX_EPOCH + Duration::from_mins(1)),
+            None,
+        );
+    }
+
+    #[test]
+    fn cached_period_estimate_requires_a_long_window() {
+        let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(5)), None);
+        state.period_total_value_estimate = Some(100.0);
+        assert_eq!(display_period_total_value(&state, UNIX_EPOCH), None);
+        state.snapshot = None;
+        assert_eq!(display_period_total_value(&state, UNIX_EPOCH), None);
     }
 
     #[test]

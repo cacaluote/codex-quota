@@ -2,6 +2,87 @@ use std::collections::{HashMap, HashSet};
 
 use super::model::{FileCache, ParentLink, TokenEvent, TokenSignature};
 use super::parser::event_is_on_date;
+use crate::quota::pricing::PriceTable;
+
+impl ModelVolumes {
+    /// 按 models.dev 牌价把分桶用量换算成美元。空价格表返回 None
+    /// （无法计价）；表内查不到的模型按 0 贡献（宁可少算不虚算）。
+    // 真实 token 计数远低于 2^53，u64→f64 的精度损失在这里不可能出现。
+    #[allow(clippy::cast_precision_loss)]
+    pub(in crate::quota::codex) fn cost(&self, table: &PriceTable) -> Option<f64> {
+        if table.is_empty() {
+            return None;
+        }
+        Some(
+            self.0
+                .iter()
+                .filter_map(|(model, volume)| {
+                    table.lookup(model.as_deref()).map(|price| {
+                        price.input * volume.uncached_input as f64 / 1_000_000.0
+                            + price.cached_input * volume.cached_input as f64 / 1_000_000.0
+                            + price.output * volume.output as f64 / 1_000_000.0
+                    })
+                })
+                // f64::sum 对空迭代器的折叠恒等值是 -0.0，会渲染成 $-0.00；
+                // 显式以 +0.0 折叠。
+                .fold(0.0, |sum, value| sum + value),
+        )
+    }
+}
+
+/// 分桶用量：计价时 `uncached_input` 按原价、`cached_input` 按 `cache_read` 价、
+/// `output` 按 output 价（`reasoning` ⊆ `output`）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(in crate::quota::codex) struct TokenVolume {
+    pub(super) uncached_input: u64,
+    pub(super) cached_input: u64,
+    pub(super) output: u64,
+}
+
+/// 按模型分桶；`None` 表示事件前没有 `turn_context` 记录、模型未知。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(in crate::quota::codex) struct ModelVolumes(
+    pub(in crate::quota::codex) Vec<(Option<String>, TokenVolume)>,
+);
+
+fn accumulate_volume(
+    volumes: &mut ModelVolumes,
+    model: Option<&str>,
+    uncached_input: u64,
+    cached_input: u64,
+    output: u64,
+) {
+    let index = volumes
+        .0
+        .iter()
+        .position(|(existing, _)| existing.as_deref() == model);
+    let volume = if let Some(index) = index {
+        &mut volumes.0[index].1
+    } else {
+        volumes
+            .0
+            .push((model.map(str::to_owned), TokenVolume::default()));
+        let Some((_, volume)) = volumes.0.last_mut() else {
+            return;
+        };
+        volume
+    };
+    volume.uncached_input = volume.uncached_input.saturating_add(uncached_input);
+    volume.cached_input = volume.cached_input.saturating_add(cached_input);
+    volume.output = volume.output.saturating_add(output);
+}
+
+fn merge_volumes(target: &mut ModelVolumes, source: ModelVolumes) {
+    for (model, volume) in source.0 {
+        accumulate_volume(
+            target,
+            model.as_deref(),
+            volume.uncached_input,
+            volume.cached_input,
+            volume.output,
+        );
+    }
+}
 
 pub(super) fn cache_has_tokens_on_date(cache: &FileCache, date: &str) -> bool {
     cache
@@ -15,7 +96,7 @@ pub(super) fn aggregate_today(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-) -> (u64, bool, usize) {
+) -> (u64, bool, usize, ModelVolumes) {
     aggregate_usage(selected, caches, rollout_index, |event| {
         event_is_on_date(event, date)
     })
@@ -26,7 +107,7 @@ pub(super) fn aggregate_period(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-) -> (u64, bool, usize) {
+) -> (u64, bool, usize, ModelVolumes) {
     aggregate_usage(selected, caches, rollout_index, |event| {
         event
             .timestamp_nanos
@@ -48,7 +129,8 @@ pub(super) fn aggregate_lifetime(
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
 ) -> (u64, bool) {
-    let (tokens, reliable, _) = aggregate_usage(selected, caches, rollout_index, |_| true);
+    // 累计价值暂不显示，分桶在这里被丢弃。
+    let (tokens, reliable, _, _) = aggregate_usage(selected, caches, rollout_index, |_| true);
     (tokens, reliable)
 }
 
@@ -57,7 +139,7 @@ fn aggregate_usage<F>(
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
     includes: F,
-) -> (u64, bool, usize)
+) -> (u64, bool, usize, ModelVolumes)
 where
     F: Fn(&TokenEvent) -> bool,
 {
@@ -105,6 +187,7 @@ where
     }
 
     let mut total = 0u64;
+    let mut volumes = ModelVolumes::default();
     for files in groups.values_mut() {
         files.sort_by_key(|file| std::cmp::Reverse(file.events.len()));
         let Some(canonical) = files.first().copied() else {
@@ -115,8 +198,11 @@ where
             .skip(1)
             .all(|other| event_prefix_matches(&other.events, &canonical.events))
         {
-            match replayed_total(canonical, caches, rollout_index, &includes) {
-                Ok(sum) => total = total.saturating_add(sum),
+            match replayed_usage(canonical, caches, rollout_index, &includes) {
+                Ok((sum, group_volumes)) => {
+                    total = total.saturating_add(sum);
+                    merge_volumes(&mut volumes, group_volumes);
+                }
                 Err(()) => {
                     defer_timeline(canonical, &includes, &mut reliable, &mut deferred_files);
                 }
@@ -141,31 +227,44 @@ where
             continue;
         };
         for chain in chains {
-            match replayed_total(chain, caches, rollout_index, &includes) {
-                Ok(sum) => total = total.saturating_add(sum),
+            match replayed_usage(chain, caches, rollout_index, &includes) {
+                Ok((sum, chain_volumes)) => {
+                    total = total.saturating_add(sum);
+                    merge_volumes(&mut volumes, chain_volumes);
+                }
                 Err(()) => defer_timeline(chain, &includes, &mut reliable, &mut deferred_files),
             }
         }
     }
-    (total, reliable, deferred_files)
+    (total, reliable, deferred_files, volumes)
 }
 
-fn replayed_total<F>(
+fn replayed_usage<F>(
     cache: &FileCache,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
     includes: &F,
-) -> Result<u64, ()>
+) -> Result<(u64, ModelVolumes), ()>
 where
     F: Fn(&TokenEvent) -> bool,
 {
     let prefix = replay_prefix(cache, caches, rollout_index)?;
-    Ok(cache
-        .events
-        .iter()
-        .skip(prefix)
-        .filter(|event| includes(event))
-        .fold(0u64, |sum, event| sum.saturating_add(event.delta_total)))
+    let mut volumes = ModelVolumes::default();
+    let total = cache.events.iter().skip(prefix).fold(0u64, |sum, event| {
+        if includes(event) {
+            accumulate_volume(
+                &mut volumes,
+                event.model.as_deref(),
+                event.delta_uncached_input,
+                event.delta_cached_input,
+                event.delta_output,
+            );
+            sum.saturating_add(event.delta_total)
+        } else {
+            sum
+        }
+    });
+    Ok((total, volumes))
 }
 
 fn defer_timeline<F>(
@@ -292,6 +391,29 @@ fn matching_replay_prefix(child: &[TokenEvent], parent: &[TokenSignature]) -> us
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
+    use super::{ModelVolumes, TokenVolume};
+    use crate::quota::pricing::PriceTable;
+
+    #[test]
+    fn cost_weights_cached_input_and_output_separately() {
+        let table = PriceTable::from_models_dev(
+            r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
+        )
+        .expect("应解析出价格表");
+        let volumes = ModelVolumes(vec![(
+            Some("m".to_owned()),
+            TokenVolume {
+                uncached_input: 1_000_000,
+                cached_input: 9_000_000,
+                output: 100_000,
+            },
+        )]);
+
+        // 1M×$4 + 9M×$0.4 + 0.1M×$20 = $9.60；全按 input 价会得出 $41.6。
+        let cost = volumes.cost(&table).unwrap();
+        assert!((cost - 9.6).abs() < 1e-9);
+        assert_eq!(volumes.cost(&PriceTable::default()), None);
+    }
 
     #[test]
     fn refresh_strips_parent_replay_from_fork() {
@@ -315,9 +437,25 @@ mod tests {
             ],
         );
 
-        let result = context.tracker().refresh_for_date(&context.date);
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
 
-        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(150));
+        assert_eq!(snapshot.as_ref().map(|value| value.today_tokens), Some(150));
+        // 子文件重放父文件的第一个事件（分桶被跳过），只计自己的增量。
+        assert_eq!(
+            snapshot.and_then(|value| value.today_volume),
+            Some(ModelVolumes(vec![(
+                None,
+                TokenVolume {
+                    uncached_input: 148,
+                    cached_input: 0,
+                    output: 2
+                }
+            )]))
+        );
     }
 
     #[test]

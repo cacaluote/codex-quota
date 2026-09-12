@@ -19,6 +19,7 @@ use serde_json::json;
 use session_usage::SessionUsageTracker;
 
 use super::model::{AppState, ConnectionStatus, QUOTA_STALE_FLOOR, QuotaSnapshot};
+use super::pricing::PriceTable;
 use crate::error::AppError;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,11 +27,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_USAGE_DEBOUNCE: Duration = Duration::from_millis(300);
 const LOCAL_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 const WATCHER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const PRICE_REFRESH_START_DELAY: Duration = Duration::from_secs(30);
+const PRICE_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
 const BACKOFF_SECONDS: [u64; 5] = [1, 2, 5, 10, 30];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerCommand {
     Refresh,
+    RefreshPrices,
     RefreshIntervalChanged,
     Shutdown,
 }
@@ -62,6 +66,10 @@ impl CodexWorker {
 
     pub fn refresh(&self) {
         let _ = self.command_tx.send(WorkerCommand::Refresh);
+    }
+
+    pub fn refresh_prices(&self) {
+        let _ = self.command_tx.send(WorkerCommand::RefreshPrices);
     }
 
     pub fn refresh_interval_changed(&self) {
@@ -151,10 +159,14 @@ fn worker_loop<F>(
     let mut next_pull_attempt = Instant::now();
     let mut next_watcher_retry = Instant::now() + WATCHER_RETRY_INTERVAL;
     let mut local_refresh_at: Option<Instant> = None;
+    let mut prices = PriceTable::load();
+    let mut price_refresh_failures = 0_usize;
+    let mut next_price_refresh =
+        Instant::now() + price_refresh_delay(prices.fetched_at(), SystemTime::now());
 
     update_status(state, ConnectionStatus::Connecting, None, notify);
     usage_tracker.require_full_scan();
-    refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+    refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
 
     loop {
         if Instant::now() >= next_pull_attempt {
@@ -163,7 +175,13 @@ fn worker_loop<F>(
                 match pull_rpc_snapshot(state, notify, cancelled) {
                     Ok(()) => {
                         pull_failures = 0;
-                        refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+                        refresh_local_usage(
+                            &mut usage_tracker,
+                            &mut local_usage,
+                            &prices,
+                            state,
+                            notify,
+                        );
                     }
                     Err(AppError::Cancelled) => break,
                     Err(error) => {
@@ -191,6 +209,22 @@ fn worker_loop<F>(
             }
         }
 
+        if Instant::now() >= next_price_refresh {
+            match prices.refresh() {
+                Ok(()) => {
+                    price_refresh_failures = 0;
+                    // 价格表更新后重算已发布的成本。
+                    local_refresh_at = Some(Instant::now() + LOCAL_USAGE_DEBOUNCE);
+                }
+                Err(error) => {
+                    price_refresh_failures = price_refresh_failures.saturating_add(1);
+                    crate::logging::log(&format!("models.dev 价格刷新失败：{error}"));
+                }
+            }
+            next_price_refresh =
+                Instant::now() + price_refresh_attempt_delay(&mut price_refresh_failures);
+        }
+
         poll_local_changes(
             &mut usage_tracker,
             &mut next_watcher_retry,
@@ -205,11 +239,15 @@ fn worker_loop<F>(
             Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerCommand::Refresh) => {
                 usage_tracker.require_full_scan();
-                refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+                refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
                 next_pull_attempt = Instant::now();
             }
             Ok(WorkerCommand::RefreshIntervalChanged) => {
                 next_pull_attempt = Instant::now();
+            }
+            Ok(WorkerCommand::RefreshPrices) => {
+                price_refresh_failures = 0;
+                next_price_refresh = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -217,10 +255,36 @@ fn worker_loop<F>(
         let due_refresh = local_refresh_at.is_some_and(|deadline| Instant::now() >= deadline);
         let date_changed = local_usage.date != local_calendar_date();
         if due_refresh || date_changed {
-            refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+            refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
             local_refresh_at = None;
         }
     }
+}
+
+/// 启动时首次价格拉取的延迟：缓存数据未满刷新间隔就等满间隔再拉
+/// （消除频繁重启下的冗余全量拉取）；无拉取记录或缓存已超间隔，则稍等
+/// 启动关键路径走完（30 秒）再拉。
+fn price_refresh_delay(fetched_at: Option<u64>, now: SystemTime) -> Duration {
+    let Some(fetched_at) = fetched_at else {
+        return PRICE_REFRESH_START_DELAY;
+    };
+    let age = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(fetched_at))
+        .and_then(|fetched| now.duration_since(fetched).ok())
+        .unwrap_or_default(); // 时钟异常（fetched_at 在未来）按刚拉取处理
+    PRICE_REFRESH_INTERVAL
+        .saturating_sub(age)
+        .max(PRICE_REFRESH_START_DELAY)
+}
+
+/// 五次重试耗尽后暂停一天，并为下一轮重置计数。
+fn price_refresh_attempt_delay(failures: &mut usize) -> Duration {
+    const RETRY_SECONDS: [u64; 5] = [30, 60, 120, 300, 300];
+    if *failures == 0 || *failures > RETRY_SECONDS.len() {
+        *failures = 0;
+        return PRICE_REFRESH_INTERVAL;
+    }
+    Duration::from_secs(RETRY_SECONDS[*failures - 1])
 }
 
 fn poll_local_changes(
@@ -431,9 +495,15 @@ where
 
 fn current_period_boundary(state: &Arc<Mutex<AppState>>) -> Option<PeriodBoundary> {
     let current = state.lock().ok()?;
+    let now = SystemTime::now();
+    // 过期快照的窗口可能已被服务端替换（外部重置/自然滚动），从它推导
+    // 边界会把上一期的用量当成本期聚合并短暂显示——等按需 pull 纠正。
+    if current.is_stale(now) {
+        return None;
+    }
     // An expired long-term window has been replaced server-side; deriving a
     // boundary from it would keep accumulating a period that no longer exists.
-    let (_, long_term) = current.snapshot.as_ref()?.active_windows(SystemTime::now());
+    let (_, long_term) = current.snapshot.as_ref()?.active_windows(now);
     let window = long_term?;
     window
         .resets_at
@@ -494,6 +564,7 @@ where
 fn refresh_local_usage<F>(
     tracker: &mut SessionUsageTracker,
     status: &mut LocalUsageStatus,
+    prices: &PriceTable,
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
 ) where
@@ -526,6 +597,18 @@ fn refresh_local_usage<F>(
         Ok((snapshot, diagnostics)) => {
             status.last_error = None;
             publish_local_quota(state, snapshot.quota, snapshot.plan_type, notify);
+            let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
+            let period_cost = snapshot
+                .period_volume
+                .as_ref()
+                .and_then(|volumes| volumes.cost(prices));
+            publish_local_cost(
+                state,
+                today_cost,
+                period_cost,
+                period_total_value_estimate(state, period_cost),
+                notify,
+            );
             publish_local_token_usage(
                 state,
                 snapshot.today_reliable.then_some(snapshot.today_tokens),
@@ -547,6 +630,18 @@ fn refresh_local_usage<F>(
                 && let Ok((snapshot, diagnostics)) =
                     tracker.refresh(status.period_boundary.as_ref())
             {
+                let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
+                let period_cost = snapshot
+                    .period_volume
+                    .as_ref()
+                    .and_then(|volumes| volumes.cost(prices));
+                publish_local_cost(
+                    state,
+                    today_cost,
+                    period_cost,
+                    period_total_value_estimate(state, period_cost),
+                    notify,
+                );
                 publish_local_token_usage(
                     state,
                     snapshot.today_reliable.then_some(snapshot.today_tokens),
@@ -563,6 +658,7 @@ fn refresh_local_usage<F>(
         }
         Err(error) => {
             publish_local_token_usage(state, None, None, notify);
+            publish_local_cost(state, None, None, None, notify);
             let message = error.to_string();
             crate::logging::log(&format!(
                 "Codex 本地用量刷新失败：总计 {}，错误 {message}",
@@ -571,6 +667,53 @@ fn refresh_local_usage<F>(
             status.last_error = Some(message);
         }
     }
+}
+
+fn publish_local_cost<F>(
+    state: &Arc<Mutex<AppState>>,
+    today: Option<f64>,
+    period: Option<f64>,
+    estimate: Option<f64>,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut changed = false;
+    if let Ok(mut current) = state.lock() {
+        if current.today_cost != today {
+            current.today_cost = today;
+            changed = true;
+        }
+        if current.current_period_cost != period {
+            current.current_period_cost = period;
+            changed = true;
+        }
+        if current.period_total_value_estimate != estimate {
+            current.period_total_value_estimate = estimate;
+            changed = true;
+        }
+    }
+    if changed {
+        notify();
+    }
+}
+
+/// 本期估值 = 本期已用美元 ÷ 周额度已用百分比 × 100。百分比过小
+/// （新窗口/外部重置后）、本机尚无用量或快照过期时给不出有意义的估算，
+/// 返回 None。
+fn period_total_value_estimate(
+    state: &Arc<Mutex<AppState>>,
+    period_cost: Option<f64>,
+) -> Option<f64> {
+    let cost = period_cost?;
+    let now = SystemTime::now();
+    let current = state.lock().ok()?;
+    if current.is_stale(now) {
+        return None;
+    }
+    let (_, long_term) = current.snapshot.as_ref()?.active_windows(now);
+    let used_percent = long_term?.used_percent;
+    (used_percent >= 1.0 && cost > 0.0).then(|| cost * 100.0 / used_percent)
 }
 
 fn should_log_local_usage_refresh(diagnostics: &session_usage::RefreshDiagnostics) -> bool {
@@ -740,6 +883,30 @@ mod tests {
             secondary: None,
             received_at,
         }
+    }
+
+    #[test]
+    fn period_boundary_survives_when_snapshot_is_fresh() {
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(SystemTime::now())),
+            ..AppState::default()
+        }));
+
+        // 单一 168h 窗口即长窗口：边界 = resets_at − 窗口时长。
+        let boundary = current_period_boundary(&state);
+        assert!(boundary.is_some());
+    }
+
+    #[test]
+    fn period_boundary_hides_while_snapshot_is_stale() {
+        // 外部重置等场景下，过期快照描述的窗口可能已被替换；从它推导
+        // 边界会把上一期的用量当成本期闪现，必须等按需 pull 纠正。
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(SystemTime::UNIX_EPOCH)),
+            ..AppState::default()
+        }));
+
+        assert_eq!(current_period_boundary(&state), None);
     }
 
     #[test]
@@ -941,6 +1108,136 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn period_value_estimate_divides_by_weekly_used_percent() {
+        let mut snapshot = quota_snapshot(SystemTime::now());
+        snapshot.primary.used_percent = 10.0;
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            ..AppState::default()
+        }));
+
+        let estimate = period_total_value_estimate(&state, Some(12.4));
+
+        assert!(estimate.is_some_and(|value| (value - 124.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn period_value_estimate_hides_below_one_percent_used() {
+        let mut snapshot = quota_snapshot(SystemTime::now());
+        snapshot.primary.used_percent = 0.5;
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            ..AppState::default()
+        }));
+
+        assert_eq!(period_total_value_estimate(&state, Some(12.4)), None);
+    }
+
+    #[test]
+    fn period_value_estimate_hides_zero_local_cost() {
+        // 本机无用量（cost=0）但服务端已有消耗时，0÷x% 的估算没有意义。
+        let mut snapshot = quota_snapshot(SystemTime::now());
+        snapshot.primary.used_percent = 10.0;
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            ..AppState::default()
+        }));
+
+        assert_eq!(period_total_value_estimate(&state, Some(0.0)), None);
+    }
+
+    #[test]
+    fn period_value_estimate_hides_stale_snapshot() {
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(SystemTime::UNIX_EPOCH)),
+            ..AppState::default()
+        }));
+
+        assert_eq!(
+            period_total_value_estimate(&state, Some(12.4)),
+            None,
+            "过期快照的百分比不可信，估算必须为 None"
+        );
+    }
+
+    #[test]
+    fn price_refresh_retries_failures_and_resumes_daily_schedule_after_success() {
+        let delays: Vec<_> = [0, 1, 2, 3, 4, 5, 6, usize::MAX, 0]
+            .into_iter()
+            .map(|mut failures| price_refresh_attempt_delay(&mut failures))
+            .collect();
+        assert_eq!(
+            delays,
+            [
+                PRICE_REFRESH_INTERVAL,
+                Duration::from_secs(30),
+                Duration::from_mins(1),
+                Duration::from_mins(2),
+                Duration::from_mins(5),
+                Duration::from_mins(5),
+                PRICE_REFRESH_INTERVAL,
+                PRICE_REFRESH_INTERVAL,
+                PRICE_REFRESH_INTERVAL,
+            ]
+        );
+    }
+
+    #[test]
+    fn price_refresh_starts_a_new_retry_round_after_exhaustion() {
+        let mut failures = 0;
+        let delays: Vec<_> = (0..7)
+            .map(|_| {
+                failures += 1;
+                price_refresh_attempt_delay(&mut failures)
+            })
+            .collect();
+        assert_eq!(
+            delays,
+            [
+                Duration::from_secs(30),
+                Duration::from_mins(1),
+                Duration::from_mins(2),
+                Duration::from_mins(5),
+                Duration::from_mins(5),
+                PRICE_REFRESH_INTERVAL,
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn price_refresh_delay_waits_out_remaining_interval_for_fresh_cache() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let fetched_at = (now - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 缓存 1 小时前拉取过：等满 24 小时间隔的剩余部分，而不是再拉一次。
+        assert_eq!(
+            price_refresh_delay(Some(fetched_at), now),
+            PRICE_REFRESH_INTERVAL
+                .checked_sub(Duration::from_hours(1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn price_refresh_delay_falls_back_to_start_delay_for_missing_or_stale_cache() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stale_fetched_at = (now - Duration::from_hours(25))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert_eq!(price_refresh_delay(None, now), PRICE_REFRESH_START_DELAY);
+        assert_eq!(
+            price_refresh_delay(Some(stale_fetched_at), now),
+            PRICE_REFRESH_START_DELAY
+        );
     }
 
     #[test]

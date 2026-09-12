@@ -348,6 +348,7 @@ impl AppWindow {
             CMD_REFRESH => {
                 if let Some(worker) = &self.worker {
                     worker.refresh();
+                    worker.refresh_prices();
                 }
                 Ok(())
             }

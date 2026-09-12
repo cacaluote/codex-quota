@@ -70,6 +70,8 @@ pub(super) struct FileCache {
     pub(super) uncertain: bool,
     pub(super) parse_errors: usize,
     pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
+    /// 最近一次 `turn_context.payload.model`，用于给后续 `token_count` 事件归属模型。
+    pub(super) current_model: Option<String>,
 }
 
 impl FileCache {
@@ -89,6 +91,7 @@ impl FileCache {
             uncertain: false,
             parse_errors: 0,
             latest_rate_limits: None,
+            current_model: None,
         }
     }
 
@@ -128,6 +131,7 @@ pub(super) enum ParentLink {
 pub(super) struct TokenCounters {
     pub(super) input: Option<u64>,
     pub(super) cached_input: Option<u64>,
+    pub(super) cache_write_input: Option<u64>,
     pub(super) output: Option<u64>,
     pub(super) reasoning_output: Option<u64>,
     pub(super) total: Option<u64>,
@@ -154,6 +158,7 @@ impl TokenCounters {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct UsageHighWater {
     pub(super) input: Option<u64>,
+    pub(super) cached_input: Option<u64>,
     pub(super) output: Option<u64>,
     pub(super) total: Option<u64>,
 }
@@ -180,6 +185,14 @@ pub(super) struct TokenEvent {
     pub(super) signature: TokenSignature,
     pub(super) source: Option<String>,
     pub(super) delta_total: u64,
+    /// 未缓存 input 的增量（`input − cached_input`，按原价计费的部分）。
+    pub(super) delta_uncached_input: u64,
+    /// 缓存命中的 input 增量（按 `cache_read` 价计费）。
+    pub(super) delta_cached_input: u64,
+    /// output 增量（`reasoning` ⊆ `output`，按 output 价计费，不另计 reasoning）。
+    pub(super) delta_output: u64,
+    /// 事件归属的模型（最近一次 `turn_context.payload.model`；会话中途可切换）。
+    pub(super) model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +237,11 @@ mod tests {
                     "signature": { "total": null, "last": null },
                     "source": null,
                     "has_total": false,
-                    "delta_total": 0
+                    "delta_total": 0,
+                    "delta_uncached_input": 0,
+                    "delta_cached_input": 0,
+                    "delta_output": 0,
+                    "model": null
                 }],
                 "high_water": {
                     "input": 1,
@@ -237,7 +254,8 @@ mod tests {
                 "token_without_timestamp": false,
                 "uncertain": false,
                 "parse_errors": 0,
-                "latest_rate_limits": null
+                "latest_rate_limits": null,
+                "current_model": "gpt-5.6-sol"
             }]
         });
 

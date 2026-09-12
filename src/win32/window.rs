@@ -101,11 +101,7 @@ impl AppWindow {
         self.overlay_active = true;
 
         let notify_hwnd = self.hwnd.0 as usize;
-        self.worker = Some(CodexWorker::spawn(Arc::clone(&self.state), move || {
-            let target = HWND(notify_hwnd as *mut c_void);
-            // SAFETY: posting by value is safe even if shutdown races; failure is intentionally ignored.
-            let _ = unsafe { PostMessageW(Some(target), WM_APP_UPDATED, WPARAM(0), LPARAM(0)) };
-        }));
+        self.spawn_worker(notify_hwnd);
         if let Err(error) = self.resize_for_state() {
             self.deactivate_overlay();
             return Err(error);
@@ -115,6 +111,14 @@ impl AppWindow {
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
         self.ensure_topmost("激活悬浮窗")?;
         Ok(())
+    }
+
+    fn spawn_worker(&mut self, notify_hwnd: usize) {
+        self.worker = Some(CodexWorker::spawn(Arc::clone(&self.state), move || {
+            let target = HWND(notify_hwnd as *mut c_void);
+            // SAFETY: posting by value is safe even if shutdown races; failure is intentionally ignored.
+            let _ = unsafe { PostMessageW(Some(target), WM_APP_UPDATED, WPARAM(0), LPARAM(0)) };
+        }));
     }
 
     fn deactivate_overlay(&mut self) {

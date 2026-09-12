@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
-use crate::quota::{AppState, ConnectionStatus, QuotaSnapshot, QuotaWindow};
+use crate::quota::{AppState, ConnectionStatus, QuotaColor, QuotaWindow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlanColor {
@@ -14,12 +14,6 @@ pub(super) enum PlanColor {
     Enterprise,
     Edu,
     Unknown,
-}
-
-pub(super) fn classify_quota_windows(
-    snapshot: &QuotaSnapshot,
-) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
-    snapshot.quota_windows()
 }
 
 pub(super) fn quota_window_label(
@@ -40,6 +34,43 @@ pub(super) fn quota_window_label(
         },
         QuotaWindow::window_label,
     )
+}
+
+/// The windows safe to render as percentages. A snapshot beyond its freshness
+/// window is withheld entirely: it predates unknown server-side changes (a
+/// reset, another device's usage) and misleads more than a blank. The on-demand
+/// pull replaces it within seconds.
+pub(super) fn display_windows(
+    state: &AppState,
+    now: SystemTime,
+) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
+    if state.is_stale(now) {
+        return (None, None);
+    }
+    state
+        .snapshot
+        .as_ref()
+        .map_or((None, None), |snapshot| snapshot.active_windows(now))
+}
+
+/// The floating ball's glanceable quota: the primary window's remaining, or
+/// the only window of single-window accounts. It reads 0 while any active
+/// window is exhausted — the account cannot serve requests regardless of the
+/// primary window — and `--` while no fresh window is known.
+pub(super) fn ball_quota(state: &AppState, now: SystemTime) -> (String, f64, QuotaColor) {
+    let (short_term, long_term) = display_windows(state, now);
+    let Some(window) = short_term.or(long_term) else {
+        return ("--".to_owned(), 0.0, QuotaColor::Unknown);
+    };
+    let blocked = [short_term, long_term]
+        .into_iter()
+        .flatten()
+        .any(|active| active.remaining_percent() <= 0.0);
+    if blocked {
+        return ("0".to_owned(), 0.0, QuotaColor::Critical);
+    }
+    let remaining = window.remaining_percent();
+    (format!("{remaining:.0}"), remaining, window.color())
 }
 
 pub(super) fn panel_title(state: &AppState) -> (&str, Option<&str>) {
@@ -144,12 +175,13 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::quota::QuotaSnapshot;
 
     fn window(duration: Duration) -> QuotaWindow {
         QuotaWindow {
             used_percent: 10.0,
             window_duration: duration,
-            resets_at: UNIX_EPOCH,
+            resets_at: UNIX_EPOCH + Duration::from_hours(1),
         }
     }
 
@@ -244,7 +276,7 @@ mod tests {
             secondary: None,
             received_at: UNIX_EPOCH,
         };
-        let (short_term, long_term) = classify_quota_windows(&snapshot);
+        let (short_term, long_term) = snapshot.active_windows(UNIX_EPOCH);
         assert!(short_term.is_none() && long_term.is_some());
     }
 
@@ -256,7 +288,7 @@ mod tests {
             secondary: Some(window(Duration::from_hours(5))),
             received_at: UNIX_EPOCH,
         };
-        let (short_term, long_term) = classify_quota_windows(&snapshot);
+        let (short_term, long_term) = snapshot.active_windows(UNIX_EPOCH);
         assert!(
             short_term.is_some_and(|value| value.window_duration == Duration::from_hours(5))
                 && long_term
@@ -267,6 +299,113 @@ mod tests {
     #[test]
     fn free_plan_uses_monthly_fallback_for_missing_long_window() {
         assert_eq!(quota_window_label(None, Some("free"), false), "月额度");
+    }
+
+    fn quota_window(used_percent: f64, duration: Duration) -> QuotaWindow {
+        QuotaWindow {
+            used_percent,
+            window_duration: duration,
+            resets_at: UNIX_EPOCH + Duration::from_hours(1),
+        }
+    }
+
+    fn expired_quota_window(used_percent: f64, duration: Duration) -> QuotaWindow {
+        QuotaWindow {
+            used_percent,
+            window_duration: duration,
+            resets_at: UNIX_EPOCH - Duration::from_hours(1),
+        }
+    }
+
+    fn ball_snapshot(primary: QuotaWindow, secondary: Option<QuotaWindow>) -> AppState {
+        AppState {
+            snapshot: Some(QuotaSnapshot {
+                limit_id: "codex".to_owned(),
+                primary,
+                secondary,
+                received_at: UNIX_EPOCH,
+            }),
+            ..AppState::default()
+        }
+    }
+
+    #[test]
+    fn ball_tracks_primary_window_while_not_blocked() {
+        // Fresh 5h window with an unconstrained weekly window: the ball keeps
+        // tracking the primary value instead of freezing on the weekly one.
+        let state = ball_snapshot(
+            quota_window(0.0, Duration::from_hours(5)),
+            Some(quota_window(60.0, Duration::from_hours(168))),
+        );
+
+        assert_eq!(
+            ball_quota(&state, UNIX_EPOCH),
+            ("100".to_owned(), 100.0, QuotaColor::Healthy)
+        );
+    }
+
+    #[test]
+    fn ball_reads_zero_while_any_active_window_is_exhausted() {
+        let state = ball_snapshot(
+            quota_window(85.0, Duration::from_hours(5)),
+            Some(quota_window(100.0, Duration::from_hours(168))),
+        );
+
+        assert_eq!(
+            ball_quota(&state, UNIX_EPOCH),
+            ("0".to_owned(), 0.0, QuotaColor::Critical)
+        );
+    }
+
+    #[test]
+    fn ball_reads_zero_when_the_only_window_is_exhausted() {
+        let state = ball_snapshot(quota_window(100.0, Duration::from_hours(168)), None);
+
+        assert_eq!(
+            ball_quota(&state, UNIX_EPOCH),
+            ("0".to_owned(), 0.0, QuotaColor::Critical)
+        );
+    }
+
+    #[test]
+    fn ball_falls_back_to_the_long_window_while_short_is_expired() {
+        let state = ball_snapshot(
+            expired_quota_window(50.0, Duration::from_hours(5)),
+            Some(quota_window(70.0, Duration::from_hours(168))),
+        );
+
+        assert_eq!(
+            ball_quota(&state, UNIX_EPOCH),
+            ("30".to_owned(), 30.0, QuotaColor::Warning)
+        );
+    }
+
+    #[test]
+    fn ball_reads_unknown_without_active_windows() {
+        let state = ball_snapshot(expired_quota_window(50.0, Duration::from_hours(5)), None);
+
+        assert_eq!(
+            ball_quota(&state, UNIX_EPOCH),
+            ("--".to_owned(), 0.0, QuotaColor::Unknown)
+        );
+        assert_eq!(
+            ball_quota(&AppState::default(), UNIX_EPOCH),
+            ("--".to_owned(), 0.0, QuotaColor::Unknown)
+        );
+    }
+
+    #[test]
+    fn ball_and_panel_withhold_percentages_while_the_snapshot_is_stale() {
+        // A snapshot hours old may predate a server-side reset or another
+        // device's usage; its percentages must not render at all.
+        let state = ball_snapshot(quota_window(0.0, Duration::from_hours(5)), None);
+        let now = UNIX_EPOCH + Duration::from_mins(31);
+
+        assert_eq!(
+            ball_quota(&state, now),
+            ("--".to_owned(), 0.0, QuotaColor::Unknown)
+        );
+        assert_eq!(display_windows(&state, now), (None, None));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 # Local scratch/generated files
 /tmp/
+/.zcode/
 
 # IDE and editor settings
 /.idea/

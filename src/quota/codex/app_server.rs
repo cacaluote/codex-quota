@@ -155,20 +155,6 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(super) fn recv_line(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<String>, RecvTimeoutError> {
-        if let Some(line) = self.pending_lines.pop_front() {
-            return Ok(Some(line));
-        }
-        match self.stdout_rx.recv_timeout(timeout) {
-            Ok(line) => Ok(Some(line)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
     pub(super) fn wait_for_response(
         &mut self,
         id: u64,

@@ -12,19 +12,20 @@ use std::time::{Duration, Instant, SystemTime};
 use app_server::AppServerSession;
 pub(crate) use app_server::find_codex_executable;
 use protocol::{
-    is_rate_limit_notification, local_calendar_date, local_calendar_date_at, parse_account_result,
-    parse_account_updated_notification, parse_lifetime_usage, parse_rate_limits_result,
+    local_calendar_date, local_calendar_date_at, parse_account_result, parse_lifetime_usage,
+    parse_rate_limits_result,
 };
 use serde_json::json;
 use session_usage::SessionUsageTracker;
 
-use super::model::{AppState, ConnectionStatus};
+use super::model::{AppState, ConnectionStatus, QUOTA_STALE_FLOOR, QuotaSnapshot};
 use crate::error::AppError;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(500);
 const LOCAL_USAGE_DEBOUNCE: Duration = Duration::from_millis(300);
+const LOCAL_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(500);
+const WATCHER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKOFF_SECONDS: [u64; 5] = [1, 2, 5, 10, 30];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,15 +83,6 @@ impl Drop for CodexWorker {
     }
 }
 
-enum SessionOutcome {
-    Shutdown,
-}
-
-struct SessionFailure {
-    error: AppError,
-    had_successful_read: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeriodBoundary {
     start: SystemTime,
@@ -142,24 +134,9 @@ impl LocalUsageStatus {
     }
 }
 
-impl SessionFailure {
-    fn after_success(error: AppError) -> Self {
-        Self {
-            error,
-            had_successful_read: true,
-        }
-    }
-}
-
-impl From<AppError> for SessionFailure {
-    fn from(error: AppError) -> Self {
-        Self {
-            error,
-            had_successful_read: false,
-        }
-    }
-}
-
+/// Drives the worker without a resident app-server: the local session-log
+/// snapshot is the primary data source, and `codex app-server` is spawned only
+/// for on-demand pulls once the snapshot grows stale or a window resets.
 fn worker_loop<F>(
     state: &Arc<Mutex<AppState>>,
     command_rx: &Receiver<WorkerCommand>,
@@ -168,81 +145,103 @@ fn worker_loop<F>(
 ) where
     F: Fn() + Send + Sync + 'static,
 {
-    let mut failure_count = 0_usize;
     let mut usage_tracker = SessionUsageTracker::new();
     let mut local_usage = LocalUsageStatus::default();
+    let mut pull_failures = 0_usize;
+    let mut next_pull_attempt = Instant::now();
+    let mut next_watcher_retry = Instant::now() + WATCHER_RETRY_INTERVAL;
+    let mut local_refresh_at: Option<Instant> = None;
+
+    update_status(state, ConnectionStatus::Connecting, None, notify);
+    usage_tracker.require_full_scan();
+    refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
 
     loop {
-        update_status(
-            state,
-            if failure_count == 0 {
-                ConnectionStatus::Connecting
+        if Instant::now() >= next_pull_attempt {
+            let pull_delay = local_pull_delay(state, SystemTime::now());
+            if pull_delay.is_zero() {
+                match pull_rpc_snapshot(state, notify, cancelled) {
+                    Ok(()) => {
+                        pull_failures = 0;
+                        refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+                    }
+                    Err(AppError::Cancelled) => break,
+                    Err(error) => {
+                        pull_failures = pull_failures.saturating_add(1);
+                        let message = error.to_string();
+                        crate::logging::log(&format!("按需读取 Codex 额度失败：{message}"));
+                        // With a local snapshot the display stays valid and
+                        // Online; only surface the failure when there is
+                        // nothing to show at all.
+                        if snapshot_received_at(state).is_none() {
+                            update_status(
+                                state,
+                                ConnectionStatus::Error {
+                                    message: message.clone(),
+                                },
+                                Some(message),
+                                notify,
+                            );
+                        }
+                    }
+                }
+                next_pull_attempt = Instant::now() + reconnect_backoff(pull_failures);
             } else {
-                ConnectionStatus::Reconnecting {
-                    attempt: u32::try_from(failure_count).unwrap_or(u32::MAX),
-                }
-            },
-            None,
-            notify,
-        );
-
-        match run_session(
-            state,
-            command_rx,
-            notify,
-            cancelled,
-            &mut usage_tracker,
-            &mut local_usage,
-        ) {
-            Ok(SessionOutcome::Shutdown) => break,
-            Err(failure) => {
-                if matches!(&failure.error, AppError::Cancelled) {
-                    break;
-                }
-                if failure.had_successful_read {
-                    failure_count = 0;
-                }
-                let message = failure.error.to_string();
-                crate::logging::log(&message);
-                update_status(
-                    state,
-                    ConnectionStatus::Error {
-                        message: message.clone(),
-                    },
-                    Some(message),
-                    notify,
-                );
-                if current_period_boundary(state).is_none() {
-                    refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
-                }
-
-                let backoff = reconnect_backoff(failure_count);
-                failure_count = failure_count.saturating_add(1);
-                match command_rx.recv_timeout(backoff) {
-                    Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-                    Ok(WorkerCommand::Refresh | WorkerCommand::RefreshIntervalChanged)
-                    | Err(RecvTimeoutError::Timeout) => {}
-                }
+                next_pull_attempt = Instant::now() + pull_delay;
             }
+        }
+
+        poll_local_changes(
+            &mut usage_tracker,
+            &mut next_watcher_retry,
+            &mut local_refresh_at,
+        );
+        let now = Instant::now();
+        let due = local_refresh_at.unwrap_or(now + LOCAL_LOOP_WAKE_INTERVAL);
+        let wait = due
+            .saturating_duration_since(now)
+            .min(LOCAL_LOOP_WAKE_INTERVAL);
+        match command_rx.recv_timeout(wait) {
+            Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(WorkerCommand::Refresh) => {
+                usage_tracker.require_full_scan();
+                refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+                next_pull_attempt = Instant::now();
+            }
+            Ok(WorkerCommand::RefreshIntervalChanged) => {
+                next_pull_attempt = Instant::now();
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        let due_refresh = local_refresh_at.is_some_and(|deadline| Instant::now() >= deadline);
+        let date_changed = local_usage.date != local_calendar_date();
+        if due_refresh || date_changed {
+            refresh_local_usage(&mut usage_tracker, &mut local_usage, state, notify);
+            local_refresh_at = None;
         }
     }
 }
 
-fn run_session<F>(
-    state: &Arc<Mutex<AppState>>,
-    command_rx: &Receiver<WorkerCommand>,
-    notify: &Arc<F>,
-    cancelled: &Arc<AtomicBool>,
+fn poll_local_changes(
     usage_tracker: &mut SessionUsageTracker,
-    local_usage: &mut LocalUsageStatus,
-) -> Result<SessionOutcome, SessionFailure>
-where
-    F: Fn() + Send + Sync + 'static,
-{
-    let executable = find_codex_executable()?;
-    let mut session = AppServerSession::spawn(&executable, Arc::clone(cancelled))?;
-    let mut next_id = 1_u64;
+    next_watcher_retry: &mut Instant,
+    local_refresh_at: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if now >= *next_watcher_retry {
+        if usage_tracker.retry_watcher() {
+            *local_refresh_at = Some(now + LOCAL_USAGE_DEBOUNCE);
+        }
+        *next_watcher_retry = now + WATCHER_RETRY_INTERVAL;
+    }
+    if usage_tracker.poll_changes() {
+        *local_refresh_at = Some(now + LOCAL_USAGE_DEBOUNCE);
+    }
+}
 
+fn initialize_session(session: &mut AppServerSession) -> Result<u64, AppError> {
+    let mut next_id = 1_u64;
     let initialize_id = next_request_id(&mut next_id);
     session.send(&json!({
         "method": "initialize",
@@ -257,112 +256,130 @@ where
     }))?;
     session.wait_for_response(initialize_id, INITIALIZE_TIMEOUT)?;
     session.send(&json!({ "method": "initialized", "params": {} }))?;
-
-    usage_tracker.require_full_scan();
-    read_and_publish(
-        &mut session,
-        &mut next_id,
-        state,
-        notify,
-        usage_tracker,
-        local_usage,
-    )?;
-    if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
-        crate::logging::log(&format!("无法读取 Codex 方案类型：{error}"));
-    }
-    let mut next_refresh = refresh_deadline(state);
-    let mut notification_refresh: Option<Instant> = None;
-    let mut local_usage_refresh: Option<Instant> = None;
-
-    loop {
-        while let Ok(command) = command_rx.try_recv() {
-            match command {
-                WorkerCommand::Refresh => {
-                    usage_tracker.require_full_scan();
-                    next_refresh = Instant::now();
-                }
-                WorkerCommand::RefreshIntervalChanged => next_refresh = refresh_deadline(state),
-                WorkerCommand::Shutdown => {
-                    session.shutdown();
-                    return Ok(SessionOutcome::Shutdown);
-                }
-            }
-        }
-
-        if usage_tracker.poll_changes() {
-            local_usage_refresh = Some(Instant::now() + LOCAL_USAGE_DEBOUNCE);
-        }
-
-        let now = Instant::now();
-        let rpc_due = notification_refresh
-            .map_or(next_refresh, |notification| notification.min(next_refresh));
-        let due = local_usage_refresh.map_or(rpc_due, |local| local.min(rpc_due));
-        if now >= due {
-            if now >= rpc_due {
-                read_and_publish(
-                    &mut session,
-                    &mut next_id,
-                    state,
-                    notify,
-                    usage_tracker,
-                    local_usage,
-                )
-                .map_err(SessionFailure::after_success)?;
-                next_refresh = refresh_deadline(state);
-                notification_refresh = None;
-                local_usage_refresh = None;
-            } else {
-                refresh_local_usage(usage_tracker, local_usage, state, notify);
-                local_usage_refresh = None;
-            }
-            continue;
-        }
-
-        let wait = due
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(100));
-        match session.recv_line(wait) {
-            Ok(Some(line)) => {
-                if let Some(update) = parse_account_updated_notification(&line) {
-                    publish_plan_type(state, update.plan_type, notify);
-                }
-                if is_rate_limit_notification(&line) {
-                    notification_refresh = Some(debounced_refresh_deadline(Instant::now()));
-                }
-            }
-            Ok(None) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(SessionFailure::after_success(AppError::Protocol(
-                    "app-server 已关闭标准输出".to_owned(),
-                )));
-            }
-        }
-    }
+    Ok(next_id)
 }
 
-fn read_and_publish<F>(
-    session: &mut AppServerSession,
-    next_id: &mut u64,
+/// Spawns app-server, reads the account-wide snapshot once, then tears the
+/// process down again.
+fn pull_rpc_snapshot<F>(
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
-    usage_tracker: &mut SessionUsageTracker,
-    local_usage: &mut LocalUsageStatus,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<(), AppError>
 where
     F: Fn() + Send + Sync + 'static,
 {
-    read_rate_limits_and_publish(session, next_id, state, notify)?;
-    let period_boundary = current_period_boundary(state);
-    if usage_tracker.needs_refresh(period_boundary.as_ref()) {
-        refresh_local_usage(usage_tracker, local_usage, state, notify);
+    let executable = find_codex_executable()?;
+    let mut session = AppServerSession::spawn(&executable, Arc::clone(cancelled))?;
+    let mut next_id = initialize_session(&mut session)?;
+    let result = read_rate_limits_and_publish(&mut session, &mut next_id, state, notify);
+    if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
+        crate::logging::log(&format!("无法读取 Codex 方案类型：{error}"));
     }
-    match read_lifetime_and_publish(session, next_id, state, notify) {
-        Ok(()) => Ok(()),
-        Err(AppError::Cancelled) => Err(AppError::Cancelled),
-        Err(error) => {
-            crate::logging::log(&format!("无法读取累计 Token 用量：{error}"));
-            Ok(())
+    // The account-wide lifetime covers sessions from every device, which the
+    // local aggregation cannot see; treat it as authoritative.
+    if let Err(error) = read_lifetime_and_publish(&mut session, &mut next_id, state, notify) {
+        crate::logging::log(&format!("无法读取累计 Token 用量：{error}"));
+    }
+    session.shutdown();
+    result
+}
+
+fn snapshot_received_at(state: &Arc<Mutex<AppState>>) -> Option<SystemTime> {
+    state.lock().ok().and_then(|current| {
+        current
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.received_at)
+    })
+}
+
+fn local_pull_threshold(state: &Arc<Mutex<AppState>>) -> Duration {
+    state
+        .lock()
+        .map_or(QUOTA_STALE_FLOOR, |current| current.stale_after())
+}
+
+fn local_pull_delay(state: &Arc<Mutex<AppState>>, now: SystemTime) -> Duration {
+    let threshold = local_pull_threshold(state);
+    let Some(snapshot) = state
+        .lock()
+        .ok()
+        .and_then(|current| current.snapshot.clone())
+    else {
+        return Duration::ZERO;
+    };
+    // A snapshot whose windows have been reset server-side cannot describe
+    // the current windows; refresh it regardless of its age.
+    if snapshot.has_expired_window(now) {
+        return Duration::ZERO;
+    }
+    let Ok(age) = now.duration_since(snapshot.received_at) else {
+        return threshold;
+    };
+    threshold.saturating_sub(age)
+}
+
+fn publish_local_quota<F>(
+    state: &Arc<Mutex<AppState>>,
+    quota: Option<QuotaSnapshot>,
+    plan_type: Option<String>,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    // Without a locally parsed snapshot there is nothing to correct: keep the
+    // current one (or none) and let the on-demand pull fill the gap.
+    let Some(quota) = quota else {
+        return;
+    };
+    let mut changed = false;
+    if let Ok(mut current) = state.lock()
+        && current
+            .snapshot
+            .as_ref()
+            .is_none_or(|existing| existing.received_at <= quota.received_at)
+    {
+        if current.snapshot.as_ref() != Some(&quota) {
+            current.snapshot = Some(quota);
+            changed = true;
         }
+        let merged_plan_type = plan_type.or_else(|| current.plan_type.clone());
+        if current.plan_type != merged_plan_type {
+            current.plan_type = merged_plan_type;
+            changed = true;
+        }
+        if changed && !matches!(current.status, ConnectionStatus::Online) {
+            current.status = ConnectionStatus::Online;
+            current.last_error = None;
+        }
+    }
+    if changed {
+        notify();
+    }
+}
+
+fn publish_local_lifetime<F>(state: &Arc<Mutex<AppState>>, lifetime: Option<u64>, notify: &Arc<F>)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    // The on-demand pull publishes the authoritative account-wide value; a
+    // local aggregate only ever raises the display (its own events), and an
+    // unreliable aggregate must not pull the displayed value back down.
+    let Some(lifetime) = lifetime else {
+        return;
+    };
+    let mut changed = false;
+    if let Ok(mut current) = state.lock()
+        && current
+            .lifetime_tokens
+            .is_none_or(|current| lifetime > current)
+    {
+        current.lifetime_tokens = Some(lifetime);
+        changed = true;
+    }
+    if changed {
+        notify();
     }
 }
 
@@ -414,7 +431,9 @@ where
 
 fn current_period_boundary(state: &Arc<Mutex<AppState>>) -> Option<PeriodBoundary> {
     let current = state.lock().ok()?;
-    let (_, long_term) = current.snapshot.as_ref()?.quota_windows();
+    // An expired long-term window has been replaced server-side; deriving a
+    // boundary from it would keep accumulating a period that no longer exists.
+    let (_, long_term) = current.snapshot.as_ref()?.active_windows(SystemTime::now());
     let window = long_term?;
     window
         .resets_at
@@ -460,7 +479,9 @@ where
     let mut changed = false;
     if let Ok(mut current) = state.lock()
         && let Some(lifetime) = lifetime
-        && current.lifetime_tokens != Some(lifetime)
+        && current
+            .lifetime_tokens
+            .is_none_or(|current| lifetime > current)
     {
         current.lifetime_tokens = Some(lifetime);
         changed = true;
@@ -504,6 +525,7 @@ fn refresh_local_usage<F>(
     match tracker.refresh(status.period_boundary.as_ref()) {
         Ok((snapshot, diagnostics)) => {
             status.last_error = None;
+            publish_local_quota(state, snapshot.quota, snapshot.plan_type, notify);
             publish_local_token_usage(
                 state,
                 snapshot.today_reliable.then_some(snapshot.today_tokens),
@@ -512,8 +534,31 @@ fn refresh_local_usage<F>(
                     .then_some(snapshot.current_period_tokens),
                 notify,
             );
+            publish_local_lifetime(state, snapshot.lifetime_tokens, notify);
             if should_log_local_usage_refresh(&diagnostics) {
                 crate::logging::log(&local_usage_refresh_description(&diagnostics));
+            }
+            // The snapshot published above can unlock a period boundary this
+            // pass could not use (cold start with no prior snapshot). Rerun
+            // once with it so the period usage is not stuck until the next
+            // external trigger.
+            let boundary_now = current_period_boundary(state);
+            if status.synchronize_period_boundary(boundary_now)
+                && let Ok((snapshot, diagnostics)) =
+                    tracker.refresh(status.period_boundary.as_ref())
+            {
+                publish_local_token_usage(
+                    state,
+                    snapshot.today_reliable.then_some(snapshot.today_tokens),
+                    snapshot
+                        .current_period_reliable
+                        .then_some(snapshot.current_period_tokens),
+                    notify,
+                );
+                publish_local_lifetime(state, snapshot.lifetime_tokens, notify);
+                if should_log_local_usage_refresh(&diagnostics) {
+                    crate::logging::log(&local_usage_refresh_description(&diagnostics));
+                }
             }
         }
         Err(error) => {
@@ -679,41 +724,205 @@ fn reconnect_backoff(failure_count: usize) -> Duration {
     Duration::from_secs(BACKOFF_SECONDS[failure_count.min(BACKOFF_SECONDS.len() - 1)])
 }
 
-fn debounced_refresh_deadline(now: Instant) -> Instant {
-    now + NOTIFICATION_DEBOUNCE
-}
-
-fn refresh_deadline(state: &Arc<Mutex<AppState>>) -> Instant {
-    let now_system = SystemTime::now();
-    let (refresh_interval, until_reset) =
-        state
-            .lock()
-            .ok()
-            .map_or((Duration::from_mins(5), None), |current| {
-                let until_reset = current.snapshot.as_ref().and_then(|snapshot| {
-                    [
-                        snapshot.primary.resets_at.duration_since(now_system).ok(),
-                        snapshot
-                            .secondary
-                            .as_ref()
-                            .and_then(|window| window.resets_at.duration_since(now_system).ok()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                });
-                (current.quota_refresh_interval, until_reset)
-            });
-    Instant::now() + next_refresh_delay(refresh_interval, until_reset)
-}
-
-fn next_refresh_delay(refresh_interval: Duration, until_reset: Option<Duration>) -> Duration {
-    until_reset.map_or(refresh_interval, |value| value.min(refresh_interval))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::QuotaWindow;
+
+    fn quota_snapshot(received_at: SystemTime) -> QuotaSnapshot {
+        QuotaSnapshot {
+            limit_id: "codex".to_owned(),
+            primary: QuotaWindow {
+                used_percent: 10.0,
+                window_duration: Duration::from_hours(168),
+                resets_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000),
+            },
+            secondary: None,
+            received_at,
+        }
+    }
+
+    #[test]
+    fn on_demand_pull_threshold_has_a_thirty_minute_floor() {
+        let state = Arc::new(Mutex::new(AppState {
+            quota_refresh_interval: Duration::from_mins(1),
+            ..AppState::default()
+        }));
+
+        assert_eq!(local_pull_threshold(&state), QUOTA_STALE_FLOOR);
+    }
+
+    #[test]
+    fn on_demand_pull_threshold_is_twice_the_refresh_interval_above_the_floor() {
+        let state = Arc::new(Mutex::new(AppState {
+            quota_refresh_interval: Duration::from_mins(30),
+            ..AppState::default()
+        }));
+
+        assert_eq!(local_pull_threshold(&state), Duration::from_hours(1));
+    }
+
+    #[test]
+    fn on_demand_pull_delay_uses_only_remaining_snapshot_freshness() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(now - Duration::from_mins(29))),
+            quota_refresh_interval: Duration::from_mins(1),
+            ..AppState::default()
+        }));
+
+        assert_eq!(local_pull_delay(&state, now), Duration::from_mins(1));
+    }
+
+    #[test]
+    fn expired_window_makes_on_demand_pull_due() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let mut expired = quota_snapshot(now - Duration::from_mins(1));
+        expired.primary.resets_at = now - Duration::from_mins(10);
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(expired),
+            quota_refresh_interval: Duration::from_mins(30),
+            ..AppState::default()
+        }));
+
+        assert_eq!(local_pull_delay(&state, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn newer_local_snapshot_replaces_older_snapshot() {
+        let now = SystemTime::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(now - Duration::from_mins(1))),
+            plan_type: Some("free".to_owned()),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_quota(
+            &state,
+            Some(quota_snapshot(now)),
+            Some("plus".to_owned()),
+            &notify,
+        );
+
+        let current = state.lock().unwrap();
+        assert_eq!(
+            current
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.received_at),
+            Some(now)
+        );
+        assert_eq!(current.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn older_local_snapshot_keeps_newer_snapshot() {
+        let now = SystemTime::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(now)),
+            plan_type: Some("pro".to_owned()),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_quota(
+            &state,
+            Some(quota_snapshot(now - Duration::from_mins(1))),
+            Some("plus".to_owned()),
+            &notify,
+        );
+
+        let current = state.lock().unwrap();
+        assert_eq!(
+            current
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.received_at),
+            Some(now)
+        );
+        assert_eq!(current.plan_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn missing_local_quota_keeps_existing_snapshot_and_plan() {
+        let now = SystemTime::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(now)),
+            plan_type: Some("pro".to_owned()),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_quota(&state, None, None, &notify);
+
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_some());
+        assert_eq!(current.plan_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn local_quota_without_plan_keeps_existing_plan() {
+        let now = SystemTime::now();
+        let state = Arc::new(Mutex::new(AppState {
+            plan_type: Some("pro".to_owned()),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_quota(&state, Some(quota_snapshot(now)), None, &notify);
+
+        assert_eq!(state.lock().unwrap().plan_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn local_quota_publish_transitions_error_status_to_online() {
+        let now = SystemTime::now();
+        let state = Arc::new(Mutex::new(AppState {
+            status: ConnectionStatus::Error {
+                message: "历史错误".to_owned(),
+            },
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_quota(&state, Some(quota_snapshot(now)), None, &notify);
+
+        assert!(matches!(
+            state.lock().unwrap().status,
+            ConnectionStatus::Online
+        ));
+    }
+
+    #[test]
+    fn local_lifetime_does_not_lower_the_displayed_value() {
+        let state = Arc::new(Mutex::new(AppState {
+            lifetime_tokens: Some(100),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_local_lifetime(&state, None, &notify);
+        publish_local_lifetime(&state, Some(50), &notify);
+        publish_local_lifetime(&state, Some(150), &notify);
+
+        assert_eq!(state.lock().unwrap().lifetime_tokens, Some(150));
+    }
+
+    #[test]
+    fn rpc_lifetime_updates_only_when_larger() {
+        let state = Arc::new(Mutex::new(AppState {
+            lifetime_tokens: Some(100),
+            ..AppState::default()
+        }));
+        let notify = Arc::new(|| {});
+
+        publish_lifetime_usage(&state, None, &notify);
+        publish_lifetime_usage(&state, Some(80), &notify);
+        publish_lifetime_usage(&state, Some(120), &notify);
+
+        assert_eq!(state.lock().unwrap().lifetime_tokens, Some(120));
+    }
 
     fn period_start() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
@@ -732,29 +941,6 @@ mod tests {
             )
             .unwrap(),
         }
-    }
-
-    #[test]
-    fn repeated_notification_pushes_debounce_deadline_forward() {
-        let first = Instant::now();
-        let second = first + Duration::from_millis(100);
-        assert!(debounced_refresh_deadline(second) > debounced_refresh_deadline(first));
-    }
-
-    #[test]
-    fn configured_interval_controls_fallback_refresh_delay() {
-        assert_eq!(
-            next_refresh_delay(Duration::from_mins(10), None),
-            Duration::from_mins(10)
-        );
-    }
-
-    #[test]
-    fn reset_deadline_takes_priority_over_fallback_interval() {
-        assert_eq!(
-            next_refresh_delay(Duration::from_mins(30), Some(Duration::from_mins(2))),
-            Duration::from_mins(2)
-        );
     }
 
     #[test]

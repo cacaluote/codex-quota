@@ -43,6 +43,15 @@ pub(super) fn cache_has_tokens_in_period(cache: &FileCache, start_nanos: i64) ->
     })
 }
 
+pub(super) fn aggregate_lifetime(
+    selected: &HashSet<String>,
+    caches: &HashMap<String, FileCache>,
+    rollout_index: &HashMap<String, Vec<String>>,
+) -> (u64, bool) {
+    let (tokens, reliable, _) = aggregate_usage(selected, caches, rollout_index, |_| true);
+    (tokens, reliable)
+}
+
 fn aggregate_usage<F>(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
@@ -104,8 +113,23 @@ where
         if files
             .iter()
             .skip(1)
-            .any(|other| !event_prefix_matches(&other.events, &canonical.events))
+            .all(|other| event_prefix_matches(&other.events, &canonical.events))
         {
+            match replayed_total(canonical, caches, rollout_index, &includes) {
+                Ok(sum) => total = total.saturating_add(sum),
+                Err(()) => {
+                    defer_timeline(canonical, &includes, &mut reliable, &mut deferred_files);
+                }
+            }
+            continue;
+        }
+        // Codex resume writes a new rollout that keeps the thread id but
+        // starts with a reset token counter and no replayed events, so
+        // same-thread files are not necessarily copies of one timeline.
+        // Distinct timelines that never overlap are sequential continuations
+        // whose events add up; any overlap leaves no canonical ordering and
+        // still defers the group.
+        let Some(chains) = sequential_timelines(files) else {
             if files.iter().any(|file| {
                 file.events
                     .iter()
@@ -115,34 +139,86 @@ where
                 deferred_files = deferred_files.saturating_add(1);
             }
             continue;
-        }
-        match replay_prefix(canonical, caches, rollout_index) {
-            Ok(prefix) => {
-                total = canonical
-                    .events
-                    .iter()
-                    .skip(prefix)
-                    .fold(total, |sum, event| {
-                        if includes(event) {
-                            sum.saturating_add(event.delta_total)
-                        } else {
-                            sum
-                        }
-                    });
-            }
-            Err(()) => {
-                if canonical
-                    .events
-                    .iter()
-                    .any(|event| event.delta_total > 0 && includes(event))
-                {
-                    reliable = false;
-                    deferred_files = deferred_files.saturating_add(1);
-                }
+        };
+        for chain in chains {
+            match replayed_total(chain, caches, rollout_index, &includes) {
+                Ok(sum) => total = total.saturating_add(sum),
+                Err(()) => defer_timeline(chain, &includes, &mut reliable, &mut deferred_files),
             }
         }
     }
     (total, reliable, deferred_files)
+}
+
+fn replayed_total<F>(
+    cache: &FileCache,
+    caches: &HashMap<String, FileCache>,
+    rollout_index: &HashMap<String, Vec<String>>,
+    includes: &F,
+) -> Result<u64, ()>
+where
+    F: Fn(&TokenEvent) -> bool,
+{
+    let prefix = replay_prefix(cache, caches, rollout_index)?;
+    Ok(cache
+        .events
+        .iter()
+        .skip(prefix)
+        .filter(|event| includes(event))
+        .fold(0u64, |sum, event| sum.saturating_add(event.delta_total)))
+}
+
+fn defer_timeline<F>(
+    cache: &FileCache,
+    includes: &F,
+    reliable: &mut bool,
+    deferred_files: &mut usize,
+) where
+    F: Fn(&TokenEvent) -> bool,
+{
+    if cache
+        .events
+        .iter()
+        .any(|event| event.delta_total > 0 && includes(event))
+    {
+        *reliable = false;
+        *deferred_files = deferred_files.saturating_add(1);
+    }
+}
+
+/// Collapses duplicate copies (files whose events are an exact prefix of a
+/// longer file) and returns the remaining distinct timelines when each starts
+/// strictly after the previous one ends, the shape of Codex resume rollouts
+/// that continue a thread with a reset token counter. Returns `None` when any
+/// two timelines overlap, which leaves no canonical ordering to count.
+fn sequential_timelines<'a>(files: &[&'a FileCache]) -> Option<Vec<&'a FileCache>> {
+    let mut timelines: Vec<&'a FileCache> = Vec::new();
+    for file in files {
+        if timelines
+            .iter()
+            .any(|kept| event_prefix_matches(&file.events, &kept.events))
+        {
+            continue;
+        }
+        timelines.push(file);
+    }
+    timelines.sort_by_key(|file| file.events.first().and_then(|event| event.timestamp_nanos));
+    for pair in timelines.windows(2) {
+        let previous_end = pair[0]
+            .events
+            .iter()
+            .filter_map(|event| event.timestamp_nanos)
+            .max();
+        let starts_later = pair[1]
+            .events
+            .first()
+            .and_then(|event| event.timestamp_nanos)
+            .is_some_and(|start| previous_end.is_some_and(|end| start > end));
+        if !starts_later {
+            return None;
+        }
+    }
+    Some(timelines)
 }
 
 fn event_prefix_matches(prefix: &[TokenEvent], complete: &[TokenEvent]) -> bool {
@@ -291,6 +367,60 @@ mod tests {
             &[
                 session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
                 token_count(&context.at(1), 200, Some(200), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_reliable), Some(false));
+    }
+
+    #[test]
+    fn refresh_sums_sequential_resume_rollouts_of_same_thread() {
+        let context = TestContext::new("resume-continuation");
+        write_jsonl(
+            &context.rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+            ],
+        );
+        // Codex resume keeps the thread id but starts a reset token counter
+        // and records no replayed events.
+        write_jsonl(
+            &context.archived_rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(5), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(6), 50, Some(50), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(
+            result
+                .ok()
+                .map(|value| (value.0.today_tokens, value.0.today_reliable)),
+            Some((150, true))
+        );
+    }
+
+    #[test]
+    fn refresh_defers_overlapping_same_thread_files_without_prefix() {
+        let context = TestContext::new("resume-overlap");
+        write_jsonl(
+            &context.rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+                token_count(&context.at(5), 150, Some(50), Some("codex")),
+            ],
+        );
+        write_jsonl(
+            &context.archived_rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(2), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(3), 50, Some(50), Some("codex")),
             ],
         );
 

@@ -9,8 +9,8 @@ use time::format_description::well_known::Rfc3339;
 use super::RefreshDiagnostics;
 use super::files::{open_session_file, path_key};
 use super::model::{
-    CandidateFile, FileCache, ParentLink, RootMeta, TokenCounters, TokenEvent, TokenSignature,
-    UsageHighWater,
+    CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry, RateLimitWindowEntry, RootMeta,
+    TokenCounters, TokenEvent, TokenSignature, UsageHighWater,
 };
 use crate::quota::codex::protocol::local_calendar_date_at;
 
@@ -28,6 +28,9 @@ pub(super) fn update_candidate_cache(
         && let Some(mut moved) = caches.remove(&old_key)
     {
         moved.path.clone_from(&key);
+        if let Some(entry) = moved.latest_rate_limits.as_mut() {
+            entry.source_path.clone_from(&key);
+        }
         caches.insert(key.clone(), moved);
         cache_dirty = true;
     }
@@ -57,6 +60,7 @@ pub(super) fn update_candidate_cache(
         let previous_token_without_timestamp = cache.token_without_timestamp;
         let previous_uncertain = cache.uncertain;
         let previous_parse_errors = cache.parse_errors;
+        let previous_rate_limits = cache.latest_rate_limits.clone();
         diagnostics.files_read = diagnostics.files_read.saturating_add(1);
         if parse_file_append(candidate, &mut cache).is_err() {
             cache.uncertain = true;
@@ -72,7 +76,8 @@ pub(super) fn update_candidate_cache(
             || previous_max_timestamp != cache.max_timestamp_nanos
             || previous_token_without_timestamp != cache.token_without_timestamp
             || previous_uncertain != cache.uncertain
-            || previous_parse_errors != cache.parse_errors;
+            || previous_parse_errors != cache.parse_errors
+            || previous_rate_limits != cache.latest_rate_limits;
     }
     cache.length = candidate.length;
     cache.last_write_time = candidate.last_write_time;
@@ -189,6 +194,14 @@ fn parse_token_event(
     if payload.get("type").and_then(Value::as_str) != Some("token_count") {
         return;
     }
+    if let Some(entry) = parse_rate_limit_snapshot(payload, timestamp, &cache.path)
+        && cache
+            .latest_rate_limits
+            .as_ref()
+            .is_none_or(|existing| entry.timestamp_nanos >= existing.timestamp_nanos)
+    {
+        cache.latest_rate_limits = Some(entry);
+    }
     let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
         return;
     };
@@ -233,6 +246,46 @@ fn parse_token_event(
         source,
         delta_total,
     });
+}
+
+fn parse_rate_limit_snapshot(
+    payload: &Value,
+    timestamp: Option<i64>,
+    source_path: &str,
+) -> Option<RateLimitSnapshotEntry> {
+    let limits = payload
+        .get("rate_limits")
+        .filter(|value| !value.is_null())?;
+    if limits.get("limit_id").and_then(Value::as_str) != Some("codex") {
+        return None;
+    }
+    let timestamp_nanos = timestamp?;
+    let primary = parse_rate_limit_window(limits.get("primary")?)?;
+    let secondary = limits
+        .get("secondary")
+        .filter(|value| !value.is_null())
+        .and_then(parse_rate_limit_window);
+    let plan_type = limits
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Some(RateLimitSnapshotEntry {
+        timestamp_nanos,
+        limit_id: "codex".to_owned(),
+        source_path: source_path.to_owned(),
+        primary,
+        secondary,
+        plan_type,
+    })
+}
+
+fn parse_rate_limit_window(value: &Value) -> Option<RateLimitWindowEntry> {
+    Some(RateLimitWindowEntry {
+        used_percent: value.get("used_percent").and_then(Value::as_f64)?,
+        window_minutes: value.get("window_minutes").and_then(Value::as_u64)?,
+        resets_at: value.get("resets_at").and_then(Value::as_i64)?,
+    })
 }
 
 fn parse_root_meta(

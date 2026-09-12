@@ -325,6 +325,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_ignores_removed_quota_source_field() {
+        let config = serde_json::from_str::<AppConfigV1>(
+            r#"{
+                "version": 1,
+                "always_on_top": true,
+                "start_with_windows": false,
+                "quota_source": "local"
+            }"#,
+        );
+
+        assert!(config.is_ok());
+    }
+
+    #[test]
     fn loading_legacy_config_persists_defaulted_fields() {
         let directory = unique_test_dir("legacy-writeback");
         let path = directory.join("config.json");

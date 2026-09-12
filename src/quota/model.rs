@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime};
 
+pub(crate) const QUOTA_STALE_FLOOR: Duration = Duration::from_mins(30);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaWindow {
     pub used_percent: f64,
@@ -36,6 +38,13 @@ impl QuotaWindow {
             _ => "等待刷新".to_owned(),
         }
     }
+
+    /// A window whose reset time has passed was already replaced server-side,
+    /// so its remaining percentage is unknowable and must not be displayed.
+    #[must_use]
+    pub fn has_expired(&self, now: SystemTime) -> bool {
+        self.resets_at <= now
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +79,28 @@ impl QuotaSnapshot {
         } else {
             (Some(secondary), Some(primary))
         }
+    }
+
+    /// Short/long-term windows that have not been replaced by a server-side
+    /// reset yet; expired windows carry no usable percentage.
+    #[must_use]
+    pub fn active_windows(&self, now: SystemTime) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
+        let (short_term, long_term) = self.quota_windows();
+        (
+            short_term.filter(|window| !window.has_expired(now)),
+            long_term.filter(|window| !window.has_expired(now)),
+        )
+    }
+
+    /// Whether any window of this snapshot has been reset server-side, which
+    /// makes an on-demand refresh due regardless of the snapshot's age.
+    #[must_use]
+    pub fn has_expired_window(&self, now: SystemTime) -> bool {
+        self.primary.has_expired(now)
+            || self
+                .secondary
+                .as_ref()
+                .is_some_and(|window| window.has_expired(now))
     }
 }
 
@@ -113,7 +144,7 @@ impl AppState {
     pub fn stale_after(&self) -> Duration {
         self.quota_refresh_interval
             .saturating_mul(2)
-            .max(Duration::from_mins(3))
+            .max(QUOTA_STALE_FLOOR)
     }
 
     #[must_use]
@@ -224,27 +255,59 @@ mod tests {
     }
 
     #[test]
-    fn one_minute_refresh_keeps_a_three_minute_minimum_stale_threshold() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    fn stale_threshold_is_twice_the_configured_refresh_interval() {
+        let state = AppState {
+            quota_refresh_interval: Duration::from_mins(30),
+            ..AppState::default()
+        };
+        assert_eq!(state.stale_after(), Duration::from_hours(1));
+    }
+
+    #[test]
+    fn stale_threshold_has_a_thirty_minute_floor() {
+        let state = AppState {
+            quota_refresh_interval: Duration::from_mins(1),
+            ..AppState::default()
+        };
+
+        assert_eq!(state.stale_after(), QUOTA_STALE_FLOOR);
+    }
+
+    #[test]
+    fn snapshot_stays_fresh_until_the_stale_threshold() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
                 limit_id: "codex".to_owned(),
                 primary: window(10.0),
                 secondary: None,
-                received_at: now - Duration::from_secs(181),
+                received_at: now - Duration::from_mins(29),
             }),
             quota_refresh_interval: Duration::from_mins(1),
             ..AppState::default()
         };
-        assert!(state.is_stale(now));
+
+        assert!(!state.is_stale(now));
     }
 
     #[test]
-    fn stale_threshold_is_twice_the_configured_refresh_interval() {
-        let state = AppState {
-            quota_refresh_interval: Duration::from_mins(10),
-            ..AppState::default()
+    fn expired_windows_are_filtered_from_active_windows() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
+        let snapshot = QuotaSnapshot {
+            limit_id: "codex".to_owned(),
+            primary: window(10.0),
+            secondary: Some(QuotaWindow {
+                used_percent: 20.0,
+                window_duration: Duration::from_hours(168),
+                resets_at: now + Duration::from_hours(1),
+            }),
+            received_at: now - Duration::from_mins(1),
         };
-        assert_eq!(state.stale_after(), Duration::from_mins(20));
+
+        let (short_term, long_term) = snapshot.active_windows(now);
+
+        assert!(short_term.is_none());
+        assert!(long_term.is_some_and(|window| !window.has_expired(now)));
+        assert!(snapshot.has_expired_window(now));
     }
 }

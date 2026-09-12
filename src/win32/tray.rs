@@ -118,31 +118,12 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
     });
     let refresh = wide("立即刷新");
     let refresh_interval = wide("刷新间隔");
-    let one_minute_label = wide("1 分钟");
-    let two_minute_label = wide("2 分钟");
-    let five_minute_label = wide("5 分钟");
-    let ten_minute_label = wide("10 分钟");
-    let thirty_minute_label = wide("30 分钟");
     let topmost = wide("始终置顶");
     let autostart = wide("开机启动");
     let follow_codex = wide("跟随 Codex");
     let panel_persistent = wide("面板常驻");
     let exit = wide("退出");
-    for (command, seconds, label) in [
-        (CMD_REFRESH_1_MIN, 60, &one_minute_label),
-        (CMD_REFRESH_2_MIN, 2 * 60, &two_minute_label),
-        (CMD_REFRESH_5_MIN, 5 * 60, &five_minute_label),
-        (CMD_REFRESH_10_MIN, 10 * 60, &ten_minute_label),
-        (CMD_REFRESH_30_MIN, 30 * 60, &thirty_minute_label),
-    ] {
-        append_menu_command(
-            refresh_menu.0,
-            command,
-            label,
-            state.quota_refresh_interval_secs == seconds,
-            true,
-        )?;
-    }
+    append_refresh_interval_entries(refresh_menu.0, state)?;
     append_menu_command(menu.0, CMD_SHOW, &show, false, !state.follow_codex)?;
     append_menu_command(
         menu.0,
@@ -201,6 +182,30 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
             hwnd,
             None,
         );
+    }
+    Ok(())
+}
+
+fn append_refresh_interval_entries(menu: HMENU, state: TrayMenuState) -> Result<(), AppError> {
+    let one_minute = wide("1 分钟");
+    let two_minute = wide("2 分钟");
+    let five_minute = wide("5 分钟");
+    let ten_minute = wide("10 分钟");
+    let thirty_minute = wide("30 分钟");
+    for (command, seconds, label) in [
+        (CMD_REFRESH_1_MIN, 60, &one_minute),
+        (CMD_REFRESH_2_MIN, 2 * 60, &two_minute),
+        (CMD_REFRESH_5_MIN, 5 * 60, &five_minute),
+        (CMD_REFRESH_10_MIN, 10 * 60, &ten_minute),
+        (CMD_REFRESH_30_MIN, 30 * 60, &thirty_minute),
+    ] {
+        append_menu_command(
+            menu,
+            command,
+            label,
+            state.quota_refresh_interval_secs == seconds,
+            true,
+        )?;
     }
     Ok(())
 }

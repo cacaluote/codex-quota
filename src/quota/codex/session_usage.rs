@@ -7,32 +7,41 @@ mod watcher;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aggregate::{
-    aggregate_period, aggregate_today, cache_has_tokens_in_period, cache_has_tokens_on_date,
+    aggregate_lifetime, aggregate_period, aggregate_today, cache_has_tokens_in_period,
+    cache_has_tokens_on_date,
 };
 use files::{
     codex_home, discover_candidates, inspect_changed_candidates, is_date_partition,
     is_date_partition_in_range, load_cache, modified_on_date, modified_on_or_after_date, path_key,
     save_cache,
 };
-use model::{CandidateFile, FileCache, ParentLink, UsageCacheV1};
+use model::{
+    CandidateFile, FileCache, LifetimeAggregate, ParentLink, RateLimitSnapshotEntry,
+    RateLimitWindowEntry, UsageCacheV1,
+};
 use parser::{event_is_on_date, system_time_from_unix_nanos, update_candidate_cache};
 use watcher::SessionChangeWatcher;
 
 use super::PeriodBoundary;
 use super::protocol::{local_calendar_date, local_calendar_date_at};
+use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_FILENAME: &str = "usage-cache-v1.json";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct LocalUsageSnapshot {
     pub(super) today_tokens: u64,
     pub(super) today_reliable: bool,
     pub(super) current_period_tokens: u64,
     pub(super) current_period_reliable: bool,
+    pub(super) quota: Option<QuotaSnapshot>,
+    pub(super) plan_type: Option<String>,
+    pub(super) lifetime_tokens: Option<u64>,
+    pub(super) lifetime_reliable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -124,6 +133,7 @@ struct ScanContext {
     caches: HashMap<String, FileCache>,
     today_selected: HashSet<String>,
     period_selected: HashSet<String>,
+    lifetime_selected: HashSet<String>,
     dependencies: HashSet<String>,
     diagnostics: RefreshDiagnostics,
     cache_dirty: bool,
@@ -136,7 +146,18 @@ struct ScanResult {
     candidate_index: HashMap<String, CandidateFile>,
     selected: HashSet<String>,
     dependencies: HashSet<String>,
+    latest_rate_limits: Option<RateLimitSnapshotEntry>,
+    lifetime: Option<LifetimeAggregate>,
+    lifetime_sources: Option<Vec<String>>,
     cache_dirty: bool,
+}
+
+struct DerivedQuota {
+    latest_rate_limits: Option<RateLimitSnapshotEntry>,
+    lifetime: Option<LifetimeAggregate>,
+    /// Contributor paths when the lifetime was recomputed this scan;
+    /// `None` when the previous aggregate is carried forward.
+    lifetime_sources: Option<Vec<String>>,
 }
 
 impl ScanContext {
@@ -147,7 +168,7 @@ impl ScanContext {
         cached_files: Vec<FileCache>,
     ) -> Result<Self, SessionUsageError> {
         let discovery = discover_candidates(codex_dir)?;
-        Ok(Self::from_candidates(
+        let mut context = Self::from_candidates(
             today,
             boundary,
             cached_files,
@@ -155,7 +176,11 @@ impl ScanContext {
             discovery.errors,
             0,
             RefreshMode::FullScan,
-        ))
+        );
+        // A full scan is the only place that sees every candidate, so it also
+        // feeds the lifetime aggregation and the newest rate-limit snapshot.
+        context.lifetime_selected = context.candidate_by_path.keys().cloned().collect();
+        Ok(context)
     }
 
     fn new_incremental(
@@ -260,6 +285,7 @@ impl ScanContext {
             caches,
             today_selected,
             period_selected,
+            lifetime_selected: HashSet::new(),
             dependencies: HashSet::new(),
             diagnostics: RefreshDiagnostics {
                 mode,
@@ -276,20 +302,29 @@ impl ScanContext {
     }
 
     fn parse_selected_and_dependencies(&mut self) {
-        let initial_selected: Vec<String> = self
+        let selected_roots: Vec<String> = self
             .today_selected
             .union(&self.period_selected)
             .cloned()
             .collect();
-        for key in &initial_selected {
-            if let Some(candidate) = self.candidate_by_path.get(key) {
+        let mut dependencies = HashSet::new();
+        self.parse_roots(selected_roots, &mut dependencies);
+        self.dependencies = dependencies;
+
+        if !self.lifetime_selected.is_empty() {
+            let lifetime_roots: Vec<String> = self.lifetime_selected.iter().cloned().collect();
+            let mut lifetime_dependencies = HashSet::new();
+            self.parse_roots(lifetime_roots, &mut lifetime_dependencies);
+        }
+    }
+
+    fn parse_roots(&mut self, roots: Vec<String>, visited: &mut HashSet<String>) {
+        let mut pending = roots;
+        while let Some(key) = pending.pop() {
+            if let Some(candidate) = self.candidate_by_path.get(&key) {
                 self.cache_dirty |=
                     update_candidate_cache(candidate, &mut self.caches, &mut self.diagnostics);
             }
-        }
-
-        let mut pending = initial_selected;
-        while let Some(key) = pending.pop() {
             let Some(ParentLink::Parent(parent_id)) = self
                 .caches
                 .get(&key)
@@ -302,13 +337,68 @@ impl ScanContext {
                 continue;
             };
             for parent_key in parent_paths {
-                if self.dependencies.insert(parent_key.clone())
+                if visited.insert(parent_key.clone())
                     && let Some(candidate) = self.candidate_by_path.get(parent_key)
                 {
                     self.cache_dirty |=
                         update_candidate_cache(candidate, &mut self.caches, &mut self.diagnostics);
                     pending.push(parent_key.clone());
                 }
+            }
+        }
+    }
+
+    fn derive_quota_and_lifetime(
+        &self,
+        previous_rate_limits: Option<RateLimitSnapshotEntry>,
+        previous_lifetime: Option<LifetimeAggregate>,
+    ) -> DerivedQuota {
+        // Only files that still exist on disk may contribute: a cache entry
+        // whose file was deleted must not keep feeding the snapshot or the
+        // lifetime total until the next trim.
+        let live_keys: HashSet<&String> = self
+            .caches
+            .keys()
+            .filter(|key| self.candidate_by_path.contains_key(*key))
+            .collect();
+        let scan_latest = live_keys
+            .iter()
+            .filter_map(|key| {
+                self.caches
+                    .get(*key)
+                    .and_then(|cache| cache.latest_rate_limits.clone())
+            })
+            .max_by_key(|entry| entry.timestamp_nanos);
+        // Discovery gaps make candidate absence meaningless: with an
+        // incomplete candidate set, absence says the directory could not be
+        // enumerated, not that the file was deleted. Carry the persisted
+        // values unchanged until a complete scan revalidates them.
+        let candidates_complete = self.diagnostics.discovery_errors == 0;
+        let carried_rate_limits = if candidates_complete {
+            // The persisted snapshot survives trims, so it can outlive its
+            // own source file; carry it only while that file still exists.
+            previous_rate_limits
+                .filter(|previous| self.candidate_by_path.contains_key(&previous.source_path))
+        } else {
+            previous_rate_limits
+        };
+        let latest_rate_limits = newest_rate_limit_entry(carried_rate_limits, scan_latest);
+        if self.diagnostics.mode == RefreshMode::FullScan && candidates_complete {
+            let selected: HashSet<String> = live_keys.into_iter().cloned().collect();
+            let (tokens, reliable) =
+                aggregate_lifetime(&selected, &self.caches, &self.rollout_index);
+            let mut lifetime_sources: Vec<String> = selected.into_iter().collect();
+            lifetime_sources.sort();
+            DerivedQuota {
+                latest_rate_limits,
+                lifetime: Some(LifetimeAggregate { tokens, reliable }),
+                lifetime_sources: Some(lifetime_sources),
+            }
+        } else {
+            DerivedQuota {
+                latest_rate_limits,
+                lifetime: previous_lifetime,
+                lifetime_sources: None,
             }
         }
     }
@@ -325,8 +415,10 @@ impl ScanContext {
         today: &str,
         boundary: Option<&PeriodBoundary>,
         reused: Option<(LocalUsageSnapshot, usize)>,
+        previous_rate_limits: Option<RateLimitSnapshotEntry>,
+        previous_lifetime: Option<LifetimeAggregate>,
     ) -> ScanResult {
-        let snapshot = if let Some((snapshot, deferred_files)) = reused {
+        let mut snapshot = if let Some((snapshot, deferred_files)) = reused {
             self.diagnostics.aggregation_skipped = true;
             self.diagnostics.deferred_files = deferred_files;
             snapshot
@@ -374,8 +466,30 @@ impl ScanContext {
                 today_reliable,
                 current_period_tokens,
                 current_period_reliable,
+                quota: None,
+                plan_type: None,
+                lifetime_tokens: None,
+                lifetime_reliable: false,
             }
         };
+        let derived = self.derive_quota_and_lifetime(previous_rate_limits, previous_lifetime);
+        snapshot.quota = derived
+            .latest_rate_limits
+            .as_ref()
+            .and_then(quota_snapshot_from_entry);
+        snapshot.plan_type = derived
+            .latest_rate_limits
+            .as_ref()
+            .and_then(|entry| entry.plan_type.clone());
+        snapshot.lifetime_tokens = derived
+            .lifetime
+            .as_ref()
+            .filter(|aggregate| aggregate.reliable)
+            .map(|aggregate| aggregate.tokens);
+        snapshot.lifetime_reliable = derived
+            .lifetime
+            .as_ref()
+            .is_some_and(|aggregate| aggregate.reliable);
         let selected = self.selected();
         self.diagnostics.parse_errors = selected
             .iter()
@@ -397,6 +511,9 @@ impl ScanContext {
             candidate_index: self.candidate_by_path,
             selected,
             dependencies,
+            latest_rate_limits: derived.latest_rate_limits,
+            lifetime: derived.lifetime,
+            lifetime_sources: derived.lifetime_sources,
             cache_dirty: self.cache_dirty,
         }
     }
@@ -467,6 +584,12 @@ impl SessionUsageTracker {
         has_changes
     }
 
+    pub(super) fn retry_watcher(&mut self) -> bool {
+        let was_incremental = self.change_monitor.supports_incremental();
+        self.ensure_watcher();
+        !was_incremental && self.change_monitor.supports_incremental()
+    }
+
     fn ensure_watcher(&mut self) {
         if matches!(self.change_monitor, ChangeMonitor::Retry)
             && let Some(codex_dir) = self
@@ -482,24 +605,6 @@ impl SessionUsageTracker {
 
     pub(super) fn require_full_scan(&mut self) {
         self.full_scan_required = true;
-    }
-
-    pub(super) fn needs_refresh(&mut self, period_boundary: Option<&PeriodBoundary>) -> bool {
-        self.ensure_watcher();
-        self.poll_changes();
-        let scope = RefreshScope {
-            date: local_calendar_date(),
-            period_boundary: period_boundary.cloned(),
-        };
-        !self.change_monitor.supports_incremental()
-            || self.full_scan_required
-            || !self.pending_paths.is_empty()
-            || self.cache_needs_write
-            || self.cache.date != scope.date
-            || self
-                .last_aggregation
-                .as_ref()
-                .is_none_or(|last| last.scope != scope)
     }
 
     fn unchanged_refresh(
@@ -560,6 +665,29 @@ impl SessionUsageTracker {
         self.refresh_for_period(date, None)
     }
 
+    fn build_scan(
+        &mut self,
+        full_scan: bool,
+        codex_dir: &Path,
+        date: &str,
+        period_boundary: Option<&PeriodBoundary>,
+    ) -> Result<ScanContext, SessionUsageError> {
+        let cached_files = std::mem::take(&mut self.cache.files);
+        if full_scan {
+            self.pending_paths.clear();
+            ScanContext::new_full(codex_dir, date, period_boundary, cached_files)
+        } else {
+            let changed_paths = std::mem::take(&mut self.pending_paths);
+            Ok(ScanContext::new_incremental(
+                date,
+                period_boundary,
+                cached_files,
+                std::mem::take(&mut self.candidate_index),
+                &changed_paths,
+            ))
+        }
+    }
+
     fn refresh_for_period(
         &mut self,
         date: &str,
@@ -568,12 +696,11 @@ impl SessionUsageTracker {
         let total_started = Instant::now();
         self.ensure_watcher();
         self.poll_changes();
-        let Some(codex_dir) = self.codex_dir.as_deref() else {
-            return Err(SessionUsageError::CodexHomeUnavailable);
-        };
-        if !codex_dir.is_dir() {
-            return Err(SessionUsageError::CodexHomeUnavailable);
-        }
+        let codex_dir = self
+            .codex_dir
+            .clone()
+            .filter(|directory| directory.is_dir())
+            .ok_or(SessionUsageError::CodexHomeUnavailable)?;
         let scope = RefreshScope {
             date: date.to_owned(),
             period_boundary: period_boundary.cloned(),
@@ -594,39 +721,38 @@ impl SessionUsageTracker {
             .iter()
             .map(|cache| cache.path.clone())
             .collect();
+        let previous_rate_limits = self.cache.latest_rate_limits.clone();
+        let previous_lifetime = self.cache.lifetime.clone();
+        let previous_lifetime_sources = self.cache.lifetime_sources.clone();
 
         let discovery_started = Instant::now();
-        let cached_files = std::mem::take(&mut self.cache.files);
-        let mut scan = if full_scan {
-            self.pending_paths.clear();
-            ScanContext::new_full(codex_dir, date, period_boundary, cached_files)?
-        } else {
-            let changed_paths = std::mem::take(&mut self.pending_paths);
-            ScanContext::new_incremental(
-                date,
-                period_boundary,
-                cached_files,
-                std::mem::take(&mut self.candidate_index),
-                &changed_paths,
-            )
-        };
+        let mut scan = self.build_scan(full_scan, &codex_dir, date, period_boundary)?;
+        // A cached file that no longer exists invalidates the carried
+        // snapshot and lifetime totals: discard them and let the promoted
+        // full scan recompute both from the surviving files only.
+        let (promoted_scan, cached_paths_dropped) = rebalance_scan_after_deletions(
+            scan,
+            full_scan,
+            &previous_cache_paths,
+            &previous_lifetime_sources,
+            &codex_dir,
+            date,
+            period_boundary,
+        )?;
+        scan = promoted_scan;
+        let previous_rate_limits = (!cached_paths_dropped)
+            .then_some(previous_rate_limits)
+            .flatten();
+        let previous_lifetime = (!cached_paths_dropped)
+            .then_some(previous_lifetime)
+            .flatten();
         scan.diagnostics.discovery_elapsed = discovery_started.elapsed();
 
         let read_parse_started = Instant::now();
         scan.parse_selected_and_dependencies();
         scan.diagnostics.read_parse_elapsed = read_parse_started.elapsed();
 
-        let reused = self
-            .last_aggregation
-            .as_ref()
-            .filter(|last| {
-                !scan.cache_dirty
-                    && scan.diagnostics.discovery_errors == 0
-                    && last.scope == scope
-                    && last.selected == scan.selected()
-                    && last.dependencies == scan.dependencies
-            })
-            .map(|last| (last.snapshot.clone(), last.deferred_files));
+        let reused = self.reusable_aggregation(&scan, &scope);
         let aggregation_started = Instant::now();
         let ScanResult {
             snapshot,
@@ -635,21 +761,68 @@ impl SessionUsageTracker {
             candidate_index,
             selected,
             dependencies,
+            latest_rate_limits,
+            lifetime,
+            lifetime_sources,
             cache_dirty,
-        } = scan.finish(date, period_boundary, reused);
+        } = scan.finish(
+            date,
+            period_boundary,
+            reused,
+            previous_rate_limits.clone(),
+            previous_lifetime.clone(),
+        );
         let mut cache_dirty = cache_dirty;
         diagnostics.aggregation_elapsed = aggregation_started.elapsed();
         let retained_paths: HashSet<_> = files.iter().map(|cache| cache.path.clone()).collect();
-        cache_dirty |= cache_date_changed || retained_paths != previous_cache_paths;
+        cache_dirty |= cache_date_changed
+            || retained_paths != previous_cache_paths
+            || previous_rate_limits != latest_rate_limits
+            || previous_lifetime != lifetime;
         self.cache.version = CACHE_VERSION;
-        self.cache.codex_home = path_key(codex_dir);
+        self.cache.codex_home = path_key(&codex_dir);
         date.clone_into(&mut self.cache.date);
         self.cache.files = files;
+        self.cache.latest_rate_limits = latest_rate_limits;
+        self.cache.lifetime = lifetime;
+        if let Some(lifetime_sources) = lifetime_sources {
+            cache_dirty |= lifetime_sources != self.cache.lifetime_sources;
+            self.cache.lifetime_sources = lifetime_sources;
+        }
         self.candidate_index = candidate_index;
 
         self.write_cache(&mut diagnostics, cache_dirty);
         diagnostics.total_elapsed = total_started.elapsed();
+        self.remember_aggregation(scope, selected, dependencies, &snapshot, &diagnostics);
 
+        Ok((snapshot, diagnostics))
+    }
+
+    fn reusable_aggregation(
+        &self,
+        scan: &ScanContext,
+        scope: &RefreshScope,
+    ) -> Option<(LocalUsageSnapshot, usize)> {
+        self.last_aggregation
+            .as_ref()
+            .filter(|last| {
+                !scan.cache_dirty
+                    && scan.diagnostics.discovery_errors == 0
+                    && last.scope == *scope
+                    && last.selected == scan.selected()
+                    && last.dependencies == scan.dependencies
+            })
+            .map(|last| (last.snapshot.clone(), last.deferred_files))
+    }
+
+    fn remember_aggregation(
+        &mut self,
+        scope: RefreshScope,
+        selected: HashSet<String>,
+        dependencies: HashSet<String>,
+        snapshot: &LocalUsageSnapshot,
+        diagnostics: &RefreshDiagnostics,
+    ) {
         if diagnostics.discovery_errors == 0 {
             if diagnostics.mode == RefreshMode::FullScan {
                 self.full_scan_required = false;
@@ -665,8 +838,6 @@ impl SessionUsageTracker {
             self.full_scan_required = true;
             self.last_aggregation = None;
         }
-
-        Ok((snapshot, diagnostics))
     }
 }
 
@@ -678,6 +849,73 @@ fn load_valid_cache(cache_path: Option<&Path>, codex_dir: Option<&Path>) -> Usag
                 && cache.codex_home == codex_dir.map_or_else(String::new, path_key)
         })
         .unwrap_or_else(|| UsageCacheV1::empty(codex_dir))
+}
+
+/// Detects cached or lifetime-contributing files that disappeared from disk.
+/// Returns the scan to use (an incremental scan is promoted to a full scan so
+/// the carried snapshot and lifetime totals are recomputed from surviving
+/// files) and whether any referenced path was dropped.
+fn rebalance_scan_after_deletions(
+    scan: ScanContext,
+    full_scan: bool,
+    previous_cache_paths: &HashSet<String>,
+    previous_lifetime_sources: &[String],
+    codex_dir: &Path,
+    date: &str,
+    period_boundary: Option<&PeriodBoundary>,
+) -> Result<(ScanContext, bool), SessionUsageError> {
+    if scan.diagnostics.discovery_errors != 0 {
+        return Ok((scan, false));
+    }
+    let dropped = previous_cache_paths
+        .iter()
+        .chain(previous_lifetime_sources.iter())
+        .any(|path| !scan.candidate_by_path.contains_key(path));
+    if !dropped || full_scan {
+        return Ok((scan, dropped));
+    }
+    let cached_files: Vec<FileCache> = scan.caches.values().cloned().collect();
+    let promoted = ScanContext::new_full(codex_dir, date, period_boundary, cached_files)?;
+    Ok((promoted, true))
+}
+
+fn newest_rate_limit_entry(
+    previous: Option<RateLimitSnapshotEntry>,
+    scan: Option<RateLimitSnapshotEntry>,
+) -> Option<RateLimitSnapshotEntry> {
+    match (previous, scan) {
+        (Some(previous), Some(scan)) => {
+            if scan.timestamp_nanos >= previous.timestamp_nanos {
+                Some(scan)
+            } else {
+                Some(previous)
+            }
+        }
+        (previous, scan) => previous.or(scan),
+    }
+}
+
+fn quota_snapshot_from_entry(entry: &RateLimitSnapshotEntry) -> Option<QuotaSnapshot> {
+    let received_at = system_time_from_unix_nanos(entry.timestamp_nanos)?;
+    let secondary = match entry.secondary.as_ref() {
+        Some(window) => Some(quota_window_from_entry(window)?),
+        None => None,
+    };
+    Some(QuotaSnapshot {
+        limit_id: entry.limit_id.clone(),
+        primary: quota_window_from_entry(&entry.primary)?,
+        secondary,
+        received_at,
+    })
+}
+
+fn quota_window_from_entry(window: &RateLimitWindowEntry) -> Option<QuotaWindow> {
+    let resets_at = u64::try_from(window.resets_at).ok()?;
+    Some(QuotaWindow {
+        used_percent: window.used_percent,
+        window_duration: Duration::from_secs(window.window_minutes.saturating_mul(60)),
+        resets_at: UNIX_EPOCH + Duration::from_secs(resets_at),
+    })
 }
 
 #[cfg(test)]
@@ -786,7 +1024,21 @@ mod test_support {
         last: Option<u64>,
         source: Option<&str>,
     ) -> Value {
-        json!({
+        token_count_with_rate_limits(
+            timestamp,
+            total,
+            last,
+            source.map_or_else(|| Value::Null, |limit_id| json!({ "limit_id": limit_id })),
+        )
+    }
+
+    pub(super) fn token_count_with_rate_limits(
+        timestamp: &str,
+        total: u64,
+        last: Option<u64>,
+        rate_limits: Value,
+    ) -> Value {
+        let mut event = json!({
             "timestamp": timestamp,
             "type": "event_msg",
             "payload": {
@@ -802,9 +1054,28 @@ mod test_support {
                         "output_tokens": 1,
                         "total_tokens": last
                     }))
-                },
-                "rate_limits": source.map(|limit_id| json!({ "limit_id": limit_id }))
+                }
             }
+        });
+        event["payload"]["rate_limits"] = rate_limits;
+        event
+    }
+
+    pub(super) fn codex_rate_limits(
+        used_percent: f64,
+        window_minutes: u64,
+        resets_at: i64,
+        plan_type: Option<&str>,
+    ) -> Value {
+        json!({
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": used_percent,
+                "window_minutes": window_minutes,
+                "resets_at": resets_at
+            },
+            "secondary": null,
+            "plan_type": plan_type
         })
     }
 
@@ -814,6 +1085,12 @@ mod test_support {
             "type": "turn_context",
             "payload": { "model": "gpt-test" }
         })
+    }
+
+    pub(super) fn epoch_seconds(timestamp: &str) -> i64 {
+        parse_timestamp_nanos(Some(&Value::String(timestamp.to_owned())))
+            .map(|nanos| nanos / 1_000_000_000)
+            .unwrap_or_default()
     }
 
     pub(super) fn write_jsonl(path: &Path, values: &[Value]) {
@@ -840,9 +1117,11 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::SystemTime;
 
     use serde_json::Value;
+    use serde_json::json;
 
     use super::parser::{parse_timestamp_nanos, system_time_from_unix_nanos};
     use super::test_support::*;
@@ -1072,54 +1351,19 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_watcher_state_does_not_need_timed_refresh() {
-        let context = TestContext::new("watcher-no-timed-refresh");
-        write_jsonl(
-            &context.rollout(PARENT_ID),
-            &[
-                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(1), 100, Some(100), Some("codex")),
-            ],
-        );
+    fn watcher_retry_recovers_incremental_monitor_and_requires_full_scan() {
+        let context = TestContext::new("watcher-retry");
         let mut tracker = context.tracker();
-        tracker.enable_incremental_for_test();
-        let _ = tracker.refresh_for_date(&context.date);
-
-        let needs_refresh = tracker.needs_refresh(None);
-
-        assert!(!needs_refresh);
-    }
-
-    #[test]
-    fn watcher_change_needs_local_refresh() {
-        let context = TestContext::new("watcher-change-needs-refresh");
-        let file = context.rollout(PARENT_ID);
-        write_jsonl(
-            &file,
-            &[
-                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(1), 100, Some(100), Some("codex")),
-            ],
-        );
-        let mut tracker = context.tracker();
-        tracker.enable_incremental_for_test();
-        let _ = tracker.refresh_for_date(&context.date);
-        tracker.mark_changed_for_test(file);
-
-        let needs_refresh = tracker.needs_refresh(None);
-
-        assert!(needs_refresh);
-    }
-
-    #[test]
-    fn forced_full_scan_needs_local_refresh() {
-        let context = TestContext::new("forced-scan-needs-refresh");
-        let mut tracker = context.tracker();
-        tracker.enable_incremental_for_test();
+        tracker.change_monitor = ChangeMonitor::Retry;
         tracker.full_scan_required = false;
-        tracker.require_full_scan();
 
-        assert!(tracker.needs_refresh(None));
+        let recovered = tracker.retry_watcher();
+
+        assert!(
+            recovered
+                && tracker.change_monitor.supports_incremental()
+                && tracker.full_scan_required
+        );
     }
 
     #[test]
@@ -1268,6 +1512,7 @@ mod tests {
             caches: HashMap::new(),
             today_selected: HashSet::new(),
             period_selected: HashSet::new(),
+            lifetime_selected: HashSet::new(),
             dependencies: HashSet::new(),
             diagnostics: RefreshDiagnostics {
                 discovery_errors: 1,
@@ -1276,8 +1521,663 @@ mod tests {
             cache_dirty: false,
         };
 
-        let snapshot = scan.finish("2026-08-10", None, None).snapshot;
+        let snapshot = scan.finish("2026-08-10", None, None, None, None).snapshot;
 
         assert!(!snapshot.today_reliable);
+    }
+
+    #[test]
+    fn lifetime_sums_sequential_resume_rollouts_of_same_thread() {
+        let context = TestContext::new("resume-lifetime");
+        write_jsonl(
+            &context.rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+            ],
+        );
+        // Codex resume keeps the thread id but starts a reset token counter
+        // and records no replayed events.
+        write_jsonl(
+            &context.archived_rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(5), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(6), 50, Some(50), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert!(result.is_ok_and(|value| {
+            value.0.lifetime_tokens == Some(150) && value.0.lifetime_reliable
+        }));
+    }
+
+    #[test]
+    fn refresh_exposes_latest_rate_limit_snapshot_with_plan_type() {
+        let context = TestContext::new("rate-limit-snapshot");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(45.0, 10_080, 2_000_000_000, Some("plus")),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    150,
+                    Some(50),
+                    codex_rate_limits(46.0, 10_080, 2_000_000_000, Some("plus")),
+                ),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+        let snapshot = result.ok().map(|value| value.0);
+        let quota = snapshot.as_ref().and_then(|value| value.quota.as_ref());
+
+        assert_eq!(
+            snapshot
+                .as_ref()
+                .and_then(|value| value.plan_type.as_deref()),
+            Some("plus")
+        );
+        assert!(quota.is_some_and(|quota| {
+            (quota.primary.used_percent - 46.0).abs() < f64::EPSILON
+                && quota.primary.window_duration == Duration::from_hours(168)
+                && quota.primary.resets_at == UNIX_EPOCH + Duration::from_secs(2_000_000_000)
+                && quota.secondary.is_none()
+                && quota.limit_id == "codex"
+        }));
+        assert_eq!(
+            snapshot.and_then(|value| value.quota.map(|quota| quota.received_at)),
+            timestamp_as_system_time(&context.at(2))
+        );
+    }
+
+    #[test]
+    fn rate_limit_snapshot_ignores_regressed_timestamp() {
+        let context = TestContext::new("rate-limit-regressed");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(5),
+                    100,
+                    Some(100),
+                    codex_rate_limits(50.0, 10_080, 2_000_000_000, None),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    150,
+                    Some(50),
+                    codex_rate_limits(20.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert!(result.is_ok_and(|value| {
+            value
+                .0
+                .quota
+                .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
+        }));
+    }
+
+    #[test]
+    fn rate_limit_snapshot_ignores_non_codex_limit() {
+        let context = TestContext::new("rate-limit-other-source");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    json!({
+                        "limit_id": "other",
+                        "primary": {
+                            "used_percent": 90.0,
+                            "window_minutes": 60,
+                            "resets_at": 2_000_000_000
+                        },
+                        "plan_type": "pro"
+                    }),
+                ),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert!(
+            result.is_ok_and(|value| { value.0.quota.is_none() && value.0.plan_type.is_none() })
+        );
+    }
+
+    #[test]
+    fn rate_limit_snapshot_survives_without_today_selection() {
+        let context = TestContext::new("rate-limit-no-today-selection");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(30.0, 10_080, 2_000_000_000, Some("pro")),
+                ),
+            ],
+        );
+        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .and_then(|file| file.set_times(old_times))
+                .is_ok()
+        );
+        let today = local_calendar_date();
+        let result = context.tracker().refresh_for_date(&today);
+
+        assert!(result.is_ok_and(|value| {
+            value
+                .0
+                .quota
+                .is_some_and(|quota| (quota.primary.used_percent - 30.0).abs() < f64::EPSILON)
+        }));
+    }
+
+    #[test]
+    fn lifetime_counts_fork_usage_once() {
+        let context = TestContext::new("lifetime-fork");
+        let parent = context.rollout(PARENT_ID);
+        let child = context.rollout(CHILD_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(&context.at(-10), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(-9), 100, Some(100), Some("codex")),
+                turn_context(&context.at(5)),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta(&context.at(3), CHILD_ID, Some("openai"), Some(PARENT_ID)),
+                token_count(&context.at(3), 100, Some(100), Some("codex")),
+                token_count(&context.at(4), 150, Some(50), Some("codex")),
+            ],
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(
+            result
+                .ok()
+                .map(|value| (value.0.lifetime_tokens, value.0.lifetime_reliable)),
+            Some((Some(150), true))
+        );
+    }
+
+    #[test]
+    fn lifetime_survives_cache_reload() {
+        let context = TestContext::new("lifetime-reload");
+        write_jsonl(
+            &context.rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+                token_count(&context.at(2), 180, Some(80), Some("codex")),
+            ],
+        );
+        let mut tracker = context.tracker();
+        let first = tracker.refresh_for_date(&context.date);
+        drop(tracker);
+
+        let second = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(
+            (
+                first.ok().and_then(|value| value.0.lifetime_tokens),
+                second.ok().and_then(|value| value.0.lifetime_tokens)
+            ),
+            (Some(180), Some(180))
+        );
+    }
+
+    #[test]
+    fn stale_cache_version_is_discarded() {
+        let context = TestContext::new("cache-version-discard");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(46.0, 10_080, 2_000_000_000, Some("plus")),
+                ),
+            ],
+        );
+        assert!(
+            context
+                .cache
+                .parent()
+                .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
+        );
+        let stale = json!({
+            "version": CACHE_VERSION - 1,
+            "codex_home": path_key(&context.root),
+            "date": "2000-01-01",
+            "latest_rate_limits": null,
+            "lifetime": null,
+            "files": []
+        });
+        assert!(
+            fs::write(
+                &context.cache,
+                serde_json::to_string(&stale).unwrap_or_default()
+            )
+            .is_ok()
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert!(result.is_ok_and(|value| {
+            value
+                .0
+                .quota
+                .is_some_and(|quota| (quota.primary.used_percent - 46.0).abs() < f64::EPSILON)
+        }));
+    }
+
+    #[test]
+    fn deleted_file_stops_contributing_to_lifetime_and_snapshot() {
+        let context = TestContext::new("deleted-file");
+        let parent = context.rollout(PARENT_ID);
+        let child = context.rollout(CHILD_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(50.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta(&context.at(2), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(3),
+                    40,
+                    Some(40),
+                    codex_rate_limits(30.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        let mut tracker = context.tracker();
+        tracker.enable_incremental_for_test();
+        let (first, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("first refresh should succeed");
+
+        assert_eq!(first.lifetime_tokens, Some(140));
+        assert!(
+            first
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 30.0).abs() < f64::EPSILON)
+        );
+
+        assert!(fs::remove_file(&child).is_ok());
+        tracker.mark_changed_for_test(child.clone());
+
+        let (second, second_diagnostics) = tracker
+            .refresh_for_date(&context.date)
+            .expect("second refresh should succeed");
+
+        assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
+        assert_eq!(second_diagnostics.discovery_errors, 0);
+        assert_eq!(second.lifetime_tokens, Some(100));
+        assert!(
+            second
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn deleted_file_snapshot_does_not_survive_cache_reload() {
+        let context = TestContext::new("deleted-file-reload");
+        let parent = context.rollout(PARENT_ID);
+        let child = context.rollout(CHILD_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(50.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta(&context.at(2), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(3),
+                    40,
+                    Some(40),
+                    codex_rate_limits(30.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        let mut tracker = context.tracker();
+        let _ = tracker.refresh_for_date(&context.date);
+        drop(tracker);
+        assert!(fs::remove_file(&child).is_ok());
+
+        // Simulate a restart: the on-disk cache still carries the deleted
+        // file's newer snapshot, and the watcher reports the removal.
+        let mut tracker = context.tracker();
+        tracker.enable_incremental_for_test();
+        tracker.mark_changed_for_test(child.clone());
+        let (reloaded, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("reloaded refresh should succeed");
+
+        assert!(
+            reloaded
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
+        );
+        assert_eq!(reloaded.lifetime_tokens, Some(100));
+    }
+
+    #[test]
+    fn deleted_trimmed_snapshot_source_stops_winning() {
+        let context = TestContext::new("deleted-trimmed-snapshot");
+        let old = context.rollout(PARENT_ID);
+        let recent = context.rollout(CHILD_ID);
+        // Both files predate today, so neither is selected by date; the old
+        // file is additionally not selected by mtime and gets trimmed from
+        // the cache while its snapshot stays the persisted newest one.
+        write_jsonl(
+            &old,
+            &[
+                session_meta(&context.at(-172_900), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(-172_800 + 100),
+                    100,
+                    Some(100),
+                    codex_rate_limits(50.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        write_jsonl(
+            &recent,
+            &[
+                session_meta(&context.at(-172_900), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(-172_800),
+                    40,
+                    Some(40),
+                    codex_rate_limits(30.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&old)
+                .and_then(|file| file.set_times(old_times))
+                .is_ok()
+        );
+        let mut tracker = context.tracker();
+        tracker.enable_incremental_for_test();
+        let (first, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("first refresh should succeed");
+
+        assert!(
+            first
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
+        );
+        assert_eq!(first.lifetime_tokens, Some(140));
+
+        assert!(fs::remove_file(&old).is_ok());
+        tracker.mark_changed_for_test(old.clone());
+
+        let (second, second_diagnostics) = tracker
+            .refresh_for_date(&context.date)
+            .expect("second refresh should succeed");
+
+        assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
+        assert!(
+            second
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 30.0).abs() < f64::EPSILON)
+        );
+        assert_eq!(second.lifetime_tokens, Some(40));
+    }
+
+    #[test]
+    fn deleted_trimmed_lifetime_contributor_recomputes() {
+        let context = TestContext::new("deleted-trimmed-lifetime");
+        let old = context.rollout(PARENT_ID);
+        let recent = context.rollout(CHILD_ID);
+        write_jsonl(
+            &old,
+            &[
+                session_meta(&context.at(-172_900), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(-172_800), 100, Some(100), Some("codex")),
+            ],
+        );
+        write_jsonl(
+            &recent,
+            &[
+                session_meta(&context.at(0), CHILD_ID, Some("openai"), None),
+                token_count(&context.at(1), 40, Some(40), Some("codex")),
+            ],
+        );
+        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&old)
+                .and_then(|file| file.set_times(old_times))
+                .is_ok()
+        );
+        let mut tracker = context.tracker();
+        tracker.enable_incremental_for_test();
+        let (first, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("first refresh should succeed");
+        assert_eq!(first.lifetime_tokens, Some(140));
+
+        assert!(fs::remove_file(&old).is_ok());
+        tracker.mark_changed_for_test(old.clone());
+
+        let (second, second_diagnostics) = tracker
+            .refresh_for_date(&context.date)
+            .expect("second refresh should succeed");
+
+        assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
+        assert_eq!(second.lifetime_tokens, Some(40));
+    }
+
+    #[test]
+    fn archive_move_updates_snapshot_source_path() {
+        let context = TestContext::new("archive-move-source");
+        let sessions_path = context.rollout(PARENT_ID);
+        write_jsonl(
+            &sessions_path,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(50.0, 10_080, 2_000_000_000, None),
+                ),
+            ],
+        );
+        let mut tracker = context.tracker();
+        tracker.enable_incremental_for_test();
+        let _ = tracker.refresh_for_date(&context.date);
+
+        let archived_path = context.archived_rollout(PARENT_ID);
+        assert!(
+            archived_path
+                .parent()
+                .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
+        );
+        assert!(fs::rename(&sessions_path, &archived_path).is_ok());
+        tracker.mark_changed_for_test(sessions_path.clone());
+        tracker.mark_changed_for_test(archived_path.clone());
+        let _ = tracker.refresh_for_date(&context.date);
+
+        let persisted = fs::read(&context.cache)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let source_path = persisted
+            .as_ref()
+            .and_then(|cache| cache.pointer("/latest_rate_limits/source_path"))
+            .and_then(Value::as_str);
+        assert_eq!(source_path, Some(path_key(&archived_path).as_str()));
+    }
+
+    #[test]
+    fn incomplete_discovery_carries_previous_snapshot_and_lifetime() {
+        fn scan_with(discovery_errors: usize) -> ScanContext {
+            ScanContext {
+                candidate_by_path: HashMap::new(),
+                rollout_index: HashMap::new(),
+                caches: HashMap::new(),
+                today_selected: HashSet::new(),
+                period_selected: HashSet::new(),
+                lifetime_selected: HashSet::new(),
+                dependencies: HashSet::new(),
+                diagnostics: RefreshDiagnostics {
+                    discovery_errors,
+                    ..RefreshDiagnostics::default()
+                },
+                cache_dirty: false,
+            }
+        }
+        let previous_rate_limits = RateLimitSnapshotEntry {
+            timestamp_nanos: 1_700_000_000_000_000_000,
+            limit_id: "codex".to_owned(),
+            source_path: "missing-in-candidates".to_owned(),
+            primary: RateLimitWindowEntry {
+                used_percent: 50.0,
+                window_minutes: 10_080,
+                resets_at: 2_000_000_000,
+            },
+            secondary: None,
+            plan_type: None,
+        };
+        let previous_lifetime = LifetimeAggregate {
+            tokens: 500,
+            reliable: true,
+        };
+
+        let incomplete = scan_with(1)
+            .finish(
+                "2026-08-10",
+                None,
+                None,
+                Some(previous_rate_limits.clone()),
+                Some(previous_lifetime.clone()),
+            )
+            .snapshot;
+
+        assert!(
+            incomplete
+                .quota
+                .as_ref()
+                .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
+        );
+        assert_eq!(incomplete.lifetime_tokens, Some(500));
+
+        let complete = scan_with(0)
+            .finish(
+                "2026-08-10",
+                None,
+                None,
+                Some(previous_rate_limits),
+                Some(previous_lifetime),
+            )
+            .snapshot;
+
+        assert!(complete.quota.is_none());
+        assert_eq!(complete.lifetime_tokens, Some(0));
+    }
+
+    #[test]
+    fn local_refresh_computes_period_usage_on_cold_start() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::quota::AppState;
+
+        use super::super::{LocalUsageStatus, refresh_local_usage};
+
+        let context = TestContext::new("cold-start-period");
+        let file = context.rollout(PARENT_ID);
+        // The weekly window starts exactly at the first token event, so the
+        // period aggregation has something to include once the boundary is
+        // derived from the published snapshot.
+        let resets_at = epoch_seconds(&context.at(1)) + 7 * 24 * 3600;
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits(10.0, 10_080, resets_at, Some("plus")),
+                ),
+                token_count(&context.at(3), 150, Some(50), Some("codex")),
+            ],
+        );
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let mut tracker = context.tracker();
+        let mut local_usage = LocalUsageStatus::default();
+
+        refresh_local_usage(&mut tracker, &mut local_usage, &state, &notify);
+
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_some());
+        assert_eq!(current.current_period_tokens, Some(150));
     }
 }

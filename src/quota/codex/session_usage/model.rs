@@ -10,6 +10,9 @@ pub(super) struct UsageCacheV1 {
     pub(super) codex_home: String,
     pub(super) date: String,
     pub(super) files: Vec<FileCache>,
+    pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
+    pub(super) lifetime: Option<LifetimeAggregate>,
+    pub(super) lifetime_sources: Vec<String>,
 }
 
 impl UsageCacheV1 {
@@ -19,8 +22,36 @@ impl UsageCacheV1 {
             codex_home: codex_dir.map_or_else(String::new, path_key),
             date: String::new(),
             files: Vec::new(),
+            latest_rate_limits: None,
+            lifetime: None,
+            lifetime_sources: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct RateLimitWindowEntry {
+    pub(super) used_percent: f64,
+    pub(super) window_minutes: u64,
+    pub(super) resets_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct RateLimitSnapshotEntry {
+    pub(super) timestamp_nanos: i64,
+    pub(super) limit_id: String,
+    /// Path of the session file the snapshot was parsed from; used to drop
+    /// the persisted snapshot once that file no longer exists on disk.
+    pub(super) source_path: String,
+    pub(super) primary: RateLimitWindowEntry,
+    pub(super) secondary: Option<RateLimitWindowEntry>,
+    pub(super) plan_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct LifetimeAggregate {
+    pub(super) tokens: u64,
+    pub(super) reliable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +69,7 @@ pub(super) struct FileCache {
     pub(super) token_without_timestamp: bool,
     pub(super) uncertain: bool,
     pub(super) parse_errors: usize,
+    pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
 }
 
 impl FileCache {
@@ -56,12 +88,16 @@ impl FileCache {
             token_without_timestamp: false,
             uncertain: false,
             parse_errors: 0,
+            latest_rate_limits: None,
         }
     }
 
     pub(super) fn has_same_identity(&self, candidate: &CandidateFile) -> bool {
+        // Distinct same-thread rollouts (Codex resume) can share a creation
+        // timestamp, so only a content-preserving rename may inherit a cache.
         self.creation_time == candidate.creation_time
             && self.filename_thread_id == candidate.thread_id
+            && self.length == candidate.length
     }
 
     pub(super) fn can_resume(&self, candidate: &CandidateFile) -> bool {
@@ -171,6 +207,9 @@ mod tests {
             "version": CACHE_VERSION,
             "codex_home": "C:\\\\Users\\\\test\\\\.codex",
             "date": "2026-08-10",
+            "latest_rate_limits": null,
+            "lifetime": null,
+            "lifetime_sources": [],
             "files": [{
                 "path": "rollout.jsonl",
                 "filename_thread_id": null,
@@ -197,7 +236,8 @@ mod tests {
                 "max_timestamp_nanos": 1,
                 "token_without_timestamp": false,
                 "uncertain": false,
-                "parse_errors": 0
+                "parse_errors": 0,
+                "latest_rate_limits": null
             }]
         });
 

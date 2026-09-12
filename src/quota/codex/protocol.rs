@@ -10,11 +10,6 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use crate::error::AppError;
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct AccountPlanUpdate {
-    pub(super) plan_type: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRateLimit {
@@ -149,25 +144,6 @@ fn convert_window(raw: &RawWindow) -> Result<QuotaWindow, AppError> {
         used_percent: raw.used_percent,
         window_duration: Duration::from_secs(raw.window_duration_mins.saturating_mul(60)),
         resets_at: UNIX_EPOCH + Duration::from_secs(reset_seconds),
-    })
-}
-
-pub(super) fn is_rate_limit_notification(line: &str) -> bool {
-    serde_json::from_str::<Value>(line).is_ok_and(|value| {
-        value.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated")
-    })
-}
-
-pub(super) fn parse_account_updated_notification(line: &str) -> Option<AccountPlanUpdate> {
-    let value = serde_json::from_str::<Value>(line).ok()?;
-    if value.get("method").and_then(Value::as_str) != Some("account/updated") {
-        return None;
-    }
-    Some(AccountPlanUpdate {
-        plan_type: value
-            .pointer("/params/planType")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
     })
 }
 
@@ -320,35 +296,5 @@ mod tests {
             parse_lifetime_usage(result).ok(),
             Some(LifetimeUsage { lifetime: None })
         );
-    }
-
-    #[test]
-    fn account_updated_notification_reads_plan_type() {
-        let update = parse_account_updated_notification(
-            r#"{"method":"account/updated","params":{"authMode":"chatgpt","planType":"plus"}}"#,
-        );
-
-        assert_eq!(
-            update,
-            Some(AccountPlanUpdate {
-                plan_type: Some("plus".to_owned())
-            })
-        );
-    }
-
-    #[test]
-    fn account_updated_notification_clears_null_plan_type() {
-        let update = parse_account_updated_notification(
-            r#"{"method":"account/updated","params":{"authMode":null,"planType":null}}"#,
-        );
-
-        assert_eq!(update, Some(AccountPlanUpdate { plan_type: None }));
-    }
-
-    #[test]
-    fn notification_detector_ignores_other_methods() {
-        assert!(!is_rate_limit_notification(
-            r#"{"method":"account/updated","params":{}}"#
-        ));
     }
 }

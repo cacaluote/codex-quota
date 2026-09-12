@@ -39,8 +39,8 @@ use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
 use super::presentation::{
-    PlanColor, classify_quota_windows, format_local_timestamp, format_token_usage, panel_title,
-    plan_type_color, plan_type_label, quota_window_label,
+    PlanColor, ball_quota, display_windows, format_local_timestamp, format_token_usage,
+    panel_title, plan_type_color, plan_type_label, quota_window_label,
 };
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
@@ -258,17 +258,10 @@ impl Renderer {
             self.brushes.track.SetOpacity(1.0);
         }
 
-        let (label, remaining, color) = state.snapshot.as_ref().map_or_else(
-            || ("--".to_owned(), 0.0, QuotaColor::Unknown),
-            |snapshot| {
-                let remaining = snapshot.primary.remaining_percent();
-                (
-                    format!("{remaining:.0}"),
-                    remaining,
-                    snapshot.primary.color(),
-                )
-            },
-        );
+        // The ball is the glanceable summary: primary window remaining (or the
+        // only window of single-window accounts), reading 0 while any active
+        // window is exhausted and -- while no fresh snapshot is known.
+        let (label, remaining, color) = ball_quota(state, SystemTime::now());
         if remaining > 0.0 {
             let brush = self.brush_for(color);
             // SAFETY: the brush is renderer-owned and its opacity is restored after the draw.
@@ -397,10 +390,7 @@ impl Renderer {
             );
         }
 
-        let (short_term, long_term) = state
-            .snapshot
-            .as_ref()
-            .map_or((None, None), classify_quota_windows);
+        let (short_term, long_term) = display_windows(state, SystemTime::now());
         let short_term_label = quota_window_label(short_term, state.plan_type.as_deref(), true);
         let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
         self.draw_quota_row(&short_term_label, short_term, 42.0, width, opacity);

@@ -240,7 +240,9 @@ mod tests {
     #[test]
     fn usd_format_drops_cents_at_hundred_dollars_and_above() {
         assert_eq!(format_usd(Some(1.234)), "$1.23");
-        assert_eq!(format_usd(Some(123.4)), "$123");
+        assert_eq!(format_usd(Some(45.67)), "$45.67");
+        assert_eq!(format_usd(Some(1145.67)), "$1146");
+        assert_eq!(format_usd(Some(12345.6)), "$12346");
         assert_eq!(format_usd(Some(0.004)), "$0.00");
         // 负零与零统一显示 $0.00。
         assert_eq!(format_usd(Some(-0.0)), "$0.00");

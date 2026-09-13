@@ -170,9 +170,15 @@ fn session_partition_date(path: &Path) -> Option<String> {
     })
 }
 
-pub(super) fn modified_on_date(candidate: &CandidateFile, date: &str) -> bool {
-    let modified = windows_ticks_to_system_time(candidate.last_write_time);
-    modified.and_then(local_calendar_date_at).as_deref() == Some(date)
+/// `2026-09-13` → `2026-09-12`；解析失败返回 None（调用方回退到当天）。
+pub(super) fn previous_date(date: &str) -> Option<String> {
+    let mut parts = date.splitn(3, '-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u8 = parts.next()?.parse().ok()?;
+    let day: u8 = parts.next()?.parse().ok()?;
+    let parsed =
+        time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()?;
+    Some(parsed.previous_day()?.to_string())
 }
 
 pub(super) fn modified_on_or_after_date(candidate: &CandidateFile, date: &str) -> bool {

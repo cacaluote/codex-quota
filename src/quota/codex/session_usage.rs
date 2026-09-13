@@ -15,7 +15,7 @@ use aggregate::{
 };
 use files::{
     codex_home, discover_candidates, inspect_changed_candidates, is_date_partition,
-    is_date_partition_in_range, load_cache, modified_on_date, modified_on_or_after_date, path_key,
+    is_date_partition_in_range, load_cache, modified_on_or_after_date, path_key, previous_date,
     save_cache,
 };
 use model::{
@@ -250,6 +250,10 @@ impl ScanContext {
             .into_iter()
             .map(|cache| (cache.path.clone(), cache))
             .collect();
+        // 跨天文件：事件时间戳可能领先文件 mtime（服务端时间戳/写入延迟），
+        // 昨天修改过的文件也纳入今天的选择；是否属于今天由聚合层按事件
+        // 时间戳过滤。
+        let yesterday = previous_date(today).unwrap_or_else(|| today.to_owned());
         let today_selected = candidates
             .iter()
             .filter_map(|candidate| {
@@ -259,7 +263,7 @@ impl ScanContext {
                     .is_some_and(|cache| cache_has_tokens_on_date(cache, today));
                 (cached_today
                     || is_date_partition(&candidate.path, today)
-                    || modified_on_date(candidate, today))
+                    || modified_on_or_after_date(candidate, &yesterday))
                 .then_some(key)
             })
             .collect();
@@ -2320,5 +2324,37 @@ mod tests {
         assert_eq!(current.current_period_cost, Some(0.0));
         // 本机零用量时满额估算没有意义。
         assert_eq!(current.period_total_value_estimate, None);
+    }
+
+    #[test]
+    fn refresh_counts_today_events_in_file_last_modified_yesterday() {
+        // 跨天文件：事件时间戳（今天 00:08）可能领先文件 mtime（昨天
+        // 23:56，事件戳来自服务端时间）。今天的 mtime 精确规则不命中，
+        // 昨天的 or-after 规则必须兜住，否则今天的用量被漏计。
+        let context = TestContext::new("cross-day-today");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+            ],
+        );
+        // mtime 拨到 24 小时前：同一钟点、昨天的日期。
+        let mtime =
+            system_time_from_unix_nanos((epoch_seconds(&context.at(1)) - 86_400) * 1_000_000_000)
+                .unwrap();
+        let old_times = std::fs::FileTimes::new().set_modified(mtime);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .and_then(|handle| handle.set_times(old_times))
+                .is_ok()
+        );
+
+        let result = context.tracker().refresh_for_date(&context.date);
+
+        assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(100));
     }
 }

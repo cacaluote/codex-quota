@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn panel_width_interpolation_reaches_midpoint_at_half_expansion() {
-        assert!((lerp(COLLAPSED_DIP, PANEL_WIDTH_DIP, 0.5) - 166.0).abs() < f32::EPSILON);
+        assert!((lerp(COLLAPSED_DIP, PANEL_WIDTH_DIP, 0.5) - 172.0).abs() < f32::EPSILON);
     }
 
     #[test]

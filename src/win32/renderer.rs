@@ -61,7 +61,7 @@ const PLAN_BUSINESS: D2D1_COLOR_F = rgba(0x4f, 0xd1, 0xc5, 1.0);
 const PLAN_ENTERPRISE: D2D1_COLOR_F = rgba(0xd8, 0xb4, 0x5c, 1.0);
 const PLAN_EDU: D2D1_COLOR_F = rgba(0x56, 0xc7, 0xd9, 1.0);
 const TRANSPARENT: D2D1_COLOR_F = rgba(0, 0, 0, 0.0);
-const TIME_COLUMN_LEFT: f32 = 140.0;
+const TIME_COLUMN_LEFT: f32 = 148.0;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum VisualState {

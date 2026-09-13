@@ -56,6 +56,7 @@ const WM_APP_COLLAPSE: u32 = WM_APP + 4;
 const WM_APP_PRESENCE_CHANGED: u32 = WM_APP + 5;
 const TIMER_REDRAW: usize = 1;
 const TIMER_ANIMATION: usize = 2;
+const TIMER_RING: usize = 3;
 const ANIMATION_FRAME_MILLIS: u32 = 16;
 const EXPAND_ANIMATION_DURATION: Duration = Duration::from_millis(160);
 const COLLAPSE_ANIMATION_DURATION: Duration = Duration::from_millis(130);
@@ -192,6 +193,8 @@ struct AppWindow {
     renderer: Option<Renderer>,
     outside_click_hook: Option<HHOOK>,
     animation: Option<PanelAnimation>,
+    /// 悬浮球动效帧定时器当前设定的间隔（毫秒）；None 表示未在跑。
+    ring_frame_millis: Option<u32>,
     animations_enabled: bool,
     expanded: bool,
     expansion_alignment: ExpansionAlignment,

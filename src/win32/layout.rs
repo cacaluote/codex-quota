@@ -51,6 +51,92 @@ impl PanelAnimation {
     }
 }
 
+/// 悬浮球百分环的动画：额度变化时把弧从旧比例推到新比例；球刚出现时
+/// 从 0 扫入到当前比例。与面板动画同样按 `Instant` + 时长采样，便于单测。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RingAnimation {
+    started_at: Instant,
+    duration: Duration,
+    from: f64,
+    to: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RingSample {
+    pub(super) fraction: f64,
+    pub(super) finished: bool,
+}
+
+impl RingAnimation {
+    /// 数值变化的补间时长：明显可见但不拖沓，通常远早于下一次刷新到来。
+    pub(super) const DURATION: Duration = Duration::from_millis(250);
+    /// 球出现时的扫入时长：略长一些，读起来像仪表自检。
+    pub(super) const SWEEP_DURATION: Duration = Duration::from_millis(700);
+    /// 中心数字在**数值变化**时的滚动时长。
+    ///
+    /// 不变式：`LABEL_TWEEN < DURATION` 且 `LABEL_SWEEP < SWEEP_DURATION`。
+    /// 数字若比弧后落定，就会出现"环已静止、数字还在滚"的割裂观感，并且
+    /// 让帧定时器多跑一段。两个时长分别对应两种弧动画，必须各自更短。
+    pub(super) const LABEL_TWEEN: Duration = Duration::from_millis(200);
+    /// 中心数字在**球出现扫入**时的滚动时长：比 `LABEL_TWEEN` 从容，
+    /// 700ms 的扫入里数字先报完数。
+    pub(super) const LABEL_SWEEP: Duration = Duration::from_millis(500);
+
+    pub(super) fn new(from: f64, to: f64, now: Instant) -> Self {
+        Self::with_duration(from, to, now, Self::DURATION)
+    }
+
+    /// 球刚出现：弧从 0 扫到当前比例。
+    pub(super) fn sweep(to: f64, now: Instant) -> Self {
+        Self::with_duration(0.0, to, now, Self::SWEEP_DURATION)
+    }
+
+    /// 中心数字随**数值变化**滚动：与弧同时起步，但更早落定。
+    pub(super) fn label_tween(from: f64, to: f64, now: Instant) -> Self {
+        Self::with_duration(from, to, now, Self::LABEL_TWEEN)
+    }
+
+    /// 中心数字随**球出现扫入**从 0 滚动。
+    pub(super) fn label_sweep(to: f64, now: Instant) -> Self {
+        Self::with_duration(0.0, to, now, Self::LABEL_SWEEP)
+    }
+
+    fn with_duration(from: f64, to: f64, now: Instant, duration: Duration) -> Self {
+        Self {
+            started_at: now,
+            duration,
+            from,
+            to,
+        }
+    }
+
+    pub(super) fn sample(self, now: Instant) -> RingSample {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let timeline = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0);
+        let progress = f64::from(ease_out_cubic(timeline as f32));
+        RingSample {
+            fraction: self.from + (self.to - self.from) * progress,
+            finished: elapsed >= self.duration,
+        }
+    }
+}
+
+/// 低额度脉冲：弧（无弧时为轨道圆）的不透明度在 `PULSE_MIN_OPACITY..=1.0`
+/// 之间正弦起伏，周期 `PULSE_PERIOD`（约 0.7Hz，远低于 WCAG 的 3Hz 闪烁阈值）。
+pub(super) const PULSE_PERIOD: Duration = Duration::from_millis(1400);
+pub(super) const PULSE_MIN_OPACITY: f32 = 0.35;
+/// 补间期间的帧间隔：与面板动画同帧率。
+pub(super) const RING_TWEEN_FRAME_MILLIS: u32 = 16;
+/// 仅脉冲时的帧间隔：缓慢的明暗变化不需要 60fps。
+pub(super) const RING_PULSE_FRAME_MILLIS: u32 = 100;
+
+pub(super) fn pulse_opacity(elapsed: Duration) -> f32 {
+    let period = PULSE_PERIOD.as_secs_f32();
+    let phase = elapsed.as_secs_f32() % period;
+    let wave = 0.5 + 0.5 * (std::f32::consts::TAU * phase / period).cos();
+    PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * wave
+}
+
 pub(super) struct MonitorDetails {
     pub(super) info: MONITORINFOEXW,
 }
@@ -266,10 +352,15 @@ pub(super) fn lerp(start: f32, end: f32, progress: f32) -> f32 {
     start + (end - start) * progress.clamp(0.0, 1.0)
 }
 
+/// 面板动画与百分环补间共用的缓动：先快后慢。
+pub(super) fn ease_out_cubic(progress: f32) -> f32 {
+    let inverse = 1.0 - progress.clamp(0.0, 1.0);
+    1.0 - inverse * inverse * inverse
+}
+
 fn animation_sample(expanding: bool, timeline: f32) -> AnimationSample {
     let timeline = timeline.clamp(0.0, 1.0);
-    let inverse = 1.0 - timeline;
-    let eased = 1.0 - inverse * inverse * inverse;
+    let eased = ease_out_cubic(timeline);
     let (expansion, ball_opacity, panel_opacity) = if expanding {
         (
             eased,
@@ -514,6 +605,94 @@ mod tests {
         assert!(!point_in_ball(0, 28, 56, 56, radius));
         // 旧实现用窗口半边长（28 px）当半径，会把透明的最外圈也算成球内。
         assert!(point_in_ball(0, 28, 56, 56, 56 / 2));
+    }
+
+    #[test]
+    fn ring_tween_starts_at_the_old_value_and_settles_on_the_new_one() {
+        let start = Instant::now();
+        let animation = RingAnimation::new(0.42, 0.08, start);
+
+        let first = animation.sample(start);
+        assert!((first.fraction - 0.42).abs() < f64::EPSILON && !first.finished);
+
+        let middle = animation.sample(start + RingAnimation::DURATION / 2);
+        assert!(
+            middle.fraction < 0.42 && middle.fraction > 0.08,
+            "补间中点必须落在两端之间：{}",
+            middle.fraction
+        );
+
+        let settled = animation.sample(start + RingAnimation::DURATION);
+        assert!((settled.fraction - 0.08).abs() < f64::EPSILON && settled.finished);
+
+        // 超时后停在终点，不会越过目标。
+        let late = animation.sample(start + Duration::from_secs(5));
+        assert!((late.fraction - 0.08).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ring_sweep_fills_from_zero_over_the_longer_sweep_duration() {
+        let start = Instant::now();
+        let sweep = RingAnimation::sweep(0.65, start);
+
+        assert!(sweep.sample(start).fraction.abs() < f64::EPSILON);
+        assert!(
+            !sweep
+                .sample(start + RingAnimation::SWEEP_DURATION / 2)
+                .finished
+        );
+
+        let settled = sweep.sample(start + RingAnimation::SWEEP_DURATION);
+        assert!((settled.fraction - 0.65).abs() < f64::EPSILON && settled.finished);
+        // 扫入比数值补间长，扫入时长下不应提前结束。
+        assert!(!sweep.sample(start + RingAnimation::DURATION).finished);
+    }
+
+    #[test]
+    fn label_rolls_are_shorter_than_the_arc_motion_they_accompany() {
+        use std::hint::black_box;
+
+        // 不变式：数字必须比同场景的弧先落定，否则出现"环已静止、数字还在滚"。
+        // black_box 让断言不再是常量表达式，绕过 clippy::assertions_on_constants。
+        assert!(black_box(RingAnimation::LABEL_TWEEN) < black_box(RingAnimation::DURATION));
+        assert!(black_box(RingAnimation::LABEL_SWEEP) < black_box(RingAnimation::SWEEP_DURATION));
+    }
+
+    #[test]
+    fn ring_tween_eases_out_so_it_is_past_halfway_at_midpoint() {
+        let start = Instant::now();
+        let animation = RingAnimation::new(0.0, 1.0, start);
+
+        let middle = animation
+            .sample(start + RingAnimation::DURATION / 2)
+            .fraction;
+
+        assert!(middle > 0.5, "缓出曲线中点应已过半：{middle}");
+    }
+
+    #[test]
+    fn ease_out_cubic_pins_both_ends_and_clamps_out_of_range_input() {
+        assert!(ease_out_cubic(0.0).abs() < f32::EPSILON);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!(ease_out_cubic(-1.0).abs() < f32::EPSILON);
+        assert!((ease_out_cubic(2.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pulse_opacity_cycles_between_full_and_minimum() {
+        assert!((pulse_opacity(Duration::ZERO) - 1.0).abs() < 1e-6);
+        assert!((pulse_opacity(PULSE_PERIOD / 2) - PULSE_MIN_OPACITY).abs() < 1e-6);
+        assert!((pulse_opacity(PULSE_PERIOD) - 1.0).abs() < 1e-6);
+
+        // 整个周期内都落在 [MIN, 1]，且相邻采样不跳变。
+        let step = PULSE_PERIOD / 40;
+        let mut previous = pulse_opacity(Duration::ZERO);
+        for index in 1..=40 {
+            let value = pulse_opacity(step * index);
+            assert!((PULSE_MIN_OPACITY..=1.0).contains(&value), "越界：{value}");
+            assert!((value - previous).abs() < 0.1, "相邻帧跳变过大：{value}");
+            previous = value;
+        }
     }
 
     #[test]

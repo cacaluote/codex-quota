@@ -30,7 +30,7 @@ use super::tray::{
 };
 use super::{
     AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_PANEL_PERSISTENT, CMD_REFRESH,
-    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW, TRAY_ID, WM_APP_COLLAPSE,
+    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW, TIMER_RING, TRAY_ID, WM_APP_COLLAPSE,
     WM_APP_PRESENCE_CHANGED, WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
 };
 use crate::config::{self, AppConfigV1};
@@ -48,6 +48,7 @@ impl AppWindow {
             renderer: None,
             outside_click_hook: None,
             animation: None,
+            ring_frame_millis: None,
             animations_enabled: true,
             expanded: false,
             expansion_alignment: ExpansionAlignment::Start,
@@ -128,6 +129,7 @@ impl AppWindow {
         self.visible = false;
         self.remove_outside_click_hook();
         self.stop_animation_timer();
+        self.stop_ring_frames();
         self.animation = None;
         self.expanded = false;
         self.pointer_down = false;
@@ -223,7 +225,13 @@ impl AppWindow {
         if !self.overlay_active {
             return Ok(());
         }
+        // 只有"从隐藏到可见"才算球重新出现。单实例唤醒路径（第二次启动进程
+        // 会 PostMessage WM_APP_SHOW）在球已经可见时走到这里，不应重扫一遍。
+        let appearing = !self.visible;
         self.visible = true;
+        if appearing && let Some(renderer) = self.renderer.as_mut() {
+            renderer.restart_ring_sweep();
+        }
         // SAFETY: no-activate show leaves focus with the current foreground window.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
         self.ensure_topmost("重新显示悬浮窗")?;
@@ -236,6 +244,7 @@ impl AppWindow {
         if self.visible {
             self.finish_animation()?;
             self.visible = false;
+            self.stop_ring_frames();
             self.update_outside_click_hook();
             // SAFETY: hwnd is live.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -398,6 +407,8 @@ impl Drop for AppWindow {
             let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_REDRAW) };
             // SAFETY: best-effort cleanup of the fixed animation timer during HWND teardown.
             let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_ANIMATION) };
+            // SAFETY: best-effort cleanup of the fixed ring animation timer during HWND teardown.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_RING) };
             let _ = unsafe { ReleaseCapture() };
         }
         if let Some(mut worker) = self.worker.take() {
@@ -476,11 +487,9 @@ pub(super) unsafe extern "system" fn window_proc(
             .and_then(|()| app.ensure_topmost("显示器配置变化")),
         WM_SETTINGCHANGE => {
             app.animations_enabled = system_animations_enabled();
-            if app.animations_enabled {
-                Ok(())
-            } else {
-                app.finish_animation()
-            }
+            // 面板动画立即收尾；球动效的开关在下一帧被推送，因此这里必须重绘，
+            // 否则关闭动画后画面会停在补间或脉冲的中间帧上。
+            app.finish_animation().and_then(|()| app.render())
         }
         WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize => {
             if let Some(watcher) = &app.presence_watcher {
@@ -498,6 +507,8 @@ pub(super) unsafe extern "system" fn window_proc(
             app.render_animation_frame(Instant::now())
         }
         WM_TIMER if wparam.0 == TIMER_ANIMATION => Ok(()),
+        WM_TIMER if wparam.0 == TIMER_RING && app.overlay_active => app.render(),
+        WM_TIMER if wparam.0 == TIMER_RING => Ok(()),
         WM_CLOSE if !app.config.follow_codex => app.toggle_visibility(),
         WM_APP_SHOW | WM_DISPLAYCHANGE | WM_CLOSE => Ok(()),
         WM_DESTROY => {

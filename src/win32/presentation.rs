@@ -66,6 +66,15 @@ pub(super) const COMMUNITY_WEEKLY_VALUE_USD: f64 = 120.0;
 /// 面板内容行位：首行顶部与行距（dip）。
 pub(super) const FIRST_ROW_TOP_DIP: f32 = 42.0;
 pub(super) const ROW_STEP_DIP: f32 = 27.0;
+/// 6 行基础内容：两组额度行、今日使用、本期使用、本期估值、更新时间；
+/// 超额行按可见性追加。行位 = 首行顶 + 行距×(n−1)，末行高 23 + 底边距 27。
+const BASE_PANEL_ROWS: f32 = 6.0;
+/// 末行下方的留白（dip）。
+const PANEL_BOTTOM_PADDING_DIP: f32 = 50.0;
+
+/// 无超额（6 行，常驻状态）时的展开高度，也是额度状态锁损坏时的兜底高度。
+pub(super) const COMPACT_PANEL_HEIGHT_DIP: f32 =
+    FIRST_ROW_TOP_DIP + (BASE_PANEL_ROWS - 1.0) * ROW_STEP_DIP + PANEL_BOTTOM_PADDING_DIP;
 
 /// 超额行是否显示：本机溢出 token 与 credits 实扣任一非零。多设备场景下
 /// 本机 token 可能为 0 而实扣 > 0（其他设备的消耗），必须显示；数据不可靠
@@ -89,10 +98,10 @@ fn overflow_visible(tokens: Option<u64>, cost: Option<f64>) -> bool {
 /// 254，8 行（今日+本期都溢出）281。行位 = 首行顶 + 行距×(n−1)，末行高
 /// 23 + 底边距 27。
 pub(super) fn panel_height_dip(state: &AppState) -> f32 {
-    let rows = 6.0
+    let rows = BASE_PANEL_ROWS
         + f32::from(u8::from(today_overflow_visible(state)))
         + f32::from(u8::from(period_overflow_visible(state)));
-    FIRST_ROW_TOP_DIP + (rows - 1.0) * ROW_STEP_DIP + 50.0
+    FIRST_ROW_TOP_DIP + (rows - 1.0) * ROW_STEP_DIP + PANEL_BOTTOM_PADDING_DIP
 }
 
 /// The floating ball's glanceable quota: the primary window's remaining, or
@@ -288,6 +297,16 @@ mod tests {
             ..AppState::default()
         };
         assert!((panel_height_dip(&both_overflow_rows) - 281.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn compact_panel_height_constant_matches_the_six_row_panel() {
+        // 锁损坏兜底用的常量必须与真实精简高度同源，避免再次漂移。
+        assert!((COMPACT_PANEL_HEIGHT_DIP - 227.0).abs() < f32::EPSILON);
+        assert!(
+            (COMPACT_PANEL_HEIGHT_DIP - panel_height_dip(&AppState::default())).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]

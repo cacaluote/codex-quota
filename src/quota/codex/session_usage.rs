@@ -19,8 +19,8 @@ use files::{
     save_cache,
 };
 use model::{
-    BalanceAnchors, BalanceObservation, CandidateFile, FileCache, ParentLink,
-    RateLimitSnapshotEntry, RateLimitWindowEntry, UsageCacheV1,
+    CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry, RateLimitWindowEntry,
+    UsageCacheV1,
 };
 use parser::{event_is_on_date, system_time_from_unix_nanos, update_candidate_cache};
 use watcher::SessionChangeWatcher;
@@ -29,8 +29,8 @@ use super::PeriodBoundary;
 use super::protocol::{local_calendar_date, local_calendar_date_at};
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-// v7: 分别保留今日/本期起点前的余额；重扫旧日志恢复 v6 覆盖掉的基线。
-const CACHE_VERSION: u32 = 7;
+// v8: 只统计同一窗口内的余额差，移除跨窗口基线。
+const CACHE_VERSION: u32 = 8;
 const CACHE_FILENAME: &str = "usage-cache-v1.json";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +155,6 @@ struct ScanResult {
     selected: HashSet<String>,
     dependencies: HashSet<String>,
     latest_rate_limits: Option<RateLimitSnapshotEntry>,
-    balance_anchors: BalanceAnchors,
     cache_dirty: bool,
 }
 
@@ -401,11 +400,7 @@ impl ScanContext {
         boundary: Option<&PeriodBoundary>,
         reused: Option<(LocalUsageSnapshot, usize)>,
         previous_rate_limits: Option<RateLimitSnapshotEntry>,
-        previous_balance_anchors: BalanceAnchors,
     ) -> ScanResult {
-        // 在聚合和裁剪前确定基线：冷启动也能使用本次读到的历史观测。
-        let balance_anchors =
-            window_balance_anchors(&self.caches, previous_balance_anchors, today, boundary);
         let mut snapshot = if let Some((snapshot, deferred_files)) = reused {
             self.diagnostics.aggregation_skipped = true;
             self.diagnostics.deferred_files = deferred_files;
@@ -416,7 +411,6 @@ impl ScanContext {
                 &self.today_selected,
                 &self.caches,
                 &self.rollout_index,
-                balance_anchors.before_today,
             );
             let today_reliable = today.reliable && self.diagnostics.discovery_errors == 0;
             let period = boundary.map_or_else(WindowAggregate::default, |boundary| {
@@ -430,7 +424,6 @@ impl ScanContext {
                     &self.period_selected,
                     &self.caches,
                     &self.rollout_index,
-                    balance_anchors.before_period,
                 );
                 period.reliable =
                     anchored && period.reliable && self.diagnostics.discovery_errors == 0;
@@ -484,65 +477,9 @@ impl ScanContext {
             selected,
             dependencies,
             latest_rate_limits: derived.latest_rate_limits,
-            balance_anchors,
             cache_dirty: self.cache_dirty,
         }
     }
-}
-
-/// 当前窗口内的新余额不能覆盖窗口开始前的基线；滚动到新窗口时再按
-/// 时间筛选。旧文件被裁剪后，持久化的三个观测仍可参与下一次筛选。
-fn window_balance_anchors(
-    caches: &HashMap<String, FileCache>,
-    previous: BalanceAnchors,
-    today: &str,
-    boundary: Option<&PeriodBoundary>,
-) -> BalanceAnchors {
-    let observations = caches
-        .values()
-        .filter(|cache| {
-            cache
-                .root
-                .as_ref()
-                .is_some_and(|root| root.provider.as_deref() == Some("openai"))
-        })
-        .flat_map(|cache| cache.balance_observations.iter())
-        .copied()
-        .chain(
-            [
-                previous.latest,
-                previous.before_today,
-                previous.before_period,
-            ]
-            .into_iter()
-            .flatten(),
-        );
-    let mut anchors = BalanceAnchors {
-        // 快照暂时过期时保留本期锚点，窗口重新确认后再筛选。
-        before_period: boundary
-            .is_none()
-            .then_some(previous.before_period)
-            .flatten(),
-        ..BalanceAnchors::default()
-    };
-    for observation in observations {
-        let keep_latest = |slot: &mut Option<BalanceObservation>| {
-            if slot.is_none_or(|current| observation.timestamp_nanos > current.timestamp_nanos) {
-                *slot = Some(observation);
-            }
-        };
-        keep_latest(&mut anchors.latest);
-        if system_time_from_unix_nanos(observation.timestamp_nanos)
-            .and_then(local_calendar_date_at)
-            .is_some_and(|date| date.as_str() < today)
-        {
-            keep_latest(&mut anchors.before_today);
-        }
-        if boundary.is_some_and(|boundary| observation.timestamp_nanos < boundary.start_nanos()) {
-            keep_latest(&mut anchors.before_period);
-        }
-    }
-    anchors
 }
 
 /// 本期窗口起点当天是否存在 openai 会话痕迹：没有锚定痕迹时“本期”的
@@ -774,8 +711,6 @@ impl SessionUsageTracker {
             .map(|cache| cache.path.clone())
             .collect();
         let previous_rate_limits = self.cache.latest_rate_limits.clone();
-        // 文件删除不影响余额观测的有效性（账户级历史事实），基线始终保留。
-        let previous_balance_anchors = self.cache.balance_anchors;
 
         let discovery_started = Instant::now();
         let mut scan = self.build_scan(full_scan, &codex_dir, date, period_boundary)?;
@@ -810,15 +745,8 @@ impl SessionUsageTracker {
             selected,
             dependencies,
             latest_rate_limits,
-            balance_anchors,
             cache_dirty,
-        } = scan.finish(
-            date,
-            period_boundary,
-            reused,
-            previous_rate_limits.clone(),
-            previous_balance_anchors,
-        );
+        } = scan.finish(date, period_boundary, reused, previous_rate_limits.clone());
         let mut cache_dirty = cache_dirty;
         diagnostics.aggregation_elapsed = aggregation_started.elapsed();
         let retained_paths: HashSet<_> = files.iter().map(|cache| cache.path.clone()).collect();
@@ -830,8 +758,6 @@ impl SessionUsageTracker {
         date.clone_into(&mut self.cache.date);
         self.cache.files = files;
         self.cache.latest_rate_limits = latest_rate_limits;
-        cache_dirty |= self.cache.balance_anchors != balance_anchors;
-        self.cache.balance_anchors = balance_anchors;
         self.candidate_index = candidate_index;
 
         self.write_cache(&mut diagnostics, cache_dirty);
@@ -1635,9 +1561,7 @@ mod tests {
             cache_dirty: false,
         };
 
-        let snapshot = scan
-            .finish("2026-08-10", None, None, None, BalanceAnchors::default())
-            .snapshot;
+        let snapshot = scan.finish("2026-08-10", None, None, None).snapshot;
 
         assert!(!snapshot.today_reliable);
     }
@@ -2087,13 +2011,7 @@ mod tests {
         };
 
         let incomplete = scan_with(1)
-            .finish(
-                "2026-08-10",
-                None,
-                None,
-                Some(previous_rate_limits.clone()),
-                BalanceAnchors::default(),
-            )
+            .finish("2026-08-10", None, None, Some(previous_rate_limits.clone()))
             .snapshot;
 
         assert!(
@@ -2104,13 +2022,7 @@ mod tests {
         );
 
         let complete = scan_with(0)
-            .finish(
-                "2026-08-10",
-                None,
-                None,
-                Some(previous_rate_limits),
-                BalanceAnchors::default(),
-            )
+            .finish("2026-08-10", None, None, Some(previous_rate_limits))
             .snapshot;
 
         assert!(complete.quota.is_none());
@@ -2437,8 +2349,7 @@ mod tests {
 
     #[test]
     fn period_aggregates_overflow_usage_within_window() {
-        // 窗口外的溢出事件不计入本期 tokens，但它的余额观测仍是窗口内
-        // 扣费的基线；窗口内溢出事件计入本期超额。
+        // 跨窗口的 100→90 不计费；窗口内 90→80 计 10 credits，Token 独立统计。
         let context = TestContext::new("overflow-period");
         let file = context.rollout(PARENT_ID);
         let capped =
@@ -2473,7 +2384,7 @@ mod tests {
             .as_ref()
             .map(|value| value.current_period_credits_spent);
         assert!(
-            spent.is_some_and(|value| (value - 20.0).abs() < 1e-9),
+            spent.is_some_and(|value| (value - 10.0).abs() < 1e-9),
             "{spent:?}"
         );
     }
@@ -2569,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_balance_anchors_survive_updates_and_cache_reload() {
+    fn in_window_debits_survive_updates_and_cache_reload() {
         let context = TestContext::new("cold-balance-anchors");
         let old = context.rollout(PARENT_ID);
         let fresh = context.rollout(CHILD_ID);
@@ -2601,8 +2512,8 @@ mod tests {
             .refresh_for_period(&context.date, boundary.as_ref())
             .unwrap()
             .0;
-        assert!((first.today_credits_spent - 10.0).abs() < 1e-9);
-        assert!((first.current_period_credits_spent - 10.0).abs() < 1e-9);
+        assert!((first.today_credits_spent - 0.0).abs() < 1e-9);
+        assert!((first.current_period_credits_spent - 0.0).abs() < 1e-9);
 
         append_jsonl(
             &fresh,
@@ -2613,10 +2524,10 @@ mod tests {
             .refresh_for_period(&context.date, boundary.as_ref())
             .unwrap()
             .0;
-        assert!((second.today_credits_spent - 11.0).abs() < 1e-9);
-        assert!((second.current_period_credits_spent - 11.0).abs() < 1e-9);
+        assert!((second.today_credits_spent - 1.0).abs() < 1e-9);
+        assert!((second.current_period_credits_spent - 1.0).abs() < 1e-9);
 
-        // 源文件不再存在时，持久化的窗口前基线仍需保留。
+        // 删除窗口外的源文件、重载缓存都不能改变窗口内扣费。
         drop(tracker);
         fs::remove_file(&old).unwrap();
         let mut tracker = context.tracker();
@@ -2624,8 +2535,8 @@ mod tests {
             .refresh_for_period(&context.date, boundary.as_ref())
             .unwrap()
             .0;
-        assert!((reloaded.today_credits_spent - 11.0).abs() < 1e-9);
-        assert!((reloaded.current_period_credits_spent - 11.0).abs() < 1e-9);
+        assert!((reloaded.today_credits_spent - 1.0).abs() < 1e-9);
+        assert!((reloaded.current_period_credits_spent - 1.0).abs() < 1e-9);
         append_jsonl(
             &fresh,
             &token_count_with_rate_limits(&context.at(3), 30, Some(10), limits("88")),
@@ -2635,44 +2546,13 @@ mod tests {
             .refresh_for_period(&context.date, boundary.as_ref())
             .unwrap()
             .0;
-        assert!((third.today_credits_spent - 12.0).abs() < 1e-9);
-        assert!((third.current_period_credits_spent - 12.0).abs() < 1e-9);
+        assert!((third.today_credits_spent - 2.0).abs() < 1e-9);
+        assert!((third.current_period_credits_spent - 2.0).abs() < 1e-9);
     }
 
     #[test]
-    fn balance_anchors_roll_today_without_replacing_the_period_anchor() {
-        let context = TestContext::new("balance-anchor-rollover");
-        let observation = |seconds, balance| BalanceObservation {
-            timestamp_nanos: parser::parse_timestamp_nanos(Some(&json!(context.at(seconds))))
-                .unwrap(),
-            balance,
-        };
-        let previous = BalanceAnchors {
-            before_period: Some(observation(-259_200, 100.0)),
-            before_today: Some(observation(-86400, 95.0)),
-            latest: Some(observation(0, 90.0)),
-        };
-        let boundary =
-            timestamp_as_system_time(&context.at(-172_800)).and_then(PeriodBoundary::from_start);
-        let tomorrow = timestamp_as_system_time(&context.at(86400))
-            .and_then(local_calendar_date_at)
-            .unwrap();
-        let anchors =
-            window_balance_anchors(&HashMap::new(), previous, &tomorrow, boundary.as_ref());
-        assert_eq!(anchors.before_today, previous.latest);
-        assert_eq!(anchors.before_period, previous.before_period);
-        let new_boundary =
-            timestamp_as_system_time(&context.at(1)).and_then(PeriodBoundary::from_start);
-        let reset =
-            window_balance_anchors(&HashMap::new(), anchors, &tomorrow, new_boundary.as_ref());
-        assert_eq!(reset.before_period, previous.latest);
-    }
-
-    #[test]
-    fn balance_baseline_survives_inactive_days() {
-        // 三天前的会话记录余额 100 后停更；今天新会话首条观测 90（空档期
-        // 其他设备消耗）。旧文件已不在今日选择集，持久化的滚动基线必须
-        // 补上时间线起点，否则这段扣费统计为 0。
+    fn inactive_days_do_not_attribute_a_cross_window_debit() {
+        // 数日前余额到今日首次观测之间的下降不归入今日。
         let context = TestContext::new("balance-baseline");
         let old = context.rollout(PARENT_ID);
         write_jsonl(
@@ -2722,6 +2602,6 @@ mod tests {
 
         assert_eq!(second.today_tokens, 100);
         let spent = second.today_credits_spent;
-        assert!((spent - 10.0).abs() < 1e-9, "{spent:?}");
+        assert!(spent.abs() < 1e-9, "{spent:?}");
     }
 }

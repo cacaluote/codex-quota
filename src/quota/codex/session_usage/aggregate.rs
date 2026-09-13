@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::model::{BalanceObservation, FileCache, ParentLink, TokenEvent, TokenSignature};
+use super::model::{FileCache, ParentLink, TokenEvent, TokenSignature};
 use super::parser::{event_is_on_date, ts_is_on_date};
 use crate::quota::pricing::PriceTable;
 
@@ -98,7 +98,6 @@ pub(super) fn aggregate_today(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-    balance_baseline: Option<BalanceObservation>,
 ) -> WindowAggregate {
     aggregate_usage(
         selected,
@@ -106,7 +105,6 @@ pub(super) fn aggregate_today(
         rollout_index,
         |event| event_is_on_date(event, date),
         |timestamp| ts_is_on_date(timestamp, date),
-        balance_baseline,
     )
 }
 
@@ -115,7 +113,6 @@ pub(super) fn aggregate_period(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-    balance_baseline: Option<BalanceObservation>,
 ) -> WindowAggregate {
     aggregate_usage(
         selected,
@@ -127,7 +124,6 @@ pub(super) fn aggregate_period(
                 .is_some_and(|timestamp| timestamp >= start_nanos)
         },
         |timestamp| timestamp.is_some_and(|value| value >= start_nanos),
-        balance_baseline,
     )
 }
 
@@ -146,7 +142,6 @@ fn aggregate_usage<F, G>(
     rollout_index: &HashMap<String, Vec<String>>,
     includes: F,
     includes_ts: G,
-    balance_baseline: Option<BalanceObservation>,
 ) -> WindowAggregate
 where
     F: Fn(&TokenEvent) -> bool,
@@ -248,11 +243,6 @@ where
             }
         }
     }
-    // 窗口内没有更早的观测时，持久化的账户余额基线（可能来自已被裁剪的
-    // 旧文件）作为时间线起点播种——“空档后的下降归入首次观测日”靠它落地。
-    if let Some(baseline) = balance_baseline {
-        observations.push((baseline.timestamp_nanos, baseline.balance));
-    }
     // 余额观测来自不同线程组的并行会话，必须先按时间排序成账户级时间线，
     // 否则同一笔扣费的重复观测无法相邻抵消。
     observations.sort_by_key(|(timestamp, _)| *timestamp);
@@ -262,8 +252,8 @@ where
 
 /// credits 余额观测合并成账户级时间线后取负跳变：并行会话对同一笔扣费的
 /// 重复观测排序后同值相邻（差为 0），不会重复计入；赠送的正跳变不计。
-/// 扣费归属到观测到它的后一个事件所在窗口——长空档后看到的下降（其他
-/// 设备消耗）因此落在空档后的第一个事件上，与实测行为一致。
+/// 只有两次观测都在统计窗口内，下降才计入该窗口；跨窗口差额无法确定
+/// 扣费发生时间，不归入今日或本期。窗口内首次观测只作为后续差分起点。
 ///
 /// 阈值只挡浮点噪声：余额字符串带 10 位小数，同值重复观测的差分精确为 0，
 /// 解析误差量级 ~1e-12；真实扣费实测最小也在 1e-3 credits 量级。原 0.005
@@ -277,7 +267,8 @@ where
     let mut spent = 0.0;
     for pair in observations.windows(2) {
         let delta = pair[1].1 - pair[0].1;
-        if delta < -BALANCE_EPSILON && includes_ts(Some(pair[1].0)) {
+        if delta < -BALANCE_EPSILON && includes_ts(Some(pair[0].0)) && includes_ts(Some(pair[1].0))
+        {
             spent -= delta;
         }
     }
@@ -462,6 +453,27 @@ fn matching_replay_prefix(child: &[TokenEvent], parent: &[TokenSignature]) -> us
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cross_window_balance_drop_is_not_charged_to_the_new_window() {
+        // 截图中的 $0.15：旧期 1965.567661，新期首次 1961.782981。
+        let observations = [(0, 1_965.567_661), (10, 1_961.782_981), (20, 1_961.782_981)];
+        let in_period = |timestamp: Option<i64>| timestamp.is_some_and(|time| time >= 5);
+        let in_today = |timestamp: Option<i64>| timestamp.is_some_and(|time| time >= 15);
+        assert!(super::credits_debits(&observations, &in_period).abs() < 1e-9);
+        assert!(super::credits_debits(&observations, &in_today).abs() < 1e-9);
+        let mut updated = observations.to_vec();
+        updated.push((30, 1_960.782_981));
+        assert!((super::credits_debits(&updated, &in_period) - 1.0).abs() < 1e-9);
+        assert!((super::credits_debits(&updated, &in_today) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_observation_at_window_start_can_anchor_a_later_debit() {
+        let observations = [(9, 110.0), (10, 100.0), (11, 99.0)];
+        let includes = |timestamp: Option<i64>| timestamp.is_some_and(|time| time >= 10);
+        assert!((super::credits_debits(&observations, &includes) - 1.0).abs() < 1e-9);
+    }
+
     use super::super::test_support::*;
     use super::{ModelVolumes, TokenVolume};
     use crate::quota::pricing::PriceTable;

@@ -8,7 +8,7 @@ use super::layout::{
     PanelAnimation, anchored_destination, animation_shape_rect, dip_to_px, expanded_destination,
     monitor_info, px_to_dip,
 };
-use super::presentation::panel_height_dip;
+use super::presentation::{COMPACT_PANEL_HEIGHT_DIP, panel_height_dip};
 use super::renderer::{TransitionVisual, VisualState};
 use super::{
     ANIMATION_FRAME_MILLIS, AppWindow, COLLAPSE_ANIMATION_DURATION, COLLAPSED_DIP,
@@ -22,7 +22,7 @@ impl AppWindow {
     pub(super) fn panel_height(&self) -> f32 {
         self.state
             .lock()
-            .map_or(254.0, |state| panel_height_dip(&state))
+            .map_or(COMPACT_PANEL_HEIGHT_DIP, |state| panel_height_dip(&state))
     }
 
     pub(super) fn desired_size(&self) -> (i32, i32) {

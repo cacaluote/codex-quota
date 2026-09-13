@@ -364,6 +364,14 @@ pub(super) fn point_is_outside_rounded_rect(point: POINT, rect: RECT, radius: i3
     )
 }
 
+/// 收起态球的命中判定：以窗口中心为圆心、给定像素半径为半径的圆。半径由
+/// 调用方传入渲染所用的同一常量，避免命中区域与画出的圆不一致。
+pub(super) fn point_in_ball(x: i32, y: i32, width: i32, height: i32, radius: i32) -> bool {
+    let dx = x - width / 2;
+    let dy = y - height / 2;
+    dx * dx + dy * dy <= radius * radius
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,7 +453,7 @@ mod tests {
 
     #[test]
     fn expanded_animation_shape_follows_the_dynamic_panel_height() {
-        // 展开终点高度由调用方按数据传入：无超额 254、双行超额 308。
+        // 展开终点高度由调用方按数据传入：无超额 227、双行超额 281。
         let animation = PanelAnimation {
             started_at: Instant::now(),
             duration: EXPAND_ANIMATION_DURATION,
@@ -469,7 +477,7 @@ mod tests {
             animation,
             1.0,
             96,
-            254.0,
+            227.0,
             AnchorEdge::Right,
             ExpansionAlignment::Start,
         );
@@ -477,13 +485,13 @@ mod tests {
             animation,
             1.0,
             96,
-            308.0,
+            281.0,
             AnchorEdge::Right,
             ExpansionAlignment::Start,
         );
 
-        assert_eq!(compact.bottom - compact.top, dip_to_px(254.0, 96));
-        assert_eq!(tall.bottom - tall.top, dip_to_px(308.0, 96));
+        assert_eq!(compact.bottom - compact.top, dip_to_px(227.0, 96));
+        assert_eq!(tall.bottom - tall.top, dip_to_px(281.0, 96));
         assert_eq!(tall.right - tall.left, compact.right - compact.left);
     }
 
@@ -491,6 +499,21 @@ mod tests {
     fn rounded_hit_test_excludes_transparent_corner() {
         assert!(!point_in_rounded_rect(0, 0, 100, 50, 16));
         assert!(point_in_rounded_rect(16, 2, 100, 50, 16));
+    }
+
+    #[test]
+    fn collapsed_ball_hit_test_matches_the_drawn_radius() {
+        use super::point_in_ball;
+        use crate::win32::renderer::BALL_RADIUS_DIP;
+
+        // 56 dip 的正方形窗口、96 dpi：圆心 (28,28)，画出的圆半径 27 px，
+        // 最外一圈（距圆心 28 px）是透明区，不得命中。
+        let radius = dip_to_px(BALL_RADIUS_DIP, 96);
+        assert_eq!(radius, 27);
+        assert!(point_in_ball(1, 28, 56, 56, radius));
+        assert!(!point_in_ball(0, 28, 56, 56, radius));
+        // 旧实现用窗口半边长（28 px）当半径，会把透明的最外圈也算成球内。
+        assert!(point_in_ball(0, 28, 56, 56, 56 / 2));
     }
 
     #[test]

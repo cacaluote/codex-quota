@@ -1,13 +1,13 @@
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EndMenu, GetCursorPos, HMENU, MF_CHECKED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RIGHTALIGN,
-    TrackPopupMenu, WM_CONTEXTMENU, WM_RBUTTONUP,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_RIGHTALIGN, TrackPopupMenu, WM_CONTEXTMENU, WM_NULL, WM_RBUTTONUP,
 };
 use windows::core::PCWSTR;
 
@@ -182,6 +182,10 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
             hwnd,
             None,
         );
+        // TrackPopupMenu 返回后必须投递一条空消息，否则菜单可能残留不消失。
+        // 本窗口是 WS_EX_NOACTIVATE，上面的 SetForegroundWindow 未必成功，
+        // 前台未切换时这一步就是唯一的兜底。
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     }
     Ok(())
 }

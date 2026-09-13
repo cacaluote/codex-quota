@@ -2,11 +2,10 @@ use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MonitorFromPoint, MonitorFromWindow,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -18,8 +17,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::layout::{
     anchored_destination, animation_shape_rect, dip_to_px, lerp, monitor_device, monitor_info,
-    point_in_rounded_rect, point_is_outside_rounded_rect, px_to_dip,
+    point_in_ball, point_in_rounded_rect, point_is_outside_rounded_rect, px_to_dip,
 };
+use super::renderer::BALL_RADIUS_DIP;
 use super::{AppWindow, OUTSIDE_CLICK_HWND, WM_APP_COLLAPSE};
 use crate::config::AnchorEdge;
 use crate::error::AppError;
@@ -41,19 +41,14 @@ impl AppWindow {
     }
 
     fn install_outside_click_hook(&mut self) -> Result<(), AppError> {
-        // SAFETY: a null module name requests the executable that contains the hook procedure.
-        let module = unsafe { GetModuleHandleW(None) }?;
-        // SAFETY: the callback is process-lifetime code, thread ID zero requests a low-level global
-        // hook, and the returned handle remains owned by AppWindow until explicit removal.
-        let hook = unsafe {
-            SetWindowsHookExW(
-                WH_MOUSE_LL,
-                Some(outside_click_mouse_proc),
-                Some(HINSTANCE(module.0)),
-                0,
-            )
-        }
-        .map_err(|error| AppError::Windows(format!("无法启用点击外部收起：{error}")))?;
+        // SAFETY: this installs a global low-level mouse hook (thread ID zero). A WH_MOUSE_LL
+        // procedure is dispatched to the thread that installed it instead of being injected
+        // into other processes, so it does not live in a DLL and no module handle is used —
+        // `hMod` is passed as NULL. The returned handle is owned by AppWindow until explicit
+        // removal.
+        let hook =
+            unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(outside_click_mouse_proc), None, 0) }
+                .map_err(|error| AppError::Windows(format!("无法启用点击外部收起：{error}")))?;
         OUTSIDE_CLICK_HWND.store(self.hwnd.0 as usize, Ordering::Release);
         self.outside_click_hook = Some(hook);
         Ok(())
@@ -261,6 +256,8 @@ impl AppWindow {
                 self.config.placement.edge,
                 self.expansion_alignment,
             );
+            // 动画期间形状是插值后的窗口边界矩形，起点圆角半径取窗口半边长
+            // （28 dip = COLLAPSED_DIP / 2，近似为圆），终点是面板圆角 16 dip。
             let radius = lerp(28.0, 16.0, sample.expansion);
             point_in_rounded_rect(
                 cursor.x - shape.left,
@@ -272,10 +269,9 @@ impl AppWindow {
         } else if self.expanded {
             point_in_rounded_rect(x, y, width, height, dip_to_px(16.0, self.dpi))
         } else {
-            let radius = width.min(height) / 2;
-            let dx = x - width / 2;
-            let dy = y - height / 2;
-            dx * dx + dy * dy <= radius * radius
+            // 命中半径与渲染的圆同源：此前用窗口半边长（28 dip）比视觉半径
+            // （27 dip）大 1 dip，最外一圈会点击穿透。
+            point_in_ball(x, y, width, height, dip_to_px(BALL_RADIUS_DIP, self.dpi))
         };
         LRESULT(if inside {
             HTCLIENT as isize

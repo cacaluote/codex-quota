@@ -75,7 +75,7 @@ const CMD_FOLLOW_CODEX: usize = 1012;
 const CMD_REFRESH_2_MIN: usize = 1013;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
-// 面板高度是动态的：随超额行可见性在 254/281/308 dip 间收缩，
+// 面板高度是动态的：随超额行可见性在 227/254/281 dip 间收缩，
 // 单一出口见 presentation::panel_height_dip。
 const TRAY_REOPEN_GUARD: Duration = Duration::from_millis(500);
 static OUTSIDE_CLICK_HWND: AtomicUsize = AtomicUsize::new(0);
@@ -164,8 +164,18 @@ pub fn run() -> Result<(), AppError> {
         return Err(error);
     }
     let mut message = MSG::default();
-    // SAFETY: standard UI-thread message loop; message points to initialized writable storage.
-    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+    loop {
+        // SAFETY: standard UI-thread message loop; message points to initialized writable storage.
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        if result == 0 {
+            break;
+        }
+        if result == -1 {
+            // -1 是错误返回而非消息；按 `!= 0` 判定会把错误当成继续循环，
+            // 从而反复派发未初始化的 MSG。
+            crate::logging::log("界面消息循环出错，正在退出");
+            break;
+        }
         // SAFETY: DispatchMessageW consumes the message produced by GetMessageW.
         unsafe { DispatchMessageW(&message) };
     }

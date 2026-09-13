@@ -63,6 +63,14 @@ const PLAN_ENTERPRISE: D2D1_COLOR_F = rgba(0xd8, 0xb4, 0x5c, 1.0);
 const PLAN_EDU: D2D1_COLOR_F = rgba(0x56, 0xc7, 0xd9, 1.0);
 const TRANSPARENT: D2D1_COLOR_F = rgba(0, 0, 0, 0.0);
 const TIME_COLUMN_LEFT: f32 = 148.0;
+/// 文本字号（dip）：居中百分比、面板标题、正文。初次创建与设备资源重建
+/// 必须共用同一组常量，否则 DPI 变化或一次绘制失败重试后字号会漂移。
+const PERCENT_FONT_SIZE: f32 = 18.0;
+const TITLE_FONT_SIZE: f32 = 14.0;
+const BODY_FONT_SIZE: f32 = 13.0;
+/// 收起球背景圆的半径（dip）。窗口边长是 56 dip，留 1 dip 余量避免抗锯齿
+/// 被裁切；命中测试共用此常量，两处不得各写各的数字。
+pub(super) const BALL_RADIUS_DIP: f32 = 27.0;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum VisualState {
@@ -136,9 +144,9 @@ impl Renderer {
         let write_factory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
         let target = create_target(&factory, dpi)?;
         let brushes = create_brushes(&target)?;
-        let percent_format = create_text_format(&write_factory, 18.0, true)?;
-        let title_format = create_text_format(&write_factory, 14.0, false)?;
-        let body_format = create_text_format(&write_factory, 13.0, false)?;
+        let percent_format = create_text_format(&write_factory, PERCENT_FONT_SIZE, true)?;
+        let title_format = create_text_format(&write_factory, TITLE_FONT_SIZE, false)?;
+        let body_format = create_text_format(&write_factory, BODY_FONT_SIZE, false)?;
 
         Ok(Self {
             surface,
@@ -181,9 +189,9 @@ impl Renderer {
     fn recreate_device_resources(&mut self, dpi: u32) -> Result<(), AppError> {
         self.target = create_target(&self.factory, dpi)?;
         self.brushes = create_brushes(&self.target)?;
-        self.percent_format = create_text_format(&self.write_factory, 18.0, true)?;
-        self.title_format = create_text_format(&self.write_factory, 14.0, false)?;
-        self.body_format = create_text_format(&self.write_factory, 12.0, false)?;
+        self.percent_format = create_text_format(&self.write_factory, PERCENT_FONT_SIZE, true)?;
+        self.title_format = create_text_format(&self.write_factory, TITLE_FONT_SIZE, false)?;
+        self.body_format = create_text_format(&self.write_factory, BODY_FONT_SIZE, false)?;
         self.dpi = dpi;
         Ok(())
     }
@@ -231,8 +239,8 @@ impl Renderer {
     fn draw_ball_background(&self, center: Vector2) {
         let circle = D2D1_ELLIPSE {
             point: center,
-            radiusX: 27.0,
-            radiusY: 27.0,
+            radiusX: BALL_RADIUS_DIP,
+            radiusY: BALL_RADIUS_DIP,
         };
         // SAFETY: the geometry and brush are renderer-owned and valid for this immediate call.
         unsafe {

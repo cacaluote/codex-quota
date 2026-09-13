@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use super::layout::{ExpansionAlignment, system_animations_enabled};
+use super::notify::{self, NotificationSwitches, Notifier};
 use super::presence::CodexPresenceWatcher;
 use super::renderer::Renderer;
 use super::system::{load_app_icon, set_autostart};
@@ -29,9 +30,10 @@ use super::tray::{
     copy_wide_fixed, handle_tray_message, refresh_interval_for_command, tray_icon_flags,
 };
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_PANEL_PERSISTENT, CMD_REFRESH,
-    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW, TIMER_RING, TRAY_ID, WM_APP_COLLAPSE,
-    WM_APP_PRESENCE_CHANGED, WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
+    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET,
+    CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW,
+    TIMER_RING, TRAY_ID, WM_APP_COLLAPSE, WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED, WM_APP_SHOW,
+    WM_APP_TRAY, WM_APP_UPDATED,
 };
 use crate::config::{self, AppConfigV1};
 use crate::error::AppError;
@@ -66,6 +68,8 @@ impl AppWindow {
             tray_uses_v4: false,
             tray_menu_open: false,
             last_tray_menu_closed: None,
+            notifier: Notifier::default(),
+            notify_state: crate::notify_state::load(),
         }
     }
 
@@ -131,6 +135,8 @@ impl AppWindow {
         self.stop_animation_timer();
         self.stop_ring_frames();
         self.animation = None;
+        // 释放资源期间不再观测额度：丢掉上一次快照，避免下次激活时比出假重置。
+        self.notifier.reset();
         self.expanded = false;
         self.pointer_down = false;
         self.dragging = false;
@@ -254,6 +260,46 @@ impl AppWindow {
         }
     }
 
+    /// 点通知气泡：先确保球可见，再展开面板。
+    fn show_expanded(&mut self) -> Result<(), AppError> {
+        self.show()?;
+        self.set_expanded(true)
+    }
+
+    /// 每次收到新快照时判一次通知：判定与去重都交给 `Notifier`，这里只负责
+    /// 取状态、弹气泡、落盘。
+    fn check_notifications(&mut self) {
+        let (snapshot, overflow_credits) = match self.state.lock() {
+            Ok(current) => (
+                current.snapshot.clone(),
+                current.current_period_overflow_credits,
+            ),
+            Err(_) => return,
+        };
+        let switches = NotificationSwitches {
+            reset: self.config.notify_on_reset,
+            overflow: self.config.notify_on_overflow,
+        };
+        let outcome = self.notifier.observe(
+            &mut self.notify_state,
+            snapshot.as_ref(),
+            overflow_credits,
+            switches,
+            self.config.quota_refresh_interval(),
+            SystemTime::now(),
+        );
+        if outcome.state_dirty {
+            crate::notify_state::save(&self.notify_state);
+        }
+        for notification in outcome.notifications {
+            let (title, body) = notification.balloon_text();
+            crate::logging::log(&format!("通知：{title} / {body}"));
+            if let Err(error) = notify::show_balloon(self.hwnd, title, &body) {
+                crate::logging::log(&error.to_string());
+            }
+        }
+    }
+
     fn apply_topmost(&self) -> Result<(), AppError> {
         let insert_after = if self.config.always_on_top {
             Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST)
@@ -367,6 +413,16 @@ impl AppWindow {
                 self.save_config();
                 Ok(())
             }
+            CMD_NOTIFY_RESET => {
+                self.config.notify_on_reset = !self.config.notify_on_reset;
+                self.save_config();
+                Ok(())
+            }
+            CMD_NOTIFY_OVERFLOW => {
+                self.config.notify_on_overflow = !self.config.notify_on_overflow;
+                self.save_config();
+                Ok(())
+            }
             CMD_AUTOSTART => {
                 let new_value = !self.config.start_with_windows;
                 set_autostart(new_value)?;
@@ -458,17 +514,22 @@ pub(super) unsafe extern "system" fn window_proc(
 
     let result = match message {
         WM_APP_UPDATED => {
-            if !app.overlay_active {
-                Ok(())
-            } else if app.animation.is_some() {
-                app.render()
-            } else if app.expanded {
-                app.resize_for_state()
+            if app.overlay_active {
+                // 新快照到手：先判两条通知，再决定怎么重绘。
+                app.check_notifications();
+                if app.animation.is_some() || !app.expanded {
+                    app.render()
+                } else {
+                    app.resize_for_state()
+                }
             } else {
-                app.render()
+                Ok(())
             }
         }
         WM_APP_SHOW if !app.config.follow_codex => app.show(),
+        // 点通知气泡展开面板：跟随模式下同样允许——能收到通知就说明球当时在，
+        // 而 Codex 已退出时 overlay 不活跃，show/set_expanded 自己会空转。
+        WM_APP_EXPAND => app.show_expanded(),
         WM_APP_COLLAPSE => app.set_expanded(false),
         WM_APP_PRESENCE_CHANGED => app.handle_presence_changed(wparam.0 != 0, lparam.0 as u32),
         WM_COMMAND => app.command(wparam.0 & 0xffff),

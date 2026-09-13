@@ -562,7 +562,7 @@ fn refresh_local_usage<F>(
         Err(error) => {
             publish_local_token_usage(state, None, None, notify);
             publish_local_cost(state, None, None, None, notify);
-            publish_local_overflow(state, None, None, None, None, notify);
+            publish_local_overflow(state, OverflowUsage::default(), notify);
             let message = error.to_string();
             crate::logging::log(&format!(
                 "Codex 本地用量刷新失败：总计 {}，错误 {message}",
@@ -597,18 +597,20 @@ fn publish_local_usage_snapshot<F>(
     );
     publish_local_overflow(
         state,
-        snapshot
-            .today_reliable
-            .then_some(snapshot.today_overflow_tokens),
-        snapshot
-            .today_reliable
-            .then(|| credits_to_usd(snapshot.today_credits_spent)),
-        snapshot
-            .current_period_reliable
-            .then_some(snapshot.current_period_overflow_tokens),
-        snapshot
-            .current_period_reliable
-            .then(|| credits_to_usd(snapshot.current_period_credits_spent)),
+        OverflowUsage {
+            today_tokens: snapshot
+                .today_reliable
+                .then_some(snapshot.today_overflow_tokens),
+            today_credits: snapshot
+                .today_reliable
+                .then_some(snapshot.today_credits_spent),
+            period_tokens: snapshot
+                .current_period_reliable
+                .then_some(snapshot.current_period_overflow_tokens),
+            period_credits: snapshot
+                .current_period_reliable
+                .then_some(snapshot.current_period_credits_spent),
+        },
         notify,
     );
     publish_local_token_usage(
@@ -652,44 +654,58 @@ fn publish_local_cost<F>(
 
 /// credits 购买价：500 credits = $20，余额实付美元按此口径折算。
 /// 实测扣费与 API 牌价并不相等（约为牌价的一半），这里显示的是真实支付。
-const CREDITS_USD_RATE: f64 = 0.04;
+pub(crate) const CREDITS_USD_RATE: f64 = 0.04;
 
 fn credits_to_usd(credits: f64) -> f64 {
     credits * CREDITS_USD_RATE
 }
 
-fn publish_local_overflow<F>(
-    state: &Arc<Mutex<AppState>>,
+/// 溢出（余额）口径的一组显示值。
+///
+/// credits 是账户级**原始**口径（日志里的余额观测差分），美元是 ×0.04 的换算
+/// 值——在这里一次性换算，`AppState` 同时保留两者，展示层不必再换算回去。
+/// token 数是本机触顶后事件的实测值，口径与 credits 不同。
+#[derive(Debug, Clone, Copy, Default)]
+struct OverflowUsage {
     today_tokens: Option<u64>,
-    today_cost: Option<f64>,
+    today_credits: Option<f64>,
     period_tokens: Option<u64>,
-    period_cost: Option<f64>,
-    notify: &Arc<F>,
-) where
+    period_credits: Option<f64>,
+}
+
+fn publish_local_overflow<F>(state: &Arc<Mutex<AppState>>, usage: OverflowUsage, notify: &Arc<F>)
+where
     F: Fn() + Send + Sync + 'static,
 {
+    let today_cost = usage.today_credits.map(credits_to_usd);
+    let period_cost = usage.period_credits.map(credits_to_usd);
     let mut changed = false;
     if let Ok(mut current) = state.lock() {
-        if current.today_overflow_tokens != today_tokens {
-            current.today_overflow_tokens = today_tokens;
-            changed = true;
-        }
-        if current.today_overflow_cost != today_cost {
-            current.today_overflow_cost = today_cost;
-            changed = true;
-        }
-        if current.current_period_overflow_tokens != period_tokens {
-            current.current_period_overflow_tokens = period_tokens;
-            changed = true;
-        }
-        if current.current_period_overflow_cost != period_cost {
-            current.current_period_overflow_cost = period_cost;
-            changed = true;
-        }
+        changed |= assign(&mut current.today_overflow_tokens, usage.today_tokens);
+        changed |= assign(&mut current.today_overflow_credits, usage.today_credits);
+        changed |= assign(&mut current.today_overflow_cost, today_cost);
+        changed |= assign(
+            &mut current.current_period_overflow_tokens,
+            usage.period_tokens,
+        );
+        changed |= assign(
+            &mut current.current_period_overflow_credits,
+            usage.period_credits,
+        );
+        changed |= assign(&mut current.current_period_overflow_cost, period_cost);
     }
     if changed {
         notify();
     }
+}
+
+/// 只在值真的变化时写回，并报告是否变化（避免无谓重绘）。
+fn assign<T: PartialEq>(field: &mut T, value: T) -> bool {
+    if *field == value {
+        return false;
+    }
+    *field = value;
+    true
 }
 
 /// 本期估值 = 本期套餐内已用美元 ÷ 周额度已用百分比 × 100（溢出扣费在
@@ -1055,38 +1071,70 @@ mod tests {
     }
 
     #[test]
-    fn publish_local_overflow_updates_all_four_fields() {
+    fn publish_local_overflow_keeps_credits_and_derives_dollars() {
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
 
         publish_local_overflow(
             &state,
-            Some(200),
-            Some(0.8),
-            Some(1_500),
-            Some(12.4),
+            OverflowUsage {
+                today_tokens: Some(200),
+                today_credits: Some(20.0),
+                period_tokens: Some(1_500),
+                period_credits: Some(310.0),
+            },
             &notify,
         );
 
         let current = state.lock().unwrap();
         assert_eq!(current.today_overflow_tokens, Some(200));
+        assert_eq!(current.today_overflow_credits, Some(20.0));
         assert_eq!(current.today_overflow_cost, Some(0.8));
         assert_eq!(current.current_period_overflow_tokens, Some(1_500));
+        assert_eq!(current.current_period_overflow_credits, Some(310.0));
         assert_eq!(current.current_period_overflow_cost, Some(12.4));
+    }
+
+    #[test]
+    fn published_credits_and_dollars_stay_in_sync() {
+        // 单位换错过两次（阈值从美元换成 credits 时调用方没跟着改），所以把
+        // 数据契约钉住：发布后两个口径必须始终是 1 : 0.04。
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+
+        publish_local_overflow(
+            &state,
+            OverflowUsage {
+                today_tokens: Some(1),
+                today_credits: Some(310.25),
+                period_tokens: Some(2),
+                period_credits: Some(73.22),
+            },
+            &notify,
+        );
+
+        let current = state.lock().unwrap();
+        let today = current.today_overflow_credits.unwrap() * CREDITS_USD_RATE;
+        let period = current.current_period_overflow_credits.unwrap() * CREDITS_USD_RATE;
+        assert!((current.today_overflow_cost.unwrap() - today).abs() < 1e-9);
+        assert!((current.current_period_overflow_cost.unwrap() - period).abs() < 1e-9);
+        assert!((period - 2.928_8).abs() < 1e-9);
     }
 
     #[test]
     fn publish_local_overflow_none_marks_unreliable_windows() {
         let state = Arc::new(Mutex::new(AppState {
             today_overflow_tokens: Some(200),
+            today_overflow_credits: Some(20.0),
             ..AppState::default()
         }));
         let notify = Arc::new(|| {});
 
-        publish_local_overflow(&state, None, None, None, None, &notify);
+        publish_local_overflow(&state, OverflowUsage::default(), &notify);
 
         let current = state.lock().unwrap();
         assert_eq!(current.today_overflow_tokens, None);
+        assert_eq!(current.today_overflow_credits, None);
         assert_eq!(current.today_overflow_cost, None);
     }
 

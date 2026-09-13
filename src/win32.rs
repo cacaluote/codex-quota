@@ -11,6 +11,7 @@
 
 mod interaction;
 mod layout;
+mod notify;
 mod overlay;
 mod presence;
 mod presentation;
@@ -54,6 +55,7 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_COLLAPSE: u32 = WM_APP + 4;
 const WM_APP_PRESENCE_CHANGED: u32 = WM_APP + 5;
+const WM_APP_EXPAND: u32 = WM_APP + 6;
 const TIMER_REDRAW: usize = 1;
 const TIMER_ANIMATION: usize = 2;
 const TIMER_RING: usize = 3;
@@ -74,6 +76,8 @@ const CMD_REFRESH_10_MIN: usize = 1010;
 const CMD_REFRESH_30_MIN: usize = 1011;
 const CMD_FOLLOW_CODEX: usize = 1012;
 const CMD_REFRESH_2_MIN: usize = 1013;
+const CMD_NOTIFY_RESET: usize = 1014;
+const CMD_NOTIFY_OVERFLOW: usize = 1015;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
 // 面板高度是动态的：随超额行可见性在 227/254/281 dip 间收缩，
@@ -212,4 +216,7 @@ struct AppWindow {
     tray_uses_v4: bool,
     tray_menu_open: bool,
     last_tray_menu_closed: Option<Instant>,
+    notifier: notify::Notifier,
+    /// 跨进程保留的通知去重状态（已通知过的余额周期）。
+    notify_state: crate::notify_state::NotifyState,
 }

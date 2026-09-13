@@ -27,7 +27,13 @@ impl QuotaWindow {
 
     #[must_use]
     pub fn window_label(&self) -> String {
-        format_duration_label(self.window_duration)
+        format!("{}额度", format_duration_name(self.window_duration))
+    }
+
+    /// 不带「额度」后缀的窗口名，用于和「窗口」搭配的句子（通知正文）。
+    #[must_use]
+    pub fn window_short_label(&self) -> String {
+        format_duration_name(self.window_duration)
     }
 
     #[must_use]
@@ -130,10 +136,14 @@ pub struct AppState {
     pub period_total_value_estimate: Option<f64>,
     /// 今日本机溢出用量（触顶后事件的实测 token；不可靠为 None）。
     pub today_overflow_tokens: Option<u64>,
-    /// 今日 credits 实扣折算美元（账户级，×$0.04/积分；不可靠为 None）。
+    /// 今日 credits 实扣（**账户级原始口径**，积分；不可靠为 None）。
+    pub today_overflow_credits: Option<f64>,
+    /// 今日 credits 实扣折算美元（账户级，×$0.04/积分；由上一项换算）。
     pub today_overflow_cost: Option<f64>,
     /// 本期本机溢出用量（实测）。
     pub current_period_overflow_tokens: Option<u64>,
+    /// 本期 credits 实扣（账户级原始口径，积分）。
+    pub current_period_overflow_credits: Option<f64>,
     /// 本期 credits 实扣折算美元（账户级）。
     pub current_period_overflow_cost: Option<f64>,
 }
@@ -152,8 +162,10 @@ impl Default for AppState {
             current_period_cost: None,
             period_total_value_estimate: None,
             today_overflow_tokens: None,
+            today_overflow_credits: None,
             today_overflow_cost: None,
             current_period_overflow_tokens: None,
+            current_period_overflow_credits: None,
             current_period_overflow_cost: None,
         }
     }
@@ -191,22 +203,25 @@ pub fn format_elapsed(then: SystemTime, now: SystemTime) -> String {
     }
 }
 
-fn format_duration_label(duration: Duration) -> String {
+/// 窗口的短名：`5h` / `周` / `月` / `2周` / `3天` / `6小时` / `45分钟`。
+/// 面板用的是加了「额度」后缀的 [`QuotaWindow::window_label`]，通知正文里
+/// 用的是这个不带后缀的版本（标题已经有「额度」了）。
+fn format_duration_name(duration: Duration) -> String {
     let minutes = duration.as_secs() / 60;
     if minutes == 300 {
-        "5h额度".to_owned()
+        "5h".to_owned()
     } else if (40_320..=44_640).contains(&minutes) {
-        "月额度".to_owned()
+        "月".to_owned()
     } else if minutes == 10_080 {
-        "周额度".to_owned()
+        "周".to_owned()
     } else if minutes != 0 && minutes.is_multiple_of(10_080) {
-        format!("{}周额度", minutes / 10_080)
+        format!("{}周", minutes / 10_080)
     } else if minutes != 0 && minutes.is_multiple_of(1_440) {
-        format!("{}天额度", minutes / 1_440)
+        format!("{}天", minutes / 1_440)
     } else if minutes != 0 && minutes.is_multiple_of(60) {
-        format!("{}小时额度", minutes / 60)
+        format!("{}小时", minutes / 60)
     } else {
-        format!("{minutes}分钟额度")
+        format!("{minutes}分钟")
     }
 }
 
@@ -273,6 +288,21 @@ mod tests {
         five_hour.window_duration = Duration::from_hours(5);
 
         assert_eq!(five_hour.window_label(), "5h额度");
+    }
+
+    #[test]
+    fn short_label_drops_the_quota_suffix() {
+        let mut five_hour = window(10.0);
+        five_hour.window_duration = Duration::from_hours(5);
+        let mut monthly = window(10.0);
+        monthly.window_duration = Duration::from_hours(24 * 30);
+        let mut three_days = window(10.0);
+        three_days.window_duration = Duration::from_hours(72);
+
+        assert_eq!(five_hour.window_short_label(), "5h");
+        assert_eq!(window(10.0).window_short_label(), "周");
+        assert_eq!(monthly.window_short_label(), "月");
+        assert_eq!(three_days.window_short_label(), "3天");
     }
 
     #[test]

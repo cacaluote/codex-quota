@@ -61,6 +61,8 @@ pub struct AppConfigV1 {
     pub start_with_windows: bool,
     pub follow_codex: bool,
     pub collapse_on_outside_click: bool,
+    pub notify_on_reset: bool,
+    pub notify_on_overflow: bool,
     pub quota_refresh_interval_secs: u64,
     pub follow_codex_check_interval_secs: u64,
 }
@@ -74,6 +76,8 @@ impl Default for AppConfigV1 {
             start_with_windows: false,
             follow_codex: false,
             collapse_on_outside_click: true,
+            notify_on_reset: true,
+            notify_on_overflow: true,
             quota_refresh_interval_secs: DEFAULT_QUOTA_REFRESH_INTERVAL_SECS,
             follow_codex_check_interval_secs: DEFAULT_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
         }
@@ -288,6 +292,24 @@ mod tests {
             }"#,
         );
         assert_eq!(config.ok().map(|value| value.follow_codex), Some(false));
+    }
+
+    #[test]
+    fn legacy_config_enables_both_notifications_by_default() {
+        let config = serde_json::from_str::<AppConfigV1>(
+            r#"{
+                "version": 1,
+                "always_on_top": true,
+                "start_with_windows": false
+            }"#,
+        );
+
+        assert_eq!(
+            config
+                .ok()
+                .map(|value| (value.notify_on_reset, value.notify_on_overflow)),
+            Some((true, true))
+        );
     }
 
     #[test]

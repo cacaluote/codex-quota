@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NOTIFY_ICON_DATA_FLAGS,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIN_BALLOONUSERCLICK, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EndMenu, GetCursorPos, HMENU, MF_CHECKED, MF_GRAYED,
@@ -12,15 +12,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_PANEL_PERSISTENT, CMD_REFRESH,
-    CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN, CMD_REFRESH_5_MIN, CMD_REFRESH_10_MIN,
-    CMD_REFRESH_30_MIN, CMD_SHOW, CMD_TOPMOST, TRAY_REOPEN_GUARD,
+    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET,
+    CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN, CMD_REFRESH_5_MIN,
+    CMD_REFRESH_10_MIN, CMD_REFRESH_30_MIN, CMD_SHOW, CMD_TOPMOST, TRAY_REOPEN_GUARD,
+    WM_APP_EXPAND,
 };
 use crate::error::AppError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayEventAction {
     OpenContextMenu,
+    /// 用户点了通知气泡：展开面板。
+    ShowPanel,
     Ignore,
 }
 
@@ -34,6 +37,8 @@ struct TrayMenuState {
     start_with_windows: bool,
     follow_codex: bool,
     collapse_on_outside_click: bool,
+    notify_on_reset: bool,
+    notify_on_overflow: bool,
     quota_refresh_interval_secs: u64,
 }
 
@@ -58,8 +63,15 @@ pub(super) unsafe fn handle_tray_message(
     let event = lparam.0 as u32 & 0xffff;
     // SAFETY: app_ptr is the live Box pointer stored in GWLP_USERDATA on the UI thread.
     let uses_v4 = unsafe { (*app_ptr).tray_uses_v4 };
-    if tray_event_action(event, uses_v4) != TrayEventAction::OpenContextMenu {
-        return Ok(());
+    match tray_event_action(event, uses_v4) {
+        TrayEventAction::OpenContextMenu => {}
+        TrayEventAction::ShowPanel => {
+            // SAFETY: the window owns the handler and posting by value carries no pointer.
+            let hwnd = unsafe { (*app_ptr).hwnd };
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_EXPAND, WPARAM(0), LPARAM(0)) };
+            return Ok(());
+        }
+        TrayEventAction::Ignore => return Ok(()),
     }
 
     // SAFETY: the field is read only on this UI thread, including modal-loop re-entry.
@@ -90,6 +102,8 @@ pub(super) unsafe fn handle_tray_message(
                 start_with_windows: (*app_ptr).config.start_with_windows,
                 follow_codex: (*app_ptr).config.follow_codex,
                 collapse_on_outside_click: (*app_ptr).config.collapse_on_outside_click,
+                notify_on_reset: (*app_ptr).config.notify_on_reset,
+                notify_on_overflow: (*app_ptr).config.notify_on_overflow,
                 quota_refresh_interval_secs: (*app_ptr).config.quota_refresh_interval().as_secs(),
             },
         )
@@ -111,6 +125,7 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
     unsafe { GetCursorPos(&mut cursor)? };
     let menu = PopupMenu::create()?;
     let refresh_menu = PopupMenu::create()?;
+    let notify_menu = PopupMenu::create()?;
     let show = wide(if state.visible {
         "隐藏悬浮球"
     } else {
@@ -118,12 +133,14 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
     });
     let refresh = wide("立即刷新");
     let refresh_interval = wide("刷新间隔");
+    let notifications = wide("通知");
     let topmost = wide("始终置顶");
     let autostart = wide("开机启动");
     let follow_codex = wide("跟随 Codex");
     let panel_persistent = wide("面板常驻");
     let exit = wide("退出");
     append_refresh_interval_entries(refresh_menu.0, state)?;
+    append_notify_entries(notify_menu.0, state)?;
     append_menu_command(menu.0, CMD_SHOW, &show, false, !state.follow_codex)?;
     append_menu_command(
         menu.0,
@@ -142,6 +159,14 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
         )?;
         // After successful attachment, the parent menu owns and destroys the submenu.
         std::mem::forget(refresh_menu);
+        AppendMenuW(
+            menu.0,
+            MF_POPUP,
+            notify_menu.0.0 as usize,
+            PCWSTR(notifications.as_ptr()),
+        )?;
+        // Same ownership transfer as the refresh submenu above.
+        std::mem::forget(notify_menu);
     }
     // SAFETY: menu is valid and separators do not carry string data.
     unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())? };
@@ -214,6 +239,20 @@ fn append_refresh_interval_entries(menu: HMENU, state: TrayMenuState) -> Result<
     Ok(())
 }
 
+fn append_notify_entries(menu: HMENU, state: TrayMenuState) -> Result<(), AppError> {
+    let reset = wide("额度重置提醒");
+    let overflow = wide("余额使用提醒");
+    append_menu_command(menu, CMD_NOTIFY_RESET, &reset, state.notify_on_reset, true)?;
+    append_menu_command(
+        menu,
+        CMD_NOTIFY_OVERFLOW,
+        &overflow,
+        state.notify_on_overflow,
+        true,
+    )?;
+    Ok(())
+}
+
 fn append_menu_command(
     menu: HMENU,
     command: usize,
@@ -263,6 +302,8 @@ fn is_tray_context_event(event: u32, uses_v4: bool) -> bool {
 fn tray_event_action(event: u32, uses_v4: bool) -> TrayEventAction {
     if is_tray_context_event(event, uses_v4) {
         TrayEventAction::OpenContextMenu
+    } else if event == NIN_BALLOONUSERCLICK {
+        TrayEventAction::ShowPanel
     } else {
         TrayEventAction::Ignore
     }
@@ -299,7 +340,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::UI::Shell::NIF_GUID;
+    use windows::Win32::UI::Shell::{NIF_GUID, NIN_BALLOONTIMEOUT};
     use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_RBUTTONUP};
 
     use super::*;
@@ -336,6 +377,23 @@ mod tests {
     #[test]
     fn version_four_tray_icon_requests_standard_tooltip() {
         assert!(tray_icon_flags().contains(NIF_SHOWTIP));
+    }
+
+    #[test]
+    fn balloon_click_expands_the_panel() {
+        assert_eq!(
+            tray_event_action(NIN_BALLOONUSERCLICK, true),
+            TrayEventAction::ShowPanel
+        );
+        // 气泡超时/关闭不做事，右键仍然只开菜单。
+        assert_eq!(
+            tray_event_action(NIN_BALLOONTIMEOUT, true),
+            TrayEventAction::Ignore
+        );
+        assert_eq!(
+            tray_event_action(WM_CONTEXTMENU, true),
+            TrayEventAction::OpenContextMenu
+        );
     }
 
     #[test]

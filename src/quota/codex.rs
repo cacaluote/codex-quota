@@ -12,13 +12,12 @@ use std::time::{Duration, Instant, SystemTime};
 use app_server::AppServerSession;
 pub(crate) use app_server::find_codex_executable;
 use protocol::{
-    local_calendar_date, local_calendar_date_at, parse_account_result, parse_lifetime_usage,
-    parse_rate_limits_result,
+    local_calendar_date, local_calendar_date_at, parse_account_result, parse_rate_limits_result,
 };
 use serde_json::json;
 use session_usage::SessionUsageTracker;
 
-use super::model::{AppState, ConnectionStatus, QUOTA_STALE_FLOOR, QuotaSnapshot};
+use super::model::{AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaSnapshot};
 use super::pricing::PriceTable;
 use crate::error::AppError;
 
@@ -340,11 +339,6 @@ where
     if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
         crate::logging::log(&format!("无法读取 Codex 方案类型：{error}"));
     }
-    // The account-wide lifetime covers sessions from every device, which the
-    // local aggregation cannot see; treat it as authoritative.
-    if let Err(error) = read_lifetime_and_publish(&mut session, &mut next_id, state, notify) {
-        crate::logging::log(&format!("无法读取累计 Token 用量：{error}"));
-    }
     session.shutdown();
     result
 }
@@ -358,10 +352,13 @@ fn snapshot_received_at(state: &Arc<Mutex<AppState>>) -> Option<SystemTime> {
     })
 }
 
+/// 空闲对表周期 = 刷新间隔 N：快照年龄（最后一次新鲜度事件起算）达到 N
+/// 就拉一次 RPC。显示门控另在 2N（`AppState::stale_after`），中间的余量
+/// 供拉取耗时使用，正常不会闪 `--`。
 fn local_pull_threshold(state: &Arc<Mutex<AppState>>) -> Duration {
-    state
-        .lock()
-        .map_or(QUOTA_STALE_FLOOR, |current| current.stale_after())
+    state.lock().map_or(DEFAULT_REFRESH_INTERVAL, |current| {
+        current.quota_refresh_interval
+    })
 }
 
 fn local_pull_delay(state: &Arc<Mutex<AppState>>, now: SystemTime) -> Duration {
@@ -423,30 +420,6 @@ fn publish_local_quota<F>(
     }
 }
 
-fn publish_local_lifetime<F>(state: &Arc<Mutex<AppState>>, lifetime: Option<u64>, notify: &Arc<F>)
-where
-    F: Fn() + Send + Sync + 'static,
-{
-    // The on-demand pull publishes the authoritative account-wide value; a
-    // local aggregate only ever raises the display (its own events), and an
-    // unreliable aggregate must not pull the displayed value back down.
-    let Some(lifetime) = lifetime else {
-        return;
-    };
-    let mut changed = false;
-    if let Ok(mut current) = state.lock()
-        && current
-            .lifetime_tokens
-            .is_none_or(|current| lifetime > current)
-    {
-        current.lifetime_tokens = Some(lifetime);
-        changed = true;
-    }
-    if changed {
-        notify();
-    }
-}
-
 fn read_rate_limits_and_publish<F>(
     session: &mut AppServerSession,
     next_id: &mut u64,
@@ -470,26 +443,6 @@ where
         current.last_error = None;
     }
     notify();
-    Ok(())
-}
-
-fn read_lifetime_and_publish<F>(
-    session: &mut AppServerSession,
-    next_id: &mut u64,
-    state: &Arc<Mutex<AppState>>,
-    notify: &Arc<F>,
-) -> Result<(), AppError>
-where
-    F: Fn() + Send + Sync + 'static,
-{
-    let id = next_request_id(next_id);
-    session.send(&json!({
-        "method": "account/usage/read",
-        "id": id
-    }))?;
-    let result = session.wait_for_response(id, REQUEST_TIMEOUT)?;
-    let usage = parse_lifetime_usage(result)?;
-    publish_lifetime_usage(state, usage.lifetime, notify);
     Ok(())
 }
 
@@ -542,25 +495,6 @@ where
     notify();
 }
 
-fn publish_lifetime_usage<F>(state: &Arc<Mutex<AppState>>, lifetime: Option<u64>, notify: &Arc<F>)
-where
-    F: Fn() + Send + Sync + 'static,
-{
-    let mut changed = false;
-    if let Ok(mut current) = state.lock()
-        && let Some(lifetime) = lifetime
-        && current
-            .lifetime_tokens
-            .is_none_or(|current| lifetime > current)
-    {
-        current.lifetime_tokens = Some(lifetime);
-        changed = true;
-    }
-    if changed {
-        notify();
-    }
-}
-
 fn refresh_local_usage<F>(
     tracker: &mut SessionUsageTracker,
     status: &mut LocalUsageStatus,
@@ -576,7 +510,9 @@ fn refresh_local_usage<F>(
         status.date.clone_from(&today);
         status.last_error = None;
         if let Ok(mut current) = state.lock()
-            && current.today_tokens.take().is_some()
+            && (current.today_tokens.take().is_some()
+                || current.today_overflow_tokens.take().is_some()
+                || current.today_overflow_cost.take().is_some())
         {
             identity_changed = true;
         }
@@ -584,7 +520,9 @@ fn refresh_local_usage<F>(
     let period_boundary = current_period_boundary(state);
     if status.synchronize_period_boundary(period_boundary)
         && let Ok(mut current) = state.lock()
-        && current.current_period_tokens.take().is_some()
+        && (current.current_period_tokens.take().is_some()
+            || current.current_period_overflow_tokens.take().is_some()
+            || current.current_period_overflow_cost.take().is_some())
     {
         identity_changed = true;
     }
@@ -596,28 +534,13 @@ fn refresh_local_usage<F>(
     match tracker.refresh(status.period_boundary.as_ref()) {
         Ok((snapshot, diagnostics)) => {
             status.last_error = None;
-            publish_local_quota(state, snapshot.quota, snapshot.plan_type, notify);
-            let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
-            let period_cost = snapshot
-                .period_volume
-                .as_ref()
-                .and_then(|volumes| volumes.cost(prices));
-            publish_local_cost(
+            publish_local_quota(
                 state,
-                today_cost,
-                period_cost,
-                period_total_value_estimate(state, period_cost),
+                snapshot.quota.clone(),
+                snapshot.plan_type.clone(),
                 notify,
             );
-            publish_local_token_usage(
-                state,
-                snapshot.today_reliable.then_some(snapshot.today_tokens),
-                snapshot
-                    .current_period_reliable
-                    .then_some(snapshot.current_period_tokens),
-                notify,
-            );
-            publish_local_lifetime(state, snapshot.lifetime_tokens, notify);
+            publish_local_usage_snapshot(state, &snapshot, prices, notify);
             if should_log_local_usage_refresh(&diagnostics) {
                 crate::logging::log(&local_usage_refresh_description(&diagnostics));
             }
@@ -630,27 +553,7 @@ fn refresh_local_usage<F>(
                 && let Ok((snapshot, diagnostics)) =
                     tracker.refresh(status.period_boundary.as_ref())
             {
-                let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
-                let period_cost = snapshot
-                    .period_volume
-                    .as_ref()
-                    .and_then(|volumes| volumes.cost(prices));
-                publish_local_cost(
-                    state,
-                    today_cost,
-                    period_cost,
-                    period_total_value_estimate(state, period_cost),
-                    notify,
-                );
-                publish_local_token_usage(
-                    state,
-                    snapshot.today_reliable.then_some(snapshot.today_tokens),
-                    snapshot
-                        .current_period_reliable
-                        .then_some(snapshot.current_period_tokens),
-                    notify,
-                );
-                publish_local_lifetime(state, snapshot.lifetime_tokens, notify);
+                publish_local_usage_snapshot(state, &snapshot, prices, notify);
                 if should_log_local_usage_refresh(&diagnostics) {
                     crate::logging::log(&local_usage_refresh_description(&diagnostics));
                 }
@@ -659,6 +562,7 @@ fn refresh_local_usage<F>(
         Err(error) => {
             publish_local_token_usage(state, None, None, notify);
             publish_local_cost(state, None, None, None, notify);
+            publish_local_overflow(state, None, None, None, None, notify);
             let message = error.to_string();
             crate::logging::log(&format!(
                 "Codex 本地用量刷新失败：总计 {}，错误 {message}",
@@ -667,6 +571,54 @@ fn refresh_local_usage<F>(
             status.last_error = Some(message);
         }
     }
+}
+
+/// 发布一次本地聚合快照的显示值：套餐内价值/估值、溢出（tokens + credits
+/// 实扣）、token 用量与累计。
+fn publish_local_usage_snapshot<F>(
+    state: &Arc<Mutex<AppState>>,
+    snapshot: &session_usage::LocalUsageSnapshot,
+    prices: &PriceTable,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
+    let period_cost = snapshot
+        .period_volume
+        .as_ref()
+        .and_then(|volumes| volumes.cost(prices));
+    publish_local_cost(
+        state,
+        today_cost,
+        period_cost,
+        period_total_value_estimate(state, period_cost),
+        notify,
+    );
+    publish_local_overflow(
+        state,
+        snapshot
+            .today_reliable
+            .then_some(snapshot.today_overflow_tokens),
+        snapshot
+            .today_reliable
+            .then(|| credits_to_usd(snapshot.today_credits_spent)),
+        snapshot
+            .current_period_reliable
+            .then_some(snapshot.current_period_overflow_tokens),
+        snapshot
+            .current_period_reliable
+            .then(|| credits_to_usd(snapshot.current_period_credits_spent)),
+        notify,
+    );
+    publish_local_token_usage(
+        state,
+        snapshot.today_reliable.then_some(snapshot.today_tokens),
+        snapshot
+            .current_period_reliable
+            .then_some(snapshot.current_period_tokens),
+        notify,
+    );
 }
 
 fn publish_local_cost<F>(
@@ -698,9 +650,51 @@ fn publish_local_cost<F>(
     }
 }
 
-/// 本期估值 = 本期已用美元 ÷ 周额度已用百分比 × 100。百分比过小
-/// （新窗口/外部重置后）、本机尚无用量或快照过期时给不出有意义的估算，
-/// 返回 None。
+/// credits 购买价：500 credits = $20，余额实付美元按此口径折算。
+/// 实测扣费与 API 牌价并不相等（约为牌价的一半），这里显示的是真实支付。
+const CREDITS_USD_RATE: f64 = 0.04;
+
+fn credits_to_usd(credits: f64) -> f64 {
+    credits * CREDITS_USD_RATE
+}
+
+fn publish_local_overflow<F>(
+    state: &Arc<Mutex<AppState>>,
+    today_tokens: Option<u64>,
+    today_cost: Option<f64>,
+    period_tokens: Option<u64>,
+    period_cost: Option<f64>,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut changed = false;
+    if let Ok(mut current) = state.lock() {
+        if current.today_overflow_tokens != today_tokens {
+            current.today_overflow_tokens = today_tokens;
+            changed = true;
+        }
+        if current.today_overflow_cost != today_cost {
+            current.today_overflow_cost = today_cost;
+            changed = true;
+        }
+        if current.current_period_overflow_tokens != period_tokens {
+            current.current_period_overflow_tokens = period_tokens;
+            changed = true;
+        }
+        if current.current_period_overflow_cost != period_cost {
+            current.current_period_overflow_cost = period_cost;
+            changed = true;
+        }
+    }
+    if changed {
+        notify();
+    }
+}
+
+/// 本期估值 = 本期套餐内已用美元 ÷ 周额度已用百分比 × 100（溢出扣费在
+/// 额度之外单独计价，不计入满额价值）。百分比过小（新窗口/外部重置后）、
+/// 本机尚无用量或快照过期时给不出有意义的估算，返回 None。
 fn period_total_value_estimate(
     state: &Arc<Mutex<AppState>>,
     period_cost: Option<f64>,
@@ -910,35 +904,27 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_pull_threshold_has_a_thirty_minute_floor() {
-        let state = Arc::new(Mutex::new(AppState {
-            quota_refresh_interval: Duration::from_mins(1),
-            ..AppState::default()
-        }));
+    fn on_demand_pull_threshold_equals_the_refresh_interval() {
+        for minutes in [1_u64, 5, 30] {
+            let state = Arc::new(Mutex::new(AppState {
+                quota_refresh_interval: Duration::from_mins(minutes),
+                ..AppState::default()
+            }));
 
-        assert_eq!(local_pull_threshold(&state), QUOTA_STALE_FLOOR);
-    }
-
-    #[test]
-    fn on_demand_pull_threshold_is_twice_the_refresh_interval_above_the_floor() {
-        let state = Arc::new(Mutex::new(AppState {
-            quota_refresh_interval: Duration::from_mins(30),
-            ..AppState::default()
-        }));
-
-        assert_eq!(local_pull_threshold(&state), Duration::from_hours(1));
+            assert_eq!(local_pull_threshold(&state), Duration::from_mins(minutes));
+        }
     }
 
     #[test]
     fn on_demand_pull_delay_uses_only_remaining_snapshot_freshness() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = Arc::new(Mutex::new(AppState {
-            snapshot: Some(quota_snapshot(now - Duration::from_mins(29))),
-            quota_refresh_interval: Duration::from_mins(1),
+            snapshot: Some(quota_snapshot(now - Duration::from_mins(2))),
+            quota_refresh_interval: Duration::from_mins(5),
             ..AppState::default()
         }));
 
-        assert_eq!(local_pull_delay(&state, now), Duration::from_mins(1));
+        assert_eq!(local_pull_delay(&state, now), Duration::from_mins(3));
     }
 
     #[test]
@@ -1062,33 +1048,46 @@ mod tests {
     }
 
     #[test]
-    fn local_lifetime_does_not_lower_the_displayed_value() {
-        let state = Arc::new(Mutex::new(AppState {
-            lifetime_tokens: Some(100),
-            ..AppState::default()
-        }));
-        let notify = Arc::new(|| {});
-
-        publish_local_lifetime(&state, None, &notify);
-        publish_local_lifetime(&state, Some(50), &notify);
-        publish_local_lifetime(&state, Some(150), &notify);
-
-        assert_eq!(state.lock().unwrap().lifetime_tokens, Some(150));
+    fn credits_convert_at_the_purchase_rate() {
+        // 500 credits = $20 → 1 credit = $0.04；实测扣费按此口径折算实付。
+        assert!((credits_to_usd(73.22) - 2.928_8).abs() < 1e-9);
+        assert!(credits_to_usd(0.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn rpc_lifetime_updates_only_when_larger() {
+    fn publish_local_overflow_updates_all_four_fields() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+
+        publish_local_overflow(
+            &state,
+            Some(200),
+            Some(0.8),
+            Some(1_500),
+            Some(12.4),
+            &notify,
+        );
+
+        let current = state.lock().unwrap();
+        assert_eq!(current.today_overflow_tokens, Some(200));
+        assert_eq!(current.today_overflow_cost, Some(0.8));
+        assert_eq!(current.current_period_overflow_tokens, Some(1_500));
+        assert_eq!(current.current_period_overflow_cost, Some(12.4));
+    }
+
+    #[test]
+    fn publish_local_overflow_none_marks_unreliable_windows() {
         let state = Arc::new(Mutex::new(AppState {
-            lifetime_tokens: Some(100),
+            today_overflow_tokens: Some(200),
             ..AppState::default()
         }));
         let notify = Arc::new(|| {});
 
-        publish_lifetime_usage(&state, None, &notify);
-        publish_lifetime_usage(&state, Some(80), &notify);
-        publish_lifetime_usage(&state, Some(120), &notify);
+        publish_local_overflow(&state, None, None, None, None, &notify);
 
-        assert_eq!(state.lock().unwrap().lifetime_tokens, Some(120));
+        let current = state.lock().unwrap();
+        assert_eq!(current.today_overflow_tokens, None);
+        assert_eq!(current.today_overflow_cost, None);
     }
 
     fn period_start() -> SystemTime {
@@ -1402,43 +1401,6 @@ mod tests {
                 ..session_usage::RefreshDiagnostics::default()
             }),
             "Codex 本地用量（监听）：1.500 ms；检查 0.900，解析 0.200，写缓存失败 0.300；文件 1/1，新增 Token 事件 0；错误：文件 1，解析 2，待定 3"
-        );
-    }
-
-    #[test]
-    fn lifetime_publish_does_not_change_local_usage_values() {
-        let state = Arc::new(Mutex::new(AppState {
-            today_tokens: Some(56_879_410),
-            current_period_tokens: Some(60_050_978),
-            ..AppState::default()
-        }));
-        let notify = Arc::new(|| {});
-
-        publish_lifetime_usage(&state, Some(40), &notify);
-
-        assert_eq!(
-            state.lock().ok().map(|state| (
-                state.today_tokens,
-                state.current_period_tokens,
-                state.lifetime_tokens
-            )),
-            Some((Some(56_879_410), Some(60_050_978), Some(40)))
-        );
-    }
-
-    #[test]
-    fn missing_lifetime_preserves_last_successful_value() {
-        let state = Arc::new(Mutex::new(AppState {
-            lifetime_tokens: Some(40),
-            ..AppState::default()
-        }));
-        let notify = Arc::new(|| {});
-
-        publish_lifetime_usage(&state, None, &notify);
-
-        assert_eq!(
-            state.lock().ok().and_then(|state| state.lifetime_tokens),
-            Some(40)
         );
     }
 

@@ -75,7 +75,8 @@ const CMD_FOLLOW_CODEX: usize = 1012;
 const CMD_REFRESH_2_MIN: usize = 1013;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
-const PANEL_HEIGHT_DIP: f32 = 254.0;
+// 面板高度是动态的：随超额行可见性在 254/281/308 dip 间收缩，
+// 单一出口见 presentation::panel_height_dip。
 const TRAY_REOPEN_GUARD: Duration = Duration::from_millis(500);
 static OUTSIDE_CLICK_HWND: AtomicUsize = AtomicUsize::new(0);
 

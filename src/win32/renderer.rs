@@ -39,9 +39,10 @@ use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
 use super::presentation::{
-    PlanColor, ball_quota, display_period_total_value, display_windows, format_local_timestamp,
-    format_token_usage, format_usd, panel_title, plan_type_color, plan_type_label,
-    quota_window_label,
+    COMMUNITY_WEEKLY_VALUE_USD, FIRST_ROW_TOP_DIP, PlanColor, ROW_STEP_DIP, ball_quota,
+    display_period_total_value, display_windows, format_local_timestamp, format_token_usage,
+    format_usd, panel_title, period_overflow_visible, plan_type_color, plan_type_label,
+    quota_window_label, today_overflow_visible,
 };
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
@@ -394,34 +395,56 @@ impl Renderer {
         let (short_term, long_term) = display_windows(state, SystemTime::now());
         let short_term_label = quota_window_label(short_term, state.plan_type.as_deref(), true);
         let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
-        self.draw_quota_row(&short_term_label, short_term, 42.0, width, opacity);
-        self.draw_quota_row(&long_term_label, long_term, 69.0, width, opacity);
+        // 行位按可见行顺序排布：超额行大多不发生，未发生时不占位，面板
+        // 高度由 panel_height_dip 按同一可见性规则收缩。
+        let mut top = FIRST_ROW_TOP_DIP;
+        self.draw_quota_row(&short_term_label, short_term, top, width, opacity);
+        top += ROW_STEP_DIP;
+        self.draw_quota_row(&long_term_label, long_term, top, width, opacity);
+        top += ROW_STEP_DIP;
         self.draw_token_usage_row(
             "今日使用",
             state.today_tokens,
             Some(state.today_cost),
-            96.0,
+            top,
             width,
             opacity,
         );
+        top += ROW_STEP_DIP;
+        if today_overflow_visible(state) {
+            self.draw_token_usage_row(
+                "今日超额",
+                state.today_overflow_tokens,
+                Some(state.today_overflow_cost),
+                top,
+                width,
+                opacity,
+            );
+            top += ROW_STEP_DIP;
+        }
         self.draw_token_usage_row(
             "本期使用",
             state.current_period_tokens,
             Some(state.current_period_cost),
-            123.0,
+            top,
             width,
             opacity,
         );
-        self.draw_period_total_value_row(state, 150.0, opacity);
-        self.draw_token_usage_row(
-            "累计使用",
-            state.lifetime_tokens,
-            None,
-            177.0,
-            width,
-            opacity,
-        );
-        self.draw_update_row(state, 204.0, width, opacity);
+        top += ROW_STEP_DIP;
+        if period_overflow_visible(state) {
+            self.draw_token_usage_row(
+                "本期超额",
+                state.current_period_overflow_tokens,
+                Some(state.current_period_overflow_cost),
+                top,
+                width,
+                opacity,
+            );
+            top += ROW_STEP_DIP;
+        }
+        self.draw_period_total_value_row(state, top, opacity);
+        top += ROW_STEP_DIP;
+        self.draw_update_row(state, top, width, opacity);
     }
 
     fn draw_quota_row(
@@ -595,6 +618,8 @@ impl Renderer {
         );
     }
 
+    /// 本期估值行：账号侧估算（绿色，96→140 列）+ 社区参考值（灰字，
+    /// 时间列位置）。两个数值按约定不带文字标注，靠颜色深浅区分。
     fn draw_period_total_value_row(&self, state: &AppState, top: f32, opacity: f32) {
         let estimate = display_period_total_value(state, SystemTime::now());
         self.draw_text_with_opacity(
@@ -621,6 +646,18 @@ impl Renderer {
                 left: 96.0,
                 top,
                 right: 140.0,
+                bottom: top + 23.0,
+            },
+            opacity,
+        );
+        self.draw_text_with_opacity(
+            &format_usd(Some(COMMUNITY_WEEKLY_VALUE_USD)),
+            &self.body_format,
+            &self.brushes.secondary_text,
+            D2D_RECT_F {
+                left: TIME_COLUMN_LEFT,
+                top,
+                right: 200.0,
                 bottom: top + 23.0,
             },
             opacity,

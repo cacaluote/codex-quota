@@ -59,6 +59,42 @@ pub(super) fn display_period_total_value(state: &AppState, now: SystemTime) -> O
     state.period_total_value_estimate
 }
 
+/// 社区参考的周额度美元价值：账号侧估算（本期套餐内已用 ÷ 周已用%）之外
+/// 的第二个参照点。静态常量，不做新鲜度门控。
+pub(super) const COMMUNITY_WEEKLY_VALUE_USD: f64 = 120.0;
+
+/// 面板内容行位：首行顶部与行距（dip）。
+pub(super) const FIRST_ROW_TOP_DIP: f32 = 42.0;
+pub(super) const ROW_STEP_DIP: f32 = 27.0;
+
+/// 超额行是否显示：本机溢出 token 与 credits 实扣任一非零。多设备场景下
+/// 本机 token 可能为 0 而实扣 > 0（其他设备的消耗），必须显示；数据不可靠
+/// （None）视为未发生，面板保持精简——大多数时间没有溢出。
+pub(super) fn today_overflow_visible(state: &AppState) -> bool {
+    overflow_visible(state.today_overflow_tokens, state.today_overflow_cost)
+}
+
+pub(super) fn period_overflow_visible(state: &AppState) -> bool {
+    overflow_visible(
+        state.current_period_overflow_tokens,
+        state.current_period_overflow_cost,
+    )
+}
+
+fn overflow_visible(tokens: Option<u64>, cost: Option<f64>) -> bool {
+    tokens.is_some_and(|value| value > 0) || cost.is_some_and(|value| value > 0.0)
+}
+
+/// 面板高度随超额行数动态收缩：6 行（无溢出，常驻状态）227 dip，7 行
+/// 254，8 行（今日+本期都溢出）281。行位 = 首行顶 + 行距×(n−1)，末行高
+/// 23 + 底边距 27。
+pub(super) fn panel_height_dip(state: &AppState) -> f32 {
+    let rows = 6.0
+        + f32::from(u8::from(today_overflow_visible(state)))
+        + f32::from(u8::from(period_overflow_visible(state)));
+    FIRST_ROW_TOP_DIP + (rows - 1.0) * ROW_STEP_DIP + 50.0
+}
+
 /// The floating ball's glanceable quota: the primary window's remaining, or
 /// the only window of single-window accounts. It reads 0 while any active
 /// window is exhausted — the account cannot serve requests regardless of the
@@ -206,6 +242,52 @@ mod tests {
             window_duration: duration,
             resets_at: UNIX_EPOCH + Duration::from_hours(1),
         }
+    }
+
+    #[test]
+    fn overflow_rows_stay_hidden_until_usage_or_cost_is_nonzero() {
+        // 默认/全零状态精简显示；不可靠（None）同样视为未发生。
+        assert!(!today_overflow_visible(&AppState::default()));
+
+        let zero = AppState {
+            today_overflow_tokens: Some(0),
+            today_overflow_cost: Some(0.0),
+            ..AppState::default()
+        };
+        assert!(!today_overflow_visible(&zero));
+
+        let tokens_only = AppState {
+            today_overflow_tokens: Some(100),
+            ..AppState::default()
+        };
+        assert!(today_overflow_visible(&tokens_only));
+
+        // 多设备：本机 token 为 0 但 credits 实扣 > 0，行必须显示。
+        let cost_only = AppState {
+            today_overflow_tokens: Some(0),
+            today_overflow_cost: Some(0.4),
+            ..AppState::default()
+        };
+        assert!(today_overflow_visible(&cost_only));
+    }
+
+    #[test]
+    fn panel_height_shrinks_with_hidden_overflow_rows() {
+        // 6 行 227 / 7 行 254 / 8 行 281，与 renderer 的行位排布一致。
+        assert!((panel_height_dip(&AppState::default()) - 227.0).abs() < f32::EPSILON);
+
+        let one_overflow_row = AppState {
+            current_period_overflow_tokens: Some(200),
+            ..AppState::default()
+        };
+        assert!((panel_height_dip(&one_overflow_row) - 254.0).abs() < f32::EPSILON);
+
+        let both_overflow_rows = AppState {
+            today_overflow_tokens: Some(1),
+            current_period_overflow_cost: Some(0.4),
+            ..AppState::default()
+        };
+        assert!((panel_height_dip(&both_overflow_rows) - 281.0).abs() < f32::EPSILON);
     }
 
     #[test]

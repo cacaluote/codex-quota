@@ -45,23 +45,6 @@ struct RawAccount {
     plan_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawUsageReadResult {
-    summary: Option<RawUsageSummary>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawUsageSummary {
-    lifetime_tokens: Option<u64>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct LifetimeUsage {
-    pub(super) lifetime: Option<u64>,
-}
-
 pub(super) fn parse_rate_limits_result(
     value: Value,
     received_at: SystemTime,
@@ -95,13 +78,6 @@ pub(super) fn parse_rate_limits_result(
 pub(super) fn parse_account_result(value: Value) -> Result<Option<String>, AppError> {
     let result: RawAccountReadResult = serde_json::from_value(value)?;
     Ok(result.account.and_then(|account| account.plan_type))
-}
-
-pub(super) fn parse_lifetime_usage(value: Value) -> Result<LifetimeUsage, AppError> {
-    let result: RawUsageReadResult = serde_json::from_value(value)?;
-    Ok(LifetimeUsage {
-        lifetime: result.summary.and_then(|summary| summary.lifetime_tokens),
-    })
 }
 
 pub(super) fn local_calendar_date() -> String {
@@ -255,46 +231,9 @@ mod tests {
     fn account_parser_accepts_account_without_plan_type() {
         let result = json!({
             "account": { "type": "apiKey" },
-            "requiresOpenaiAuth": true
+            "requiresOpenAIAuth": true
         });
 
         assert_eq!(parse_account_result(result).ok(), Some(None));
-    }
-
-    #[test]
-    fn usage_parser_reads_lifetime_and_ignores_daily_buckets() {
-        let result = json!({
-            "summary": {
-                "lifetimeTokens": 900_000,
-                "unknownFutureField": true
-            },
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-29", "tokens": 1_000 },
-                { "startDate": "2026-07-30", "tokens": 12_345 },
-                { "startDate": "2026-07-31", "tokens": 67_890 },
-                { "startDate": "2026-08-01", "tokens": 2_000 }
-            ],
-            "unknownFutureField": true
-        });
-
-        assert_eq!(
-            parse_lifetime_usage(result).ok(),
-            Some(LifetimeUsage {
-                lifetime: Some(900_000),
-            })
-        );
-    }
-
-    #[test]
-    fn usage_parser_accepts_null_summary() {
-        let result = json!({
-            "summary": null,
-            "dailyUsageBuckets": null
-        });
-
-        assert_eq!(
-            parse_lifetime_usage(result).ok(),
-            Some(LifetimeUsage { lifetime: None })
-        );
     }
 }

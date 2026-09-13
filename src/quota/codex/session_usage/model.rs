@@ -11,8 +11,9 @@ pub(super) struct UsageCacheV1 {
     pub(super) date: String,
     pub(super) files: Vec<FileCache>,
     pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
-    pub(super) lifetime: Option<LifetimeAggregate>,
-    pub(super) lifetime_sources: Vec<String>,
+    /// 窗口起点前的余额与最新余额分别保留，文件裁剪后仍可重算窗口扣费。
+    #[serde(default)]
+    pub(super) balance_anchors: BalanceAnchors,
 }
 
 impl UsageCacheV1 {
@@ -23,8 +24,7 @@ impl UsageCacheV1 {
             date: String::new(),
             files: Vec::new(),
             latest_rate_limits: None,
-            lifetime: None,
-            lifetime_sources: Vec::new(),
+            balance_anchors: BalanceAnchors::default(),
         }
     }
 }
@@ -48,12 +48,6 @@ pub(super) struct RateLimitSnapshotEntry {
     pub(super) plan_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct LifetimeAggregate {
-    pub(super) tokens: u64,
-    pub(super) reliable: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileCache {
     pub(super) path: String,
@@ -72,6 +66,24 @@ pub(super) struct FileCache {
     pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
     /// 最近一次 `turn_context.payload.model`，用于给后续 `token_count` 事件归属模型。
     pub(super) current_model: Option<String>,
+    /// 本文件解析出的全部 credits 余额观测（含无 Token 明细的纯额度快照），
+    /// 独立于 Token 事件——它们是账户余额时间线的原始素材。
+    #[serde(default)]
+    pub(super) balance_observations: Vec<BalanceObservation>,
+}
+
+/// 账户级 credits 余额的一次观测（溢出池：套餐内消耗不动，溢出请求递减）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(super) struct BalanceObservation {
+    pub(super) timestamp_nanos: i64,
+    pub(super) balance: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(super) struct BalanceAnchors {
+    pub(super) latest: Option<BalanceObservation>,
+    pub(super) before_today: Option<BalanceObservation>,
+    pub(super) before_period: Option<BalanceObservation>,
 }
 
 impl FileCache {
@@ -92,6 +104,7 @@ impl FileCache {
             parse_errors: 0,
             latest_rate_limits: None,
             current_model: None,
+            balance_observations: Vec::new(),
         }
     }
 
@@ -179,7 +192,7 @@ pub(super) struct TokenSignature {
     pub(super) last: Option<TokenCounters>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct TokenEvent {
     pub(super) timestamp_nanos: Option<i64>,
     pub(super) signature: TokenSignature,
@@ -193,6 +206,12 @@ pub(super) struct TokenEvent {
     pub(super) delta_output: u64,
     /// 事件归属的模型（最近一次 `turn_context.payload.model`；会话中途可切换）。
     pub(super) model: Option<String>,
+    /// 事件自带的 codex 额度快照：5h/周窗口进度。服务端封顶 100（10k+ 真实
+    /// 事件无一越界），触顶后冻结不再增长——溢出用量由此可识别。
+    #[serde(default)]
+    pub(super) primary_percent: Option<f64>,
+    #[serde(default)]
+    pub(super) secondary_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime};
 
-pub(crate) const QUOTA_STALE_FLOOR: Duration = Duration::from_mins(30);
+/// 菜单未配置/状态锁损坏时的兜底刷新间隔。
+pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaWindow {
@@ -119,15 +120,22 @@ pub struct AppState {
     pub plan_type: Option<String>,
     pub today_tokens: Option<u64>,
     pub current_period_tokens: Option<u64>,
-    pub lifetime_tokens: Option<u64>,
     pub last_error: Option<String>,
     pub quota_refresh_interval: Duration,
-    /// 今日已用 token 的 API 牌价等价价值（分桶计价；不可靠/无价格表为 None）。
+    /// 今日已用 token 的 API 牌价等价价值（套餐内，分桶计价；不可靠/无价格表为 None）。
     pub today_cost: Option<f64>,
-    /// 本期已用 token 的 API 牌价等价价值。
+    /// 本期已用 token 的 API 牌价等价价值（套餐内）。
     pub current_period_cost: Option<f64>,
-    /// 本期窗口满额的 API 等价价值估算 = 本期已用 ÷ 周额度已用%。
+    /// 本期窗口满额的 API 等价价值估算 = 本期套餐内已用 ÷ 周额度已用%。
     pub period_total_value_estimate: Option<f64>,
+    /// 今日本机溢出用量（触顶后事件的实测 token；不可靠为 None）。
+    pub today_overflow_tokens: Option<u64>,
+    /// 今日 credits 实扣折算美元（账户级，×$0.04/积分；不可靠为 None）。
+    pub today_overflow_cost: Option<f64>,
+    /// 本期本机溢出用量（实测）。
+    pub current_period_overflow_tokens: Option<u64>,
+    /// 本期 credits 实扣折算美元（账户级）。
+    pub current_period_overflow_cost: Option<f64>,
 }
 
 impl Default for AppState {
@@ -138,22 +146,26 @@ impl Default for AppState {
             plan_type: None,
             today_tokens: None,
             current_period_tokens: None,
-            lifetime_tokens: None,
             last_error: None,
             quota_refresh_interval: Duration::from_mins(5),
             today_cost: None,
             current_period_cost: None,
             period_total_value_estimate: None,
+            today_overflow_tokens: None,
+            today_overflow_cost: None,
+            current_period_overflow_tokens: None,
+            current_period_overflow_cost: None,
         }
     }
 }
 
 impl AppState {
+    /// 显示门控阈值 = 2×刷新间隔。按需拉取在 1×间隔就已触发（见 codex
+    /// 侧 `local_pull_threshold`），正常情况下新快照在数据被判过期前到位；
+    /// 超过 2×间隔仍无新快照说明拉取持续失败，百分比/本期/估值扣成 --。
     #[must_use]
     pub fn stale_after(&self) -> Duration {
-        self.quota_refresh_interval
-            .saturating_mul(2)
-            .max(QUOTA_STALE_FLOOR)
+        self.quota_refresh_interval.saturating_mul(2)
     }
 
     #[must_use]
@@ -273,24 +285,25 @@ mod tests {
     }
 
     #[test]
-    fn stale_threshold_has_a_thirty_minute_floor() {
+    fn stale_threshold_is_twice_the_interval_even_below_the_old_floor() {
         let state = AppState {
             quota_refresh_interval: Duration::from_mins(1),
             ..AppState::default()
         };
 
-        assert_eq!(state.stale_after(), QUOTA_STALE_FLOOR);
+        assert_eq!(state.stale_after(), Duration::from_mins(2));
     }
 
     #[test]
     fn snapshot_stays_fresh_until_the_stale_threshold() {
+        // 2N 门控：间隔 1 分钟时，年龄 1 分钟 < 2 分钟，仍未过期。
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
                 limit_id: "codex".to_owned(),
                 primary: window(10.0),
                 secondary: None,
-                received_at: now - Duration::from_mins(29),
+                received_at: now - Duration::from_mins(1),
             }),
             quota_refresh_interval: Duration::from_mins(1),
             ..AppState::default()

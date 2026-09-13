@@ -257,6 +257,7 @@ impl AppWindow {
                 animation,
                 sample.expansion,
                 self.dpi,
+                self.panel_height(),
                 self.config.placement.edge,
                 self.expansion_alignment,
             );

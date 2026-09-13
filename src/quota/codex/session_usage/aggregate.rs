@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use super::model::{FileCache, ParentLink, TokenEvent, TokenSignature};
-use super::parser::event_is_on_date;
+use super::model::{BalanceObservation, FileCache, ParentLink, TokenEvent, TokenSignature};
+use super::parser::{event_is_on_date, ts_is_on_date};
 use crate::quota::pricing::PriceTable;
 
 impl ModelVolumes {
@@ -72,18 +72,6 @@ fn accumulate_volume(
     volume.output = volume.output.saturating_add(output);
 }
 
-fn merge_volumes(target: &mut ModelVolumes, source: ModelVolumes) {
-    for (model, volume) in source.0 {
-        accumulate_volume(
-            target,
-            model.as_deref(),
-            volume.uncached_input,
-            volume.cached_input,
-            volume.output,
-        );
-    }
-}
-
 pub(super) fn cache_has_tokens_on_date(cache: &FileCache, date: &str) -> bool {
     cache
         .events
@@ -91,15 +79,35 @@ pub(super) fn cache_has_tokens_on_date(cache: &FileCache, date: &str) -> bool {
         .any(|event| event.delta_total > 0 && event_is_on_date(event, date))
 }
 
+/// 单窗口聚合结果。`tokens`/`volumes` 是套餐内用量（不含余额溢出），
+/// `overflow_tokens` 是本机触顶后的溢出用量，两者相加等于窗口内全部实际
+/// 用量；`credits_spent` 是窗口内 credits 实扣（账户级观测，含其他设备的
+/// 消耗，与本地 token 口径不同——它回答“余额付了多少钱”而非“值多少钱”）。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(super) struct WindowAggregate {
+    pub(super) tokens: u64,
+    pub(super) reliable: bool,
+    pub(super) deferred_files: usize,
+    pub(super) volumes: ModelVolumes,
+    pub(super) overflow_tokens: u64,
+    pub(super) credits_spent: f64,
+}
+
 pub(super) fn aggregate_today(
     date: &str,
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-) -> (u64, bool, usize, ModelVolumes) {
-    aggregate_usage(selected, caches, rollout_index, |event| {
-        event_is_on_date(event, date)
-    })
+    balance_baseline: Option<BalanceObservation>,
+) -> WindowAggregate {
+    aggregate_usage(
+        selected,
+        caches,
+        rollout_index,
+        |event| event_is_on_date(event, date),
+        |timestamp| ts_is_on_date(timestamp, date),
+        balance_baseline,
+    )
 }
 
 pub(super) fn aggregate_period(
@@ -107,12 +115,20 @@ pub(super) fn aggregate_period(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
-) -> (u64, bool, usize, ModelVolumes) {
-    aggregate_usage(selected, caches, rollout_index, |event| {
-        event
-            .timestamp_nanos
-            .is_some_and(|timestamp| timestamp >= start_nanos)
-    })
+    balance_baseline: Option<BalanceObservation>,
+) -> WindowAggregate {
+    aggregate_usage(
+        selected,
+        caches,
+        rollout_index,
+        |event| {
+            event
+                .timestamp_nanos
+                .is_some_and(|timestamp| timestamp >= start_nanos)
+        },
+        |timestamp| timestamp.is_some_and(|value| value >= start_nanos),
+        balance_baseline,
+    )
 }
 
 pub(super) fn cache_has_tokens_in_period(cache: &FileCache, start_nanos: i64) -> bool {
@@ -124,33 +140,28 @@ pub(super) fn cache_has_tokens_in_period(cache: &FileCache, start_nanos: i64) ->
     })
 }
 
-pub(super) fn aggregate_lifetime(
-    selected: &HashSet<String>,
-    caches: &HashMap<String, FileCache>,
-    rollout_index: &HashMap<String, Vec<String>>,
-) -> (u64, bool) {
-    // 累计价值暂不显示，分桶在这里被丢弃。
-    let (tokens, reliable, _, _) = aggregate_usage(selected, caches, rollout_index, |_| true);
-    (tokens, reliable)
-}
-
-fn aggregate_usage<F>(
+fn aggregate_usage<F, G>(
     selected: &HashSet<String>,
     caches: &HashMap<String, FileCache>,
     rollout_index: &HashMap<String, Vec<String>>,
     includes: F,
-) -> (u64, bool, usize, ModelVolumes)
+    includes_ts: G,
+    balance_baseline: Option<BalanceObservation>,
+) -> WindowAggregate
 where
     F: Fn(&TokenEvent) -> bool,
+    G: Fn(Option<i64>) -> bool,
 {
-    let mut reliable = true;
-    let mut deferred_files = 0usize;
+    let mut aggregate = WindowAggregate {
+        reliable: true,
+        ..WindowAggregate::default()
+    };
     let mut groups: HashMap<String, Vec<&FileCache>> = HashMap::new();
 
     for key in selected {
         let Some(cache) = caches.get(key) else {
-            reliable = false;
-            deferred_files = deferred_files.saturating_add(1);
+            aggregate.reliable = false;
+            aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             continue;
         };
         let has_usage = cache
@@ -159,35 +170,34 @@ where
             .any(|event| event.delta_total > 0 && includes(event));
         let Some(root) = cache.root.as_ref() else {
             if has_usage || cache.uncertain {
-                reliable = false;
-                deferred_files = deferred_files.saturating_add(1);
+                aggregate.reliable = false;
+                aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             }
             continue;
         };
         if root.provider.as_deref() != Some("openai") {
             if root.provider.is_none() && has_usage {
-                reliable = false;
-                deferred_files = deferred_files.saturating_add(1);
+                aggregate.reliable = false;
+                aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             }
             continue;
         }
         if cache.uncertain || cache.token_without_timestamp {
-            reliable = false;
-            deferred_files = deferred_files.saturating_add(1);
+            aggregate.reliable = false;
+            aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             continue;
         }
         let Some(thread_id) = root.thread_id.as_ref() else {
             if has_usage {
-                reliable = false;
-                deferred_files = deferred_files.saturating_add(1);
+                aggregate.reliable = false;
+                aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             }
             continue;
         };
         groups.entry(thread_id.clone()).or_default().push(cache);
     }
 
-    let mut total = 0u64;
-    let mut volumes = ModelVolumes::default();
+    let mut observations: Vec<(i64, f64)> = Vec::new();
     for files in groups.values_mut() {
         files.sort_by_key(|file| std::cmp::Reverse(file.events.len()));
         let Some(canonical) = files.first().copied() else {
@@ -198,14 +208,17 @@ where
             .skip(1)
             .all(|other| event_prefix_matches(&other.events, &canonical.events))
         {
-            match replayed_usage(canonical, caches, rollout_index, &includes) {
-                Ok((sum, group_volumes)) => {
-                    total = total.saturating_add(sum);
-                    merge_volumes(&mut volumes, group_volumes);
+            match replay_prefix(canonical, caches, rollout_index) {
+                Ok(prefix) => {
+                    tally_timeline(
+                        canonical,
+                        prefix,
+                        &includes,
+                        &mut aggregate,
+                        &mut observations,
+                    );
                 }
-                Err(()) => {
-                    defer_timeline(canonical, &includes, &mut reliable, &mut deferred_files);
-                }
+                Err(()) => defer_timeline(canonical, &includes, &mut aggregate),
             }
             continue;
         }
@@ -221,58 +234,58 @@ where
                     .iter()
                     .any(|event| event.delta_total > 0 && includes(event))
             }) {
-                reliable = false;
-                deferred_files = deferred_files.saturating_add(1);
+                aggregate.reliable = false;
+                aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
             }
             continue;
         };
         for chain in chains {
-            match replayed_usage(chain, caches, rollout_index, &includes) {
-                Ok((sum, chain_volumes)) => {
-                    total = total.saturating_add(sum);
-                    merge_volumes(&mut volumes, chain_volumes);
+            match replay_prefix(chain, caches, rollout_index) {
+                Ok(prefix) => {
+                    tally_timeline(chain, prefix, &includes, &mut aggregate, &mut observations);
                 }
-                Err(()) => defer_timeline(chain, &includes, &mut reliable, &mut deferred_files),
+                Err(()) => defer_timeline(chain, &includes, &mut aggregate),
             }
         }
     }
-    (total, reliable, deferred_files, volumes)
+    // 窗口内没有更早的观测时，持久化的账户余额基线（可能来自已被裁剪的
+    // 旧文件）作为时间线起点播种——“空档后的下降归入首次观测日”靠它落地。
+    if let Some(baseline) = balance_baseline {
+        observations.push((baseline.timestamp_nanos, baseline.balance));
+    }
+    // 余额观测来自不同线程组的并行会话，必须先按时间排序成账户级时间线，
+    // 否则同一笔扣费的重复观测无法相邻抵消。
+    observations.sort_by_key(|(timestamp, _)| *timestamp);
+    aggregate.credits_spent = credits_debits(&observations, &includes_ts);
+    aggregate
 }
 
-fn replayed_usage<F>(
-    cache: &FileCache,
-    caches: &HashMap<String, FileCache>,
-    rollout_index: &HashMap<String, Vec<String>>,
-    includes: &F,
-) -> Result<(u64, ModelVolumes), ()>
+/// credits 余额观测合并成账户级时间线后取负跳变：并行会话对同一笔扣费的
+/// 重复观测排序后同值相邻（差为 0），不会重复计入；赠送的正跳变不计。
+/// 扣费归属到观测到它的后一个事件所在窗口——长空档后看到的下降（其他
+/// 设备消耗）因此落在空档后的第一个事件上，与实测行为一致。
+///
+/// 阈值只挡浮点噪声：余额字符串带 10 位小数，同值重复观测的差分精确为 0，
+/// 解析误差量级 ~1e-12；真实扣费实测最小也在 1e-3 credits 量级。原 0.005
+/// 的阈值会整段丢弃小额扣费且不累计余量，已按原始精度保留。
+const BALANCE_EPSILON: f64 = 1e-6;
+
+fn credits_debits<G>(observations: &[(i64, f64)], includes_ts: &G) -> f64
 where
-    F: Fn(&TokenEvent) -> bool,
+    G: Fn(Option<i64>) -> bool,
 {
-    let prefix = replay_prefix(cache, caches, rollout_index)?;
-    let mut volumes = ModelVolumes::default();
-    let total = cache.events.iter().skip(prefix).fold(0u64, |sum, event| {
-        if includes(event) {
-            accumulate_volume(
-                &mut volumes,
-                event.model.as_deref(),
-                event.delta_uncached_input,
-                event.delta_cached_input,
-                event.delta_output,
-            );
-            sum.saturating_add(event.delta_total)
-        } else {
-            sum
+    let mut spent = 0.0;
+    for pair in observations.windows(2) {
+        let delta = pair[1].1 - pair[0].1;
+        if delta < -BALANCE_EPSILON && includes_ts(Some(pair[1].0)) {
+            spent -= delta;
         }
-    });
-    Ok((total, volumes))
+    }
+    spent
 }
 
-fn defer_timeline<F>(
-    cache: &FileCache,
-    includes: &F,
-    reliable: &mut bool,
-    deferred_files: &mut usize,
-) where
+fn defer_timeline<F>(cache: &FileCache, includes: &F, aggregate: &mut WindowAggregate)
+where
     F: Fn(&TokenEvent) -> bool,
 {
     if cache
@@ -280,8 +293,67 @@ fn defer_timeline<F>(
         .iter()
         .any(|event| event.delta_total > 0 && includes(event))
     {
-        *reliable = false;
-        *deferred_files = deferred_files.saturating_add(1);
+        aggregate.reliable = false;
+        aggregate.deferred_files = aggregate.deferred_files.saturating_add(1);
+    }
+}
+
+/// 服务端把窗口进度封顶在 100（10k+ 真实事件无一越界）；触顶即视为满。
+fn window_capped(event: &TokenEvent) -> bool {
+    const CAPPED_PERCENT: f64 = 99.99;
+    event
+        .primary_percent
+        .is_some_and(|percent| percent >= CAPPED_PERCENT)
+        || event
+            .secondary_percent
+            .is_some_and(|percent| percent >= CAPPED_PERCENT)
+}
+
+/// 遍历一条时间线：余额观测取自文件级采集列表（含重放区域，排序合并后
+/// 自然去重），用量按溢出标记分计。溢出判定：前一事件报告触顶且本事件
+/// 仍触顶——溢出用量不推进冻结的进度；进度回落说明窗口已被服务端重置，
+/// 其后的事件回到套餐内。时间线首事件没有前值，以自身报告触顶为准（覆盖
+/// 文件从溢出中段开始写入的场景）；跨界请求（把进度从 <100 顶到 100）按
+/// 套餐内计，误差以一个请求为界。
+fn tally_timeline<F>(
+    cache: &FileCache,
+    prefix: usize,
+    includes: &F,
+    aggregate: &mut WindowAggregate,
+    observations: &mut Vec<(i64, f64)>,
+) where
+    F: Fn(&TokenEvent) -> bool,
+{
+    observations.extend(
+        cache
+            .balance_observations
+            .iter()
+            .map(|observation| (observation.timestamp_nanos, observation.balance)),
+    );
+    let mut previous_capped = false;
+    for (index, event) in cache.events.iter().enumerate() {
+        let capped_now = window_capped(event);
+        let overflow = if index == 0 {
+            capped_now
+        } else {
+            previous_capped && capped_now
+        };
+        previous_capped = capped_now;
+        if index < prefix || !includes(event) || event.delta_total == 0 {
+            continue;
+        }
+        if overflow {
+            aggregate.overflow_tokens = aggregate.overflow_tokens.saturating_add(event.delta_total);
+        } else {
+            aggregate.tokens = aggregate.tokens.saturating_add(event.delta_total);
+            accumulate_volume(
+                &mut aggregate.volumes,
+                event.model.as_deref(),
+                event.delta_uncached_input,
+                event.delta_cached_input,
+                event.delta_output,
+            );
+        }
     }
 }
 

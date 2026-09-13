@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aggregate::{
-    ModelVolumes, aggregate_lifetime, aggregate_period, aggregate_today,
-    cache_has_tokens_in_period, cache_has_tokens_on_date,
+    ModelVolumes, WindowAggregate, aggregate_period, aggregate_today, cache_has_tokens_in_period,
+    cache_has_tokens_on_date,
 };
 use files::{
     codex_home, discover_candidates, inspect_changed_candidates, is_date_partition,
@@ -19,8 +19,8 @@ use files::{
     save_cache,
 };
 use model::{
-    CandidateFile, FileCache, LifetimeAggregate, ParentLink, RateLimitSnapshotEntry,
-    RateLimitWindowEntry, UsageCacheV1,
+    BalanceAnchors, BalanceObservation, CandidateFile, FileCache, ParentLink,
+    RateLimitSnapshotEntry, RateLimitWindowEntry, UsageCacheV1,
 };
 use parser::{event_is_on_date, system_time_from_unix_nanos, update_candidate_cache};
 use watcher::SessionChangeWatcher;
@@ -29,23 +29,28 @@ use super::PeriodBoundary;
 use super::protocol::{local_calendar_date, local_calendar_date_at};
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-// Reparse persisted deltas calculated before model-aware duplicate detection.
-const CACHE_VERSION: u32 = 4;
+// v7: 分别保留今日/本期起点前的余额；重扫旧日志恢复 v6 覆盖掉的基线。
+const CACHE_VERSION: u32 = 7;
 const CACHE_FILENAME: &str = "usage-cache-v1.json";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LocalUsageSnapshot {
+    /// 套餐内 token 用量（不含余额溢出）。
     pub(super) today_tokens: u64,
+    /// 本机触顶后的溢出用量（实测）。
+    pub(super) today_overflow_tokens: u64,
+    /// 今日 credits 实扣（账户级观测，含其他设备的消耗）。
+    pub(super) today_credits_spent: f64,
     pub(super) today_reliable: bool,
     pub(super) current_period_tokens: u64,
+    pub(super) current_period_overflow_tokens: u64,
+    pub(super) current_period_credits_spent: f64,
     pub(super) current_period_reliable: bool,
-    /// 分桶用量（reliable 才有），用于按模型计价。
+    /// 套餐内分桶用量（reliable 才有），用于按模型计价。
     pub(super) today_volume: Option<ModelVolumes>,
     pub(super) period_volume: Option<ModelVolumes>,
     pub(super) quota: Option<QuotaSnapshot>,
     pub(super) plan_type: Option<String>,
-    pub(super) lifetime_tokens: Option<u64>,
-    pub(super) lifetime_reliable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -137,7 +142,6 @@ struct ScanContext {
     caches: HashMap<String, FileCache>,
     today_selected: HashSet<String>,
     period_selected: HashSet<String>,
-    lifetime_selected: HashSet<String>,
     dependencies: HashSet<String>,
     diagnostics: RefreshDiagnostics,
     cache_dirty: bool,
@@ -151,17 +155,12 @@ struct ScanResult {
     selected: HashSet<String>,
     dependencies: HashSet<String>,
     latest_rate_limits: Option<RateLimitSnapshotEntry>,
-    lifetime: Option<LifetimeAggregate>,
-    lifetime_sources: Option<Vec<String>>,
+    balance_anchors: BalanceAnchors,
     cache_dirty: bool,
 }
 
 struct DerivedQuota {
     latest_rate_limits: Option<RateLimitSnapshotEntry>,
-    lifetime: Option<LifetimeAggregate>,
-    /// Contributor paths when the lifetime was recomputed this scan;
-    /// `None` when the previous aggregate is carried forward.
-    lifetime_sources: Option<Vec<String>>,
 }
 
 impl ScanContext {
@@ -172,7 +171,7 @@ impl ScanContext {
         cached_files: Vec<FileCache>,
     ) -> Result<Self, SessionUsageError> {
         let discovery = discover_candidates(codex_dir)?;
-        let mut context = Self::from_candidates(
+        let context = Self::from_candidates(
             today,
             boundary,
             cached_files,
@@ -181,9 +180,6 @@ impl ScanContext {
             0,
             RefreshMode::FullScan,
         );
-        // A full scan is the only place that sees every candidate, so it also
-        // feeds the lifetime aggregation and the newest rate-limit snapshot.
-        context.lifetime_selected = context.candidate_by_path.keys().cloned().collect();
         Ok(context)
     }
 
@@ -293,7 +289,6 @@ impl ScanContext {
             caches,
             today_selected,
             period_selected,
-            lifetime_selected: HashSet::new(),
             dependencies: HashSet::new(),
             diagnostics: RefreshDiagnostics {
                 mode,
@@ -319,10 +314,12 @@ impl ScanContext {
         self.parse_roots(selected_roots, &mut dependencies);
         self.dependencies = dependencies;
 
-        if !self.lifetime_selected.is_empty() {
-            let lifetime_roots: Vec<String> = self.lifetime_selected.iter().cloned().collect();
-            let mut lifetime_dependencies = HashSet::new();
-            self.parse_roots(lifetime_roots, &mut lifetime_dependencies);
+        // 全量扫描解析所有候选文件（增量扫描只解析选中与依赖文件）：额度
+        // 快照可能躺在未被今日/本期选中的旧文件里——数日未用 codex 后的
+        // 首次扫描仍要能取到最近一条快照。已缓存文件按 offset 续读，成本可控。
+        if self.diagnostics.mode == RefreshMode::FullScan {
+            let all_roots: Vec<String> = self.candidate_by_path.keys().cloned().collect();
+            self.parse_roots(all_roots, &mut HashSet::new());
         }
     }
 
@@ -356,14 +353,10 @@ impl ScanContext {
         }
     }
 
-    fn derive_quota_and_lifetime(
-        &self,
-        previous_rate_limits: Option<RateLimitSnapshotEntry>,
-        previous_lifetime: Option<LifetimeAggregate>,
-    ) -> DerivedQuota {
+    fn derive_quota(&self, previous_rate_limits: Option<RateLimitSnapshotEntry>) -> DerivedQuota {
         // Only files that still exist on disk may contribute: a cache entry
-        // whose file was deleted must not keep feeding the snapshot or the
-        // lifetime total until the next trim.
+        // whose file was deleted must not keep feeding the snapshot until
+        // the next trim.
         let live_keys: HashSet<&String> = self
             .caches
             .keys()
@@ -390,24 +383,8 @@ impl ScanContext {
         } else {
             previous_rate_limits
         };
-        let latest_rate_limits = newest_rate_limit_entry(carried_rate_limits, scan_latest);
-        if self.diagnostics.mode == RefreshMode::FullScan && candidates_complete {
-            let selected: HashSet<String> = live_keys.into_iter().cloned().collect();
-            let (tokens, reliable) =
-                aggregate_lifetime(&selected, &self.caches, &self.rollout_index);
-            let mut lifetime_sources: Vec<String> = selected.into_iter().collect();
-            lifetime_sources.sort();
-            DerivedQuota {
-                latest_rate_limits,
-                lifetime: Some(LifetimeAggregate { tokens, reliable }),
-                lifetime_sources: Some(lifetime_sources),
-            }
-        } else {
-            DerivedQuota {
-                latest_rate_limits,
-                lifetime: previous_lifetime,
-                lifetime_sources: None,
-            }
+        DerivedQuota {
+            latest_rate_limits: newest_rate_limit_entry(carried_rate_limits, scan_latest),
         }
     }
 
@@ -424,60 +401,59 @@ impl ScanContext {
         boundary: Option<&PeriodBoundary>,
         reused: Option<(LocalUsageSnapshot, usize)>,
         previous_rate_limits: Option<RateLimitSnapshotEntry>,
-        previous_lifetime: Option<LifetimeAggregate>,
+        previous_balance_anchors: BalanceAnchors,
     ) -> ScanResult {
+        // 在聚合和裁剪前确定基线：冷启动也能使用本次读到的历史观测。
+        let balance_anchors =
+            window_balance_anchors(&self.caches, previous_balance_anchors, today, boundary);
         let mut snapshot = if let Some((snapshot, deferred_files)) = reused {
             self.diagnostics.aggregation_skipped = true;
             self.diagnostics.deferred_files = deferred_files;
             snapshot
         } else {
-            let (today_tokens, today_aggregate_reliable, today_deferred, today_volumes) =
-                aggregate_today(
-                    today,
-                    &self.today_selected,
+            let today = aggregate_today(
+                today,
+                &self.today_selected,
+                &self.caches,
+                &self.rollout_index,
+                balance_anchors.before_today,
+            );
+            let today_reliable = today.reliable && self.diagnostics.discovery_errors == 0;
+            let period = boundary.map_or_else(WindowAggregate::default, |boundary| {
+                // 窗口内本机没有任何会话文件痕迹时，本期就是可靠的 0
+                // （与今日口径一致）；只有存在文件却锚定不到窗口起点时
+                // 才保守显示 --（日志可能未覆盖窗口开头）。
+                let anchored = self.period_selected.is_empty()
+                    || period_has_openai_start_file(&self.caches, &self.period_selected, boundary);
+                let mut period = aggregate_period(
+                    boundary.start_nanos(),
+                    &self.period_selected,
                     &self.caches,
                     &self.rollout_index,
+                    balance_anchors.before_period,
                 );
-            let today_reliable = today_aggregate_reliable && self.diagnostics.discovery_errors == 0;
-            let (current_period_tokens, current_period_reliable, period_deferred, period_volumes) =
-                boundary.map_or((0, false, 0, ModelVolumes::default()), |boundary| {
-                    // 窗口内本机没有任何会话文件痕迹时，本期就是可靠的 0
-                    // （与今日口径一致）；只有存在文件却锚定不到窗口起点时
-                    // 才保守显示 --（日志可能未覆盖窗口开头）。
-                    let anchored = self.period_selected.is_empty()
-                        || period_has_openai_start_file(
-                            &self.caches,
-                            &self.period_selected,
-                            boundary,
-                        );
-                    let (tokens, reliable, deferred, period_volumes) = aggregate_period(
-                        boundary.start_nanos(),
-                        &self.period_selected,
-                        &self.caches,
-                        &self.rollout_index,
-                    );
-                    (
-                        tokens,
-                        anchored && reliable && self.diagnostics.discovery_errors == 0,
-                        deferred,
-                        period_volumes,
-                    )
-                });
-            self.diagnostics.deferred_files = today_deferred.saturating_add(period_deferred);
+                period.reliable =
+                    anchored && period.reliable && self.diagnostics.discovery_errors == 0;
+                period
+            });
+            self.diagnostics.deferred_files =
+                today.deferred_files.saturating_add(period.deferred_files);
             LocalUsageSnapshot {
-                today_tokens,
+                today_tokens: today.tokens,
+                today_overflow_tokens: today.overflow_tokens,
+                today_credits_spent: today.credits_spent,
                 today_reliable,
-                current_period_tokens,
-                current_period_reliable,
-                today_volume: today_reliable.then_some(today_volumes),
-                period_volume: current_period_reliable.then_some(period_volumes),
+                current_period_tokens: period.tokens,
+                current_period_overflow_tokens: period.overflow_tokens,
+                current_period_credits_spent: period.credits_spent,
+                current_period_reliable: period.reliable,
+                today_volume: today_reliable.then_some(today.volumes),
+                period_volume: period.reliable.then_some(period.volumes),
                 quota: None,
                 plan_type: None,
-                lifetime_tokens: None,
-                lifetime_reliable: false,
             }
         };
-        let derived = self.derive_quota_and_lifetime(previous_rate_limits, previous_lifetime);
+        let derived = self.derive_quota(previous_rate_limits);
         snapshot.quota = derived
             .latest_rate_limits
             .as_ref()
@@ -486,15 +462,6 @@ impl ScanContext {
             .latest_rate_limits
             .as_ref()
             .and_then(|entry| entry.plan_type.clone());
-        snapshot.lifetime_tokens = derived
-            .lifetime
-            .as_ref()
-            .filter(|aggregate| aggregate.reliable)
-            .map(|aggregate| aggregate.tokens);
-        snapshot.lifetime_reliable = derived
-            .lifetime
-            .as_ref()
-            .is_some_and(|aggregate| aggregate.reliable);
         let selected = self.selected();
         self.diagnostics.parse_errors = selected
             .iter()
@@ -517,11 +484,65 @@ impl ScanContext {
             selected,
             dependencies,
             latest_rate_limits: derived.latest_rate_limits,
-            lifetime: derived.lifetime,
-            lifetime_sources: derived.lifetime_sources,
+            balance_anchors,
             cache_dirty: self.cache_dirty,
         }
     }
+}
+
+/// 当前窗口内的新余额不能覆盖窗口开始前的基线；滚动到新窗口时再按
+/// 时间筛选。旧文件被裁剪后，持久化的三个观测仍可参与下一次筛选。
+fn window_balance_anchors(
+    caches: &HashMap<String, FileCache>,
+    previous: BalanceAnchors,
+    today: &str,
+    boundary: Option<&PeriodBoundary>,
+) -> BalanceAnchors {
+    let observations = caches
+        .values()
+        .filter(|cache| {
+            cache
+                .root
+                .as_ref()
+                .is_some_and(|root| root.provider.as_deref() == Some("openai"))
+        })
+        .flat_map(|cache| cache.balance_observations.iter())
+        .copied()
+        .chain(
+            [
+                previous.latest,
+                previous.before_today,
+                previous.before_period,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    let mut anchors = BalanceAnchors {
+        // 快照暂时过期时保留本期锚点，窗口重新确认后再筛选。
+        before_period: boundary
+            .is_none()
+            .then_some(previous.before_period)
+            .flatten(),
+        ..BalanceAnchors::default()
+    };
+    for observation in observations {
+        let keep_latest = |slot: &mut Option<BalanceObservation>| {
+            if slot.is_none_or(|current| observation.timestamp_nanos > current.timestamp_nanos) {
+                *slot = Some(observation);
+            }
+        };
+        keep_latest(&mut anchors.latest);
+        if system_time_from_unix_nanos(observation.timestamp_nanos)
+            .and_then(local_calendar_date_at)
+            .is_some_and(|date| date.as_str() < today)
+        {
+            keep_latest(&mut anchors.before_today);
+        }
+        if boundary.is_some_and(|boundary| observation.timestamp_nanos < boundary.start_nanos()) {
+            keep_latest(&mut anchors.before_period);
+        }
+    }
+    anchors
 }
 
 /// 本期窗口起点当天是否存在 openai 会话痕迹：没有锚定痕迹时“本期”的
@@ -753,19 +774,18 @@ impl SessionUsageTracker {
             .map(|cache| cache.path.clone())
             .collect();
         let previous_rate_limits = self.cache.latest_rate_limits.clone();
-        let previous_lifetime = self.cache.lifetime.clone();
-        let previous_lifetime_sources = self.cache.lifetime_sources.clone();
+        // 文件删除不影响余额观测的有效性（账户级历史事实），基线始终保留。
+        let previous_balance_anchors = self.cache.balance_anchors;
 
         let discovery_started = Instant::now();
         let mut scan = self.build_scan(full_scan, &codex_dir, date, period_boundary)?;
         // A cached file that no longer exists invalidates the carried
-        // snapshot and lifetime totals: discard them and let the promoted
-        // full scan recompute both from the surviving files only.
+        // snapshot: discard it and let the promoted full scan recompute it
+        // from the surviving files only.
         let (promoted_scan, cached_paths_dropped) = rebalance_scan_after_deletions(
             scan,
             full_scan,
             &previous_cache_paths,
-            &previous_lifetime_sources,
             &codex_dir,
             date,
             period_boundary,
@@ -773,9 +793,6 @@ impl SessionUsageTracker {
         scan = promoted_scan;
         let previous_rate_limits = (!cached_paths_dropped)
             .then_some(previous_rate_limits)
-            .flatten();
-        let previous_lifetime = (!cached_paths_dropped)
-            .then_some(previous_lifetime)
             .flatten();
         scan.diagnostics.discovery_elapsed = discovery_started.elapsed();
 
@@ -793,33 +810,28 @@ impl SessionUsageTracker {
             selected,
             dependencies,
             latest_rate_limits,
-            lifetime,
-            lifetime_sources,
+            balance_anchors,
             cache_dirty,
         } = scan.finish(
             date,
             period_boundary,
             reused,
             previous_rate_limits.clone(),
-            previous_lifetime.clone(),
+            previous_balance_anchors,
         );
         let mut cache_dirty = cache_dirty;
         diagnostics.aggregation_elapsed = aggregation_started.elapsed();
         let retained_paths: HashSet<_> = files.iter().map(|cache| cache.path.clone()).collect();
         cache_dirty |= cache_date_changed
             || retained_paths != previous_cache_paths
-            || previous_rate_limits != latest_rate_limits
-            || previous_lifetime != lifetime;
+            || previous_rate_limits != latest_rate_limits;
         self.cache.version = CACHE_VERSION;
         self.cache.codex_home = path_key(&codex_dir);
         date.clone_into(&mut self.cache.date);
         self.cache.files = files;
         self.cache.latest_rate_limits = latest_rate_limits;
-        self.cache.lifetime = lifetime;
-        if let Some(lifetime_sources) = lifetime_sources {
-            cache_dirty |= lifetime_sources != self.cache.lifetime_sources;
-            self.cache.lifetime_sources = lifetime_sources;
-        }
+        cache_dirty |= self.cache.balance_anchors != balance_anchors;
+        self.cache.balance_anchors = balance_anchors;
         self.candidate_index = candidate_index;
 
         self.write_cache(&mut diagnostics, cache_dirty);
@@ -882,15 +894,13 @@ fn load_valid_cache(cache_path: Option<&Path>, codex_dir: Option<&Path>) -> Usag
         .unwrap_or_else(|| UsageCacheV1::empty(codex_dir))
 }
 
-/// Detects cached or lifetime-contributing files that disappeared from disk.
-/// Returns the scan to use (an incremental scan is promoted to a full scan so
-/// the carried snapshot and lifetime totals are recomputed from surviving
-/// files) and whether any referenced path was dropped.
+/// Detects cached files that disappeared from disk. Returns the scan to use
+/// (an incremental scan is promoted to a full scan so the carried snapshot is
+/// recomputed from surviving files) and whether any referenced path dropped.
 fn rebalance_scan_after_deletions(
     scan: ScanContext,
     full_scan: bool,
     previous_cache_paths: &HashSet<String>,
-    previous_lifetime_sources: &[String],
     codex_dir: &Path,
     date: &str,
     period_boundary: Option<&PeriodBoundary>,
@@ -900,7 +910,6 @@ fn rebalance_scan_after_deletions(
     }
     let dropped = previous_cache_paths
         .iter()
-        .chain(previous_lifetime_sources.iter())
         .any(|path| !scan.candidate_by_path.contains_key(path));
     if !dropped || full_scan {
         return Ok((scan, dropped));
@@ -1110,6 +1119,36 @@ mod test_support {
         })
     }
 
+    /// 带窗口进度与 credits 余额的快照（余额为高精度十进制字符串，与真实
+    /// 日志一致）；`secondary`/`balance` 传 `None` 时对应字段为 null/缺失。
+    pub(super) fn codex_rate_limits_with_credits(
+        primary_percent: f64,
+        secondary_percent: Option<f64>,
+        balance: Option<&str>,
+    ) -> Value {
+        let mut limits = json!({
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": primary_percent,
+                "window_minutes": 300,
+                "resets_at": 2_000_000_000
+            },
+            "secondary": secondary_percent.map(|percent| {
+                json!({
+                    "used_percent": percent,
+                    "window_minutes": 10_080,
+                    "resets_at": 2_000_000_000
+                })
+            }),
+            "plan_type": "plus"
+        });
+        if let Some(balance) = balance {
+            limits["credits"] =
+                json!({ "has_credits": true, "unlimited": false, "balance": balance });
+        }
+        limits
+    }
+
     pub(super) fn turn_context_model(timestamp: &str, model: &str) -> Value {
         json!({
             "timestamp": timestamp,
@@ -1195,6 +1234,7 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
 
+    use super::aggregate::TokenVolume;
     use super::parser::{parse_timestamp_nanos, system_time_from_unix_nanos};
     use super::test_support::*;
     use super::*;
@@ -1587,7 +1627,6 @@ mod tests {
             caches: HashMap::new(),
             today_selected: HashSet::new(),
             period_selected: HashSet::new(),
-            lifetime_selected: HashSet::new(),
             dependencies: HashSet::new(),
             diagnostics: RefreshDiagnostics {
                 discovery_errors: 1,
@@ -1596,36 +1635,11 @@ mod tests {
             cache_dirty: false,
         };
 
-        let snapshot = scan.finish("2026-08-10", None, None, None, None).snapshot;
+        let snapshot = scan
+            .finish("2026-08-10", None, None, None, BalanceAnchors::default())
+            .snapshot;
 
         assert!(!snapshot.today_reliable);
-    }
-
-    #[test]
-    fn lifetime_sums_sequential_resume_rollouts_of_same_thread() {
-        let context = TestContext::new("resume-lifetime");
-        write_jsonl(
-            &context.rollout(PARENT_ID),
-            &[
-                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(1), 100, Some(100), Some("codex")),
-            ],
-        );
-        // Codex resume keeps the thread id but starts a reset token counter
-        // and records no replayed events.
-        write_jsonl(
-            &context.archived_rollout(PARENT_ID),
-            &[
-                session_meta(&context.at(5), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(6), 50, Some(50), Some("codex")),
-            ],
-        );
-
-        let result = context.tracker().refresh_for_date(&context.date);
-
-        assert!(result.is_ok_and(|value| {
-            value.0.lifetime_tokens == Some(150) && value.0.lifetime_reliable
-        }));
     }
 
     #[test]
@@ -1775,64 +1789,6 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_counts_fork_usage_once() {
-        let context = TestContext::new("lifetime-fork");
-        let parent = context.rollout(PARENT_ID);
-        let child = context.rollout(CHILD_ID);
-        write_jsonl(
-            &parent,
-            &[
-                session_meta(&context.at(-10), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(-9), 100, Some(100), Some("codex")),
-                turn_context(&context.at(5)),
-            ],
-        );
-        write_jsonl(
-            &child,
-            &[
-                session_meta(&context.at(3), CHILD_ID, Some("openai"), Some(PARENT_ID)),
-                token_count(&context.at(3), 100, Some(100), Some("codex")),
-                token_count(&context.at(4), 150, Some(50), Some("codex")),
-            ],
-        );
-
-        let result = context.tracker().refresh_for_date(&context.date);
-
-        assert_eq!(
-            result
-                .ok()
-                .map(|value| (value.0.lifetime_tokens, value.0.lifetime_reliable)),
-            Some((Some(150), true))
-        );
-    }
-
-    #[test]
-    fn lifetime_survives_cache_reload() {
-        let context = TestContext::new("lifetime-reload");
-        write_jsonl(
-            &context.rollout(PARENT_ID),
-            &[
-                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(1), 100, Some(100), Some("codex")),
-                token_count(&context.at(2), 180, Some(80), Some("codex")),
-            ],
-        );
-        let mut tracker = context.tracker();
-        let first = tracker.refresh_for_date(&context.date);
-        drop(tracker);
-
-        let second = context.tracker().refresh_for_date(&context.date);
-
-        assert_eq!(
-            (
-                first.ok().and_then(|value| value.0.lifetime_tokens),
-                second.ok().and_then(|value| value.0.lifetime_tokens)
-            ),
-            (Some(180), Some(180))
-        );
-    }
-
-    #[test]
     fn stale_cache_version_is_discarded() {
         let context = TestContext::new("cache-version-discard");
         let file = context.rollout(PARENT_ID);
@@ -1881,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_file_stops_contributing_to_lifetime_and_snapshot() {
+    fn deleted_file_stops_contributing_to_snapshot() {
         let context = TestContext::new("deleted-file");
         let parent = context.rollout(PARENT_ID);
         let child = context.rollout(CHILD_ID);
@@ -1915,7 +1871,6 @@ mod tests {
             .refresh_for_date(&context.date)
             .expect("first refresh should succeed");
 
-        assert_eq!(first.lifetime_tokens, Some(140));
         assert!(
             first
                 .quota
@@ -1932,7 +1887,6 @@ mod tests {
 
         assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
         assert_eq!(second_diagnostics.discovery_errors, 0);
-        assert_eq!(second.lifetime_tokens, Some(100));
         assert!(
             second
                 .quota
@@ -1990,7 +1944,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
         );
-        assert_eq!(reloaded.lifetime_tokens, Some(100));
     }
 
     #[test]
@@ -2045,68 +1998,21 @@ mod tests {
                 .as_ref()
                 .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
         );
-        assert_eq!(first.lifetime_tokens, Some(140));
 
         assert!(fs::remove_file(&old).is_ok());
         tracker.mark_changed_for_test(old.clone());
 
-        let (second, second_diagnostics) = tracker
+        let (second, _) = tracker
             .refresh_for_date(&context.date)
             .expect("second refresh should succeed");
 
-        assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
+        // 被裁剪文件的快照靠 source_path 存活检查失效，不依赖全量扫描提升。
         assert!(
             second
                 .quota
                 .as_ref()
                 .is_some_and(|quota| (quota.primary.used_percent - 30.0).abs() < f64::EPSILON)
         );
-        assert_eq!(second.lifetime_tokens, Some(40));
-    }
-
-    #[test]
-    fn deleted_trimmed_lifetime_contributor_recomputes() {
-        let context = TestContext::new("deleted-trimmed-lifetime");
-        let old = context.rollout(PARENT_ID);
-        let recent = context.rollout(CHILD_ID);
-        write_jsonl(
-            &old,
-            &[
-                session_meta(&context.at(-172_900), PARENT_ID, Some("openai"), None),
-                token_count(&context.at(-172_800), 100, Some(100), Some("codex")),
-            ],
-        );
-        write_jsonl(
-            &recent,
-            &[
-                session_meta(&context.at(0), CHILD_ID, Some("openai"), None),
-                token_count(&context.at(1), 40, Some(40), Some("codex")),
-            ],
-        );
-        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
-        assert!(
-            std::fs::File::options()
-                .write(true)
-                .open(&old)
-                .and_then(|file| file.set_times(old_times))
-                .is_ok()
-        );
-        let mut tracker = context.tracker();
-        tracker.enable_incremental_for_test();
-        let (first, _) = tracker
-            .refresh_for_date(&context.date)
-            .expect("first refresh should succeed");
-        assert_eq!(first.lifetime_tokens, Some(140));
-
-        assert!(fs::remove_file(&old).is_ok());
-        tracker.mark_changed_for_test(old.clone());
-
-        let (second, second_diagnostics) = tracker
-            .refresh_for_date(&context.date)
-            .expect("second refresh should succeed");
-
-        assert_eq!(second_diagnostics.mode, RefreshMode::FullScan);
-        assert_eq!(second.lifetime_tokens, Some(40));
     }
 
     #[test]
@@ -2151,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_discovery_carries_previous_snapshot_and_lifetime() {
+    fn incomplete_discovery_carries_previous_snapshot() {
         fn scan_with(discovery_errors: usize) -> ScanContext {
             ScanContext {
                 candidate_by_path: HashMap::new(),
@@ -2159,7 +2065,6 @@ mod tests {
                 caches: HashMap::new(),
                 today_selected: HashSet::new(),
                 period_selected: HashSet::new(),
-                lifetime_selected: HashSet::new(),
                 dependencies: HashSet::new(),
                 diagnostics: RefreshDiagnostics {
                     discovery_errors,
@@ -2180,10 +2085,6 @@ mod tests {
             secondary: None,
             plan_type: None,
         };
-        let previous_lifetime = LifetimeAggregate {
-            tokens: 500,
-            reliable: true,
-        };
 
         let incomplete = scan_with(1)
             .finish(
@@ -2191,7 +2092,7 @@ mod tests {
                 None,
                 None,
                 Some(previous_rate_limits.clone()),
-                Some(previous_lifetime.clone()),
+                BalanceAnchors::default(),
             )
             .snapshot;
 
@@ -2201,7 +2102,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|quota| (quota.primary.used_percent - 50.0).abs() < f64::EPSILON)
         );
-        assert_eq!(incomplete.lifetime_tokens, Some(500));
 
         let complete = scan_with(0)
             .finish(
@@ -2209,12 +2109,11 @@ mod tests {
                 None,
                 None,
                 Some(previous_rate_limits),
-                Some(previous_lifetime),
+                BalanceAnchors::default(),
             )
             .snapshot;
 
         assert!(complete.quota.is_none());
-        assert_eq!(complete.lifetime_tokens, Some(0));
     }
 
     #[test]
@@ -2356,5 +2255,473 @@ mod tests {
         let result = context.tracker().refresh_for_date(&context.date);
 
         assert_eq!(result.ok().map(|value| value.0.today_tokens), Some(100));
+    }
+
+    #[test]
+    fn refresh_splits_overflow_usage_from_plan_usage() {
+        // 服务端把窗口进度封顶在 100：进度冻结期间的事件是余额消耗（实测
+        // balance 同步递减），进度从 100 回落说明窗口已重置、回到套餐内。
+        // 把进度从 99 顶到 100 的跨界请求按套餐内计（误差以一个请求为界）。
+        let context = TestContext::new("overflow-split");
+        let file = context.rollout(PARENT_ID);
+        let limits = |primary: f64, secondary: f64, balance: &str| {
+            codex_rate_limits_with_credits(primary, Some(secondary), Some(balance))
+        };
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    limits(50.0, 10.0, "100"),
+                ),
+                // 跨界请求：进度顶到 100，本请求按套餐内计。
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    200,
+                    Some(100),
+                    limits(100.0, 20.0, "100"),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(3),
+                    300,
+                    Some(100),
+                    limits(100.0, 30.0, "95"),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(4),
+                    400,
+                    Some(100),
+                    limits(100.0, 40.0, "89.5"),
+                ),
+                // 5h 窗口重置（进度回落），回到套餐内；余额不变。
+                token_count_with_rate_limits(
+                    &context.at(5),
+                    450,
+                    Some(50),
+                    limits(0.0, 40.0, "89.5"),
+                ),
+            ],
+        );
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
+
+        assert_eq!(
+            snapshot.as_ref().map(|value| (
+                value.today_tokens,
+                value.today_overflow_tokens,
+                value.today_reliable,
+            )),
+            Some((250, 200, true))
+        );
+        let spent = snapshot.as_ref().map(|value| value.today_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 10.5).abs() < 1e-9),
+            "{spent:?}"
+        );
+        // 套餐内分桶只含非溢出事件（t1/t2/t5：99+99+49 未命中、3 输出）。
+        assert_eq!(
+            snapshot.and_then(|value| value.today_volume),
+            Some(ModelVolumes(vec![(
+                None,
+                TokenVolume {
+                    uncached_input: 247,
+                    cached_input: 0,
+                    output: 3
+                }
+            )]))
+        );
+    }
+
+    #[test]
+    fn refresh_counts_first_capped_event_of_file_as_overflow() {
+        // 文件从溢出中段开始写入（resume 场景）：首事件没有前值，以自身
+        // 报告触顶为准。
+        let context = TestContext::new("overflow-file-start");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    codex_rate_limits_with_credits(100.0, Some(50.0), Some("200")),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    200,
+                    Some(100),
+                    codex_rate_limits_with_credits(100.0, Some(60.0), Some("180")),
+                ),
+            ],
+        );
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
+
+        assert_eq!(
+            snapshot.as_ref().map(|value| (
+                value.today_tokens,
+                value.today_overflow_tokens,
+                value.today_reliable,
+            )),
+            Some((0, 200, true))
+        );
+        let spent = snapshot.as_ref().map(|value| value.today_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 20.0).abs() < 1e-9),
+            "{spent:?}"
+        );
+    }
+
+    #[test]
+    fn credits_debits_merge_parallel_observations_and_ignore_grants() {
+        // 余额是账户级的：并行会话对同一笔扣费的重复观测合并排序后同值
+        // 相邻（A 在 t4 观测到的 90 与 B 在 t3 观测到的 90 相邻，差为 0），
+        // 不会重复计入；赠送带来的正跳变不计入消耗。
+        let context = TestContext::new("credits-merge");
+        let balance_only =
+            |balance: &str| json!({ "limit_id": "codex", "credits": { "balance": balance } });
+        let a = context.rollout(PARENT_ID);
+        write_jsonl(
+            &a,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(&context.at(1), 10, Some(10), balance_only("100")),
+                token_count_with_rate_limits(&context.at(4), 20, Some(10), balance_only("90")),
+            ],
+        );
+        let b = context.rollout(CHILD_ID);
+        write_jsonl(
+            &b,
+            &[
+                session_meta(&context.at(2), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(&context.at(3), 10, Some(10), balance_only("95")),
+                token_count_with_rate_limits(&context.at(5), 20, Some(10), balance_only("92")),
+            ],
+        );
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
+
+        // 合并时间线 (t1,100)(t3,95)(t4,90)(t5,92)：-5、-5、+2（赠送）。
+        // 真实扣费 100→90 = 10；按文件各自求和会得到 13（重复计入）。
+        let spent = snapshot.as_ref().map(|value| value.today_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 10.0).abs() < 1e-9),
+            "{spent:?}"
+        );
+        assert_eq!(
+            snapshot.as_ref().map(|value| (
+                value.today_tokens,
+                value.today_overflow_tokens,
+                value.today_reliable,
+            )),
+            Some((40, 0, true))
+        );
+    }
+
+    #[test]
+    fn period_aggregates_overflow_usage_within_window() {
+        // 窗口外的溢出事件不计入本期 tokens，但它的余额观测仍是窗口内
+        // 扣费的基线；窗口内溢出事件计入本期超额。
+        let context = TestContext::new("overflow-period");
+        let file = context.rollout(PARENT_ID);
+        let capped =
+            |balance: &str| codex_rate_limits_with_credits(100.0, Some(50.0), Some(balance));
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(-10), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(&context.at(-5), 100, Some(100), capped("100")),
+                token_count_with_rate_limits(&context.at(1), 200, Some(100), capped("90")),
+                token_count_with_rate_limits(&context.at(2), 300, Some(100), capped("80")),
+            ],
+        );
+        let boundary =
+            timestamp_as_system_time(&context.at(0)).and_then(PeriodBoundary::from_start);
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_period(&context.date, boundary.as_ref())
+            .ok()
+            .map(|value| value.0);
+
+        assert_eq!(
+            snapshot.as_ref().map(|value| (
+                value.current_period_tokens,
+                value.current_period_overflow_tokens,
+                value.current_period_reliable,
+            )),
+            Some((0, 200, true))
+        );
+        let spent = snapshot
+            .as_ref()
+            .map(|value| value.current_period_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 20.0).abs() < 1e-9),
+            "{spent:?}"
+        );
+    }
+
+    #[test]
+    fn credits_spent_accumulates_sub_epsilon_debits() {
+        // 小额扣费不得被噪声阈值整段丢弃：两段各 0.004 credits，合计 0.008
+        // 必须入账（显示层负责舍入，统计层保留原始精度）。
+        let context = TestContext::new("sub-epsilon");
+        let file = context.rollout(PARENT_ID);
+        let balance_only_limits =
+            |balance: &str| json!({ "limit_id": "codex", "credits": { "balance": balance } });
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    balance_only_limits("100"),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    200,
+                    Some(100),
+                    balance_only_limits("99.996"),
+                ),
+                token_count_with_rate_limits(
+                    &context.at(3),
+                    300,
+                    Some(100),
+                    balance_only_limits("99.992"),
+                ),
+            ],
+        );
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
+
+        let spent = snapshot.as_ref().map(|value| value.today_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 0.008).abs() < 1e-9),
+            "{spent:?}"
+        );
+    }
+
+    #[test]
+    fn balance_only_snapshot_anchors_first_debit() {
+        // 纯额度快照（info 缺失）不带 Token 明细，但它的余额观测是基线；
+        // 解析不得因其无明细而丢弃，否则随后那段扣费统计为 0。
+        let context = TestContext::new("balance-only-anchor");
+        let file = context.rollout(PARENT_ID);
+        let balance_only = |timestamp: String, balance: &str| {
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": { "limit_id": "codex", "credits": { "balance": balance } }
+                }
+            })
+        };
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                balance_only(context.at(1), "100"),
+                token_count_with_rate_limits(
+                    &context.at(2),
+                    100,
+                    Some(100),
+                    json!({ "limit_id": "codex", "credits": { "balance": "90" } }),
+                ),
+            ],
+        );
+
+        let snapshot = context
+            .tracker()
+            .refresh_for_date(&context.date)
+            .ok()
+            .map(|value| value.0);
+
+        assert_eq!(snapshot.as_ref().map(|value| value.today_tokens), Some(100));
+        let spent = snapshot.as_ref().map(|value| value.today_credits_spent);
+        assert!(
+            spent.is_some_and(|value| (value - 10.0).abs() < 1e-9),
+            "{spent:?}"
+        );
+    }
+
+    #[test]
+    fn cold_start_balance_anchors_survive_updates_and_cache_reload() {
+        let context = TestContext::new("cold-balance-anchors");
+        let old = context.rollout(PARENT_ID);
+        let fresh = context.rollout(CHILD_ID);
+        let limits = |balance: &str| json!({"limit_id": "codex", "credits": {"balance": balance}});
+        write_jsonl(
+            &old,
+            &[
+                session_meta(&context.at(-259_200), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(&context.at(-259_199), 10, Some(10), limits("100")),
+            ],
+        );
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        write_jsonl(
+            &fresh,
+            &[
+                session_meta(&context.at(0), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(&context.at(1), 10, Some(10), limits("90")),
+            ],
+        );
+        let boundary =
+            timestamp_as_system_time(&context.at(0)).and_then(PeriodBoundary::from_start);
+        let mut tracker = context.tracker();
+        let first = tracker
+            .refresh_for_period(&context.date, boundary.as_ref())
+            .unwrap()
+            .0;
+        assert!((first.today_credits_spent - 10.0).abs() < 1e-9);
+        assert!((first.current_period_credits_spent - 10.0).abs() < 1e-9);
+
+        append_jsonl(
+            &fresh,
+            &token_count_with_rate_limits(&context.at(2), 20, Some(10), limits("89")),
+        );
+        tracker.mark_changed_for_test(fresh.clone());
+        let second = tracker
+            .refresh_for_period(&context.date, boundary.as_ref())
+            .unwrap()
+            .0;
+        assert!((second.today_credits_spent - 11.0).abs() < 1e-9);
+        assert!((second.current_period_credits_spent - 11.0).abs() < 1e-9);
+
+        // 源文件不再存在时，持久化的窗口前基线仍需保留。
+        drop(tracker);
+        fs::remove_file(&old).unwrap();
+        let mut tracker = context.tracker();
+        let reloaded = tracker
+            .refresh_for_period(&context.date, boundary.as_ref())
+            .unwrap()
+            .0;
+        assert!((reloaded.today_credits_spent - 11.0).abs() < 1e-9);
+        assert!((reloaded.current_period_credits_spent - 11.0).abs() < 1e-9);
+        append_jsonl(
+            &fresh,
+            &token_count_with_rate_limits(&context.at(3), 30, Some(10), limits("88")),
+        );
+        tracker.mark_changed_for_test(fresh.clone());
+        let third = tracker
+            .refresh_for_period(&context.date, boundary.as_ref())
+            .unwrap()
+            .0;
+        assert!((third.today_credits_spent - 12.0).abs() < 1e-9);
+        assert!((third.current_period_credits_spent - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn balance_anchors_roll_today_without_replacing_the_period_anchor() {
+        let context = TestContext::new("balance-anchor-rollover");
+        let observation = |seconds, balance| BalanceObservation {
+            timestamp_nanos: parser::parse_timestamp_nanos(Some(&json!(context.at(seconds))))
+                .unwrap(),
+            balance,
+        };
+        let previous = BalanceAnchors {
+            before_period: Some(observation(-259_200, 100.0)),
+            before_today: Some(observation(-86400, 95.0)),
+            latest: Some(observation(0, 90.0)),
+        };
+        let boundary =
+            timestamp_as_system_time(&context.at(-172_800)).and_then(PeriodBoundary::from_start);
+        let tomorrow = timestamp_as_system_time(&context.at(86400))
+            .and_then(local_calendar_date_at)
+            .unwrap();
+        let anchors =
+            window_balance_anchors(&HashMap::new(), previous, &tomorrow, boundary.as_ref());
+        assert_eq!(anchors.before_today, previous.latest);
+        assert_eq!(anchors.before_period, previous.before_period);
+        let new_boundary =
+            timestamp_as_system_time(&context.at(1)).and_then(PeriodBoundary::from_start);
+        let reset =
+            window_balance_anchors(&HashMap::new(), anchors, &tomorrow, new_boundary.as_ref());
+        assert_eq!(reset.before_period, previous.latest);
+    }
+
+    #[test]
+    fn balance_baseline_survives_inactive_days() {
+        // 三天前的会话记录余额 100 后停更；今天新会话首条观测 90（空档期
+        // 其他设备消耗）。旧文件已不在今日选择集，持久化的滚动基线必须
+        // 补上时间线起点，否则这段扣费统计为 0。
+        let context = TestContext::new("balance-baseline");
+        let old = context.rollout(PARENT_ID);
+        write_jsonl(
+            &old,
+            &[
+                session_meta(&context.at(-3 * 86_400), PARENT_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(-3 * 86_400 + 60),
+                    100,
+                    Some(100),
+                    json!({ "limit_id": "codex", "credits": { "balance": "100" } }),
+                ),
+            ],
+        );
+        let old_times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        assert!(
+            std::fs::File::options()
+                .write(true)
+                .open(&old)
+                .and_then(|handle| handle.set_times(old_times))
+                .is_ok()
+        );
+        let mut tracker = context.tracker();
+        let (first, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("first refresh should succeed");
+        assert!((first.today_credits_spent).abs() < 1e-9);
+
+        let fresh = context.rollout(CHILD_ID);
+        write_jsonl(
+            &fresh,
+            &[
+                session_meta(&context.at(0), CHILD_ID, Some("openai"), None),
+                token_count_with_rate_limits(
+                    &context.at(1),
+                    100,
+                    Some(100),
+                    json!({ "limit_id": "codex", "credits": { "balance": "90" } }),
+                ),
+            ],
+        );
+        tracker.mark_changed_for_test(fresh.clone());
+
+        let (second, _) = tracker
+            .refresh_for_date(&context.date)
+            .expect("second refresh should succeed");
+
+        assert_eq!(second.today_tokens, 100);
+        let spent = second.today_credits_spent;
+        assert!((spent - 10.0).abs() < 1e-9, "{spent:?}");
     }
 }

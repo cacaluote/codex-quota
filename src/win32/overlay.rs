@@ -8,24 +8,34 @@ use super::layout::{
     PanelAnimation, anchored_destination, animation_shape_rect, dip_to_px, expanded_destination,
     monitor_info, px_to_dip,
 };
+use super::presentation::panel_height_dip;
 use super::renderer::{TransitionVisual, VisualState};
 use super::{
     ANIMATION_FRAME_MILLIS, AppWindow, COLLAPSE_ANIMATION_DURATION, COLLAPSED_DIP,
-    EXPAND_ANIMATION_DURATION, PANEL_HEIGHT_DIP, PANEL_WIDTH_DIP, TIMER_ANIMATION,
+    EXPAND_ANIMATION_DURATION, PANEL_WIDTH_DIP, TIMER_ANIMATION,
 };
 use crate::error::AppError;
 
 impl AppWindow {
+    /// 展开态面板高度（dip）：随超额行可见性收缩。锁损坏时按精简高度
+    /// 兜底——渲染路径本身会因锁损坏报错。
+    pub(super) fn panel_height(&self) -> f32 {
+        self.state
+            .lock()
+            .map_or(254.0, |state| panel_height_dip(&state))
+    }
+
     pub(super) fn desired_size(&self) -> (i32, i32) {
         if self.expanded {
-            (
-                dip_to_px(PANEL_WIDTH_DIP, self.dpi),
-                dip_to_px(PANEL_HEIGHT_DIP, self.dpi),
-            )
+            (dip_to_px(PANEL_WIDTH_DIP, self.dpi), self.panel_height_px())
         } else {
             let side = dip_to_px(COLLAPSED_DIP, self.dpi);
             (side, side)
         }
+    }
+
+    fn panel_height_px(&self) -> i32 {
+        dip_to_px(self.panel_height(), self.dpi)
     }
 
     pub(super) fn render(&mut self) -> Result<(), AppError> {
@@ -86,15 +96,17 @@ impl AppWindow {
             return self.render();
         };
         let sample = animation.sample(now);
+        let panel_height_dip = self.panel_height();
         let shape = animation_shape_rect(
             animation,
             sample.expansion,
             self.dpi,
+            panel_height_dip,
             self.config.placement.edge,
             self.expansion_alignment,
         );
         let width = dip_to_px(PANEL_WIDTH_DIP, self.dpi);
-        let height = dip_to_px(PANEL_HEIGHT_DIP, self.dpi);
+        let height = dip_to_px(panel_height_dip, self.dpi);
         let ball_center = (
             px_to_dip(
                 animation.ball_center_screen.x - animation.canvas_destination.x,
@@ -194,7 +206,7 @@ impl AppWindow {
         let work_area = monitor_info(monitor)?.info.monitorInfo.rcWork;
         let canvas_destination = if expanding {
             let width = dip_to_px(PANEL_WIDTH_DIP, self.dpi);
-            let height = dip_to_px(PANEL_HEIGHT_DIP, self.dpi);
+            let height = self.panel_height_px();
             let (destination, alignment) =
                 expanded_destination(rect, self.config.placement.edge, width, height, work_area);
             self.expansion_alignment = alignment;

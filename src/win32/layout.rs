@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
 
-use super::{COLLAPSED_DIP, PANEL_HEIGHT_DIP, PANEL_WIDTH_DIP};
+use super::{COLLAPSED_DIP, PANEL_WIDTH_DIP};
 use crate::config::{AnchorEdge, AppConfigV1};
 use crate::error::AppError;
 
@@ -295,11 +295,12 @@ pub(super) fn animation_shape_rect(
     animation: PanelAnimation,
     expansion: f32,
     dpi: u32,
+    panel_height_dip: f32,
     edge: AnchorEdge,
     alignment: ExpansionAlignment,
 ) -> RECT {
     let width = dip_to_px(lerp(COLLAPSED_DIP, PANEL_WIDTH_DIP, expansion), dpi);
-    let height = dip_to_px(lerp(COLLAPSED_DIP, PANEL_HEIGHT_DIP, expansion), dpi);
+    let height = dip_to_px(lerp(COLLAPSED_DIP, panel_height_dip, expansion), dpi);
     let destination = anchored_destination(
         animation.anchor_rect,
         edge,
@@ -367,7 +368,7 @@ pub(super) fn point_is_outside_rounded_rect(point: POINT, rect: RECT, radius: i3
 mod tests {
     use super::*;
     use crate::config::AnchorEdge;
-    use crate::win32::COLLAPSE_ANIMATION_DURATION;
+    use crate::win32::{COLLAPSE_ANIMATION_DURATION, EXPAND_ANIMATION_DURATION};
 
     #[test]
     fn expanding_animation_starts_with_only_ball_content_visible() {
@@ -432,6 +433,7 @@ mod tests {
             animation,
             0.0,
             96,
+            308.0,
             AnchorEdge::Right,
             ExpansionAlignment::Start,
         );
@@ -439,6 +441,50 @@ mod tests {
             (shape.left, shape.top, shape.right, shape.bottom),
             (1_651, 407, 1_707, 463)
         );
+    }
+
+    #[test]
+    fn expanded_animation_shape_follows_the_dynamic_panel_height() {
+        // 展开终点高度由调用方按数据传入：无超额 254、双行超额 308。
+        let animation = PanelAnimation {
+            started_at: Instant::now(),
+            duration: EXPAND_ANIMATION_DURATION,
+            anchor_rect: RECT {
+                left: 1_431,
+                top: 407,
+                right: 1_487,
+                bottom: 463,
+            },
+            work_area: RECT {
+                left: 0,
+                top: 0,
+                right: 1_920,
+                bottom: 1_040,
+            },
+            canvas_destination: POINT { x: 1_431, y: 407 },
+            ball_center_screen: POINT { x: 1_459, y: 435 },
+            expanding: true,
+        };
+        let compact = animation_shape_rect(
+            animation,
+            1.0,
+            96,
+            254.0,
+            AnchorEdge::Right,
+            ExpansionAlignment::Start,
+        );
+        let tall = animation_shape_rect(
+            animation,
+            1.0,
+            96,
+            308.0,
+            AnchorEdge::Right,
+            ExpansionAlignment::Start,
+        );
+
+        assert_eq!(compact.bottom - compact.top, dip_to_px(254.0, 96));
+        assert_eq!(tall.bottom - tall.top, dip_to_px(308.0, 96));
+        assert_eq!(tall.right - tall.left, compact.right - compact.left);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use time::format_description::well_known::Rfc3339;
 use super::RefreshDiagnostics;
 use super::files::{open_session_file, path_key};
 use super::model::{
-    CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry, RateLimitWindowEntry, RootMeta,
-    TokenCounters, TokenEvent, TokenSignature, UsageHighWater,
+    BalanceObservation, CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry,
+    RateLimitWindowEntry, RootMeta, TokenCounters, TokenEvent, TokenSignature, UsageHighWater,
 };
 use crate::quota::codex::protocol::local_calendar_date_at;
 
@@ -62,6 +62,7 @@ pub(super) fn update_candidate_cache(
         let previous_parse_errors = cache.parse_errors;
         let previous_rate_limits = cache.latest_rate_limits.clone();
         let previous_current_model = cache.current_model.clone();
+        let previous_balance_observations = cache.balance_observations.clone();
         diagnostics.files_read = diagnostics.files_read.saturating_add(1);
         if parse_file_append(candidate, &mut cache).is_err() {
             cache.uncertain = true;
@@ -79,7 +80,8 @@ pub(super) fn update_candidate_cache(
             || previous_uncertain != cache.uncertain
             || previous_parse_errors != cache.parse_errors
             || previous_rate_limits != cache.latest_rate_limits
-            || previous_current_model != cache.current_model;
+            || previous_current_model != cache.current_model
+            || previous_balance_observations != cache.balance_observations;
     }
     cache.length = candidate.length;
     cache.last_write_time = candidate.last_write_time;
@@ -227,6 +229,16 @@ fn parse_token_event(
     {
         cache.latest_rate_limits = Some(entry);
     }
+    // 余额观测独立于 Token 明细采集：info 缺失或无计数器的纯额度快照
+    // 也可能是某段消耗前的最后基线，必须进入账户余额时间线。
+    if let Some(balance) = parse_credits_balance(payload)
+        && let Some(timestamp) = timestamp
+    {
+        cache.balance_observations.push(BalanceObservation {
+            timestamp_nanos: timestamp,
+            balance,
+        });
+    }
     let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
         return;
     };
@@ -264,30 +276,13 @@ fn parse_token_event(
     // `cached_input ⊆ input`（对 72k 真实事件做过不变量检验），因此计价桶为
     // input−cached（原价）、cached（cache_read 价）、output（output 价，含 reasoning）。
     // cache_write_input_tokens 实测恒 0，v1 不计价。
-    let (delta_total, delta_uncached_input, delta_cached_input, delta_output) = if duplicate
-        || stale_snapshot
-    {
-        (0, 0, 0, 0)
-    } else if let Some(last) = last {
-        let cached = last.cached_input.unwrap_or(0);
-        (
-            last.effective_total(),
-            last.input.unwrap_or(0).saturating_sub(cached),
-            cached,
-            last.output.unwrap_or(0),
-        )
-    } else if let Some(total) = total {
-        // 实测 35k 真实事件全部携带 last_token_usage，此路径仅为兜底。
-        let (uncached, cached, output) = cumulative_bucket_deltas(cache.high_water.as_ref(), total);
-        (
-            cumulative_delta(cache.high_water.as_ref(), total),
-            uncached,
-            cached,
-            output,
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
+    let (delta_total, delta_uncached_input, delta_cached_input, delta_output) = token_deltas(
+        duplicate,
+        stale_snapshot,
+        last,
+        total,
+        cache.high_water.as_ref(),
+    );
     if let Some(total) = total {
         update_high_water(&mut cache.high_water, total);
     }
@@ -304,6 +299,7 @@ fn parse_token_event(
     if timestamp.is_none() {
         cache.token_without_timestamp = true;
     }
+    let (primary_percent, secondary_percent) = parse_window_percents(payload);
     cache.events.push(TokenEvent {
         timestamp_nanos: timestamp,
         signature,
@@ -313,7 +309,76 @@ fn parse_token_event(
         delta_cached_input,
         delta_output,
         model: cache.current_model.clone(),
+        primary_percent,
+        secondary_percent,
     });
+}
+
+/// 事件增量四元组（total、未缓存 input、cached input、output）。
+fn token_deltas(
+    duplicate: bool,
+    stale_snapshot: bool,
+    last: Option<&TokenCounters>,
+    total: Option<&TokenCounters>,
+    high_water: Option<&UsageHighWater>,
+) -> (u64, u64, u64, u64) {
+    if duplicate || stale_snapshot {
+        return (0, 0, 0, 0);
+    }
+    if let Some(last) = last {
+        let cached = last.cached_input.unwrap_or(0);
+        return (
+            last.effective_total(),
+            last.input.unwrap_or(0).saturating_sub(cached),
+            cached,
+            last.output.unwrap_or(0),
+        );
+    }
+    if let Some(total) = total {
+        // 实测 35k 真实事件全部携带 last_token_usage，此路径仅为兜底。
+        let (uncached, cached, output) = cumulative_bucket_deltas(high_water, total);
+        return (
+            cumulative_delta(high_water, total),
+            uncached,
+            cached,
+            output,
+        );
+    }
+    (0, 0, 0, 0)
+}
+
+/// 事件自带的 codex 窗口进度。仅接受 `codex` limit：其他 limit 的进度
+/// 口径不同，不得驱动溢出判定。
+fn parse_window_percents(payload: &Value) -> (Option<f64>, Option<f64>) {
+    let Some(limits) = codex_rate_limits(payload) else {
+        return (None, None);
+    };
+    let primary = limits
+        .pointer("/primary/used_percent")
+        .and_then(Value::as_f64);
+    let secondary = limits
+        .pointer("/secondary/used_percent")
+        .and_then(Value::as_f64);
+    (primary, secondary)
+}
+
+/// credits 余额观测。仅接受 `codex` limit；余额是高精度十进制字符串
+/// （如 "575.0172470000"），容忍数字形式。
+fn parse_credits_balance(payload: &Value) -> Option<f64> {
+    let limits = codex_rate_limits(payload)?;
+    limits.pointer("/credits/balance").and_then(|value| {
+        value
+            .as_str()
+            .and_then(|text| text.parse::<f64>().ok())
+            .or_else(|| value.as_f64())
+    })
+}
+
+fn codex_rate_limits(payload: &Value) -> Option<&Value> {
+    let limits = payload
+        .get("rate_limits")
+        .filter(|value| !value.is_null())?;
+    (limits.get("limit_id").and_then(Value::as_str) == Some("codex")).then_some(limits)
 }
 
 fn parse_rate_limit_snapshot(
@@ -547,8 +612,11 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 pub(super) fn event_is_on_date(event: &TokenEvent, date: &str) -> bool {
-    event
-        .timestamp_nanos
+    ts_is_on_date(event.timestamp_nanos, date)
+}
+
+pub(super) fn ts_is_on_date(timestamp: Option<i64>, date: &str) -> bool {
+    timestamp
         .and_then(system_time_from_unix_nanos)
         .and_then(local_calendar_date_at)
         .as_deref()

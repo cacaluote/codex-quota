@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use super::layout::{ExpansionAlignment, system_animations_enabled};
-use super::notify::{self, NotificationSwitches, Notifier};
+use super::notify::{self, Notification, NotificationSwitches, Notifier};
 use super::presence::CodexPresenceWatcher;
 use super::renderer::Renderer;
 use super::system::{load_app_icon, set_autostart};
@@ -292,11 +292,17 @@ impl AppWindow {
             crate::notify_state::save(&self.notify_state);
         }
         for notification in outcome.notifications {
-            let (title, body) = notification.balloon_text();
-            crate::logging::log(&format!("通知：{title} / {body}"));
-            if let Err(error) = notify::show_balloon(self.hwnd, title, &body) {
-                crate::logging::log(&error.to_string());
-            }
+            self.show_notification(&notification);
+        }
+    }
+
+    /// 弹一条通知气泡。判定与去重都在 `Notifier` 里，这里只管投递，
+    /// 因此调试入口可以复用它而不碰任何判定状态。
+    fn show_notification(&self, notification: &Notification) {
+        let (title, body) = notification.balloon_text();
+        crate::logging::log(&format!("通知：{title} / {body}"));
+        if let Err(error) = notify::show_balloon(self.hwnd, title, &body) {
+            crate::logging::log(&error.to_string());
         }
     }
 
@@ -396,6 +402,13 @@ impl AppWindow {
             }
             self.save_config();
             return self.render();
+        }
+
+        // 调试构建专供：手动弹一条通知，仅供验证投递（声音/点击/应用名）。
+        #[cfg(debug_assertions)]
+        if let Some(notification) = notify::test_notification_for_command(command) {
+            self.show_notification(&notification);
+            return Ok(());
         }
 
         match command {

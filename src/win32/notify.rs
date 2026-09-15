@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{
-    NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_INFO, NIIF_NONE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 
 use super::TRAY_ID;
@@ -276,7 +276,26 @@ fn period_key(snapshot: &QuotaSnapshot) -> Option<i64> {
     i64::try_from(seconds).ok()
 }
 
+/// 调试构建专供：把"测试通知"菜单命令映射成一条有代表性的通知。
+///
+/// 只走投递路径（气泡、声音、点击），**不经过判定状态机**，所以随便点也
+/// 不会污染通知起点或去重记录。发布构建里这套菜单项与函数都不存在。
+#[cfg(debug_assertions)]
+pub(super) fn test_notification_for_command(command: usize) -> Option<Notification> {
+    match command {
+        super::CMD_TEST_NOTIFY_RESET => Some(Notification::Reset {
+            window: "5h".to_owned(),
+            remaining_percent: 99.0,
+        }),
+        super::CMD_TEST_NOTIFY_BALANCE => Some(Notification::Overflow { credits: 310.25 }),
+        _ => None,
+    }
+}
+
 /// 弹一条托盘通知气泡；点击气泡会以 `NIN_BALLOONUSERCLICK` 回到托盘回调。
+///
+/// 正文不放图标：`NIIF_NONE` 的语义就是"无图标"。不传它的话 Windows 会按
+/// `dwInfoFlags` 塞一个系统图标（信息/警告），跟本应用无关。
 pub(super) fn show_balloon(hwnd: HWND, title: &str, body: &str) -> Result<(), AppError> {
     let mut data = NOTIFYICONDATAW {
         cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
@@ -284,7 +303,7 @@ pub(super) fn show_balloon(hwnd: HWND, title: &str, body: &str) -> Result<(), Ap
         hWnd: hwnd,
         uID: TRAY_ID,
         uFlags: NIF_INFO,
-        dwInfoFlags: NIIF_INFO,
+        dwInfoFlags: NIIF_NONE,
         ..Default::default()
     };
     copy_wide_fixed(title, &mut data.szInfoTitle);
@@ -1139,6 +1158,25 @@ mod tests {
         assert_eq!(window_separator("周"), "");
         assert_eq!(window_separator("月"), "");
         assert_eq!(window_separator("2周"), "");
+    }
+
+    /// 测试入口只映射两条命令，别的命令一律不放行（避免误触发投递）。
+    #[cfg(debug_assertions)]
+    #[test]
+    fn only_the_two_test_commands_map_to_test_notifications() {
+        assert_eq!(
+            test_notification_for_command(super::super::CMD_TEST_NOTIFY_RESET),
+            Some(Notification::Reset {
+                window: "5h".to_owned(),
+                remaining_percent: 99.0,
+            })
+        );
+        assert_eq!(
+            test_notification_for_command(super::super::CMD_TEST_NOTIFY_BALANCE),
+            Some(Notification::Overflow { credits: 310.25 })
+        );
+        assert_eq!(test_notification_for_command(0), None);
+        assert_eq!(test_notification_for_command(1001), None);
     }
 
     #[test]

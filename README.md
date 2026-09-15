@@ -102,6 +102,8 @@ cargo run
 
 两条通知都只报“程序自己看到的那一下”：关机、退出程序、跟随模式下 Codex 未运行期间发生的事，事后不会补发。点击通知气泡会展开面板；通知受 Windows 的专注助手与本应用的系统通知设置约束，因此它只是告知，悬浮球的颜色和脉冲才是主状态指示。
 
+通知在系统的通知中心里以应用身份“Codex Quota”呈现。非打包应用没有接口直接指定这个标题，程序启动时会在 `HKCU\Software\Classes\AppUserModelId\CodexQuota.Overlay` 登记显示名与图标（注册表里的一次性登记，删除它只会让标题退回 `codex-quota.exe`）。
+
 ## 配置与日志
 
 应用数据保存在：
@@ -115,6 +117,7 @@ cargo run
 - `config.json`：窗口位置和应用设置
 - `usage-cache-v1.json`：本机 Codex 会话用量的增量解析缓存，不包含对话正文或凭据
 - `models-dev-openai.json`：上次成功拉取的 OpenAI 模型价格表
+- `app.ico`：用于通知显示名的应用图标副本（`IconUri` 只接受图标文件，不能用 exe 里的资源）
 - `notify-state.json`：通知去重记录（已经提醒过的余额周期），删掉只会让本期多弹一次
 - `codex-quota.log`：运行日志
 - `codex-quota.log.old`：轮换后的上一份日志

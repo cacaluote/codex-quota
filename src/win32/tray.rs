@@ -17,6 +17,8 @@ use super::{
     CMD_REFRESH_10_MIN, CMD_REFRESH_30_MIN, CMD_SHOW, CMD_TOPMOST, TRAY_REOPEN_GUARD,
     WM_APP_EXPAND,
 };
+#[cfg(debug_assertions)]
+use super::{CMD_TEST_NOTIFY_BALANCE, CMD_TEST_NOTIFY_RESET};
 use crate::error::AppError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +197,8 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
     // SAFETY: menu is valid and the final menu strings stay live through TrackPopupMenu.
     unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())? };
     append_menu_command(menu.0, CMD_EXIT, &exit, false, true)?;
+    #[cfg(debug_assertions)]
+    append_debug_entries(menu.0)?;
     // SAFETY: foreground ownership is required for dismissal; both HWND and menu are live.
     unsafe {
         let _ = SetForegroundWindow(hwnd);
@@ -236,6 +240,18 @@ fn append_refresh_interval_entries(menu: HMENU, state: TrayMenuState) -> Result<
             true,
         )?;
     }
+    Ok(())
+}
+
+/// 仅调试构建：菜单最下方追加两条"测试通知"，用来免等真实事件验证投递路径。
+#[cfg(debug_assertions)]
+fn append_debug_entries(menu: HMENU) -> Result<(), AppError> {
+    let reset = wide("测试通知：额度重置");
+    let balance = wide("测试通知：余额使用");
+    // SAFETY: menu is valid and separators do not carry string data.
+    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())? };
+    append_menu_command(menu, CMD_TEST_NOTIFY_RESET, &reset, false, true)?;
+    append_menu_command(menu, CMD_TEST_NOTIFY_BALANCE, &balance, false, true)?;
     Ok(())
 }
 

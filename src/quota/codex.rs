@@ -156,6 +156,8 @@ fn worker_loop<F>(
     let mut local_usage = LocalUsageStatus::default();
     let mut pull_failures = 0_usize;
     let mut next_pull_attempt = Instant::now();
+    // 手动刷新标记：置位后那一次拉取跳过"快照还新鲜"的判断。
+    let mut forced_pull = false;
     let mut next_watcher_retry = Instant::now() + WATCHER_RETRY_INTERVAL;
     let mut local_refresh_at: Option<Instant> = None;
     let mut prices = PriceTable::load();
@@ -169,7 +171,8 @@ fn worker_loop<F>(
 
     loop {
         if Instant::now() >= next_pull_attempt {
-            let pull_delay = local_pull_delay(state, SystemTime::now());
+            let pull_delay = pull_delay(forced_pull, state, SystemTime::now());
+            forced_pull = false;
             if pull_delay.is_zero() {
                 match pull_rpc_snapshot(state, notify, cancelled) {
                     Ok(()) => {
@@ -237,6 +240,8 @@ fn worker_loop<F>(
         match command_rx.recv_timeout(wait) {
             Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerCommand::Refresh) => {
+                // 手动刷新：这次不等快照变旧，直接向服务端要一次（见 pull_delay）。
+                forced_pull = true;
                 usage_tracker.require_full_scan();
                 refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
                 next_pull_attempt = Instant::now();
@@ -359,6 +364,17 @@ fn local_pull_threshold(state: &Arc<Mutex<AppState>>) -> Duration {
     state.lock().map_or(DEFAULT_REFRESH_INTERVAL, |current| {
         current.quota_refresh_interval
     })
+}
+
+/// 这次该等多久再拉：手动刷新（`forced`）立即拉，否则按快照新鲜度决定。
+///
+/// 托盘菜单的"立即刷新"必须真的向服务端要一次——否则一个叫立即刷新的按钮
+/// 只重扫本地日志，用户会以为程序卡住了。
+fn pull_delay(forced: bool, state: &Arc<Mutex<AppState>>, now: SystemTime) -> Duration {
+    if forced {
+        return Duration::ZERO;
+    }
+    local_pull_delay(state, now)
 }
 
 fn local_pull_delay(state: &Arc<Mutex<AppState>>, now: SystemTime) -> Duration {
@@ -941,6 +957,21 @@ mod tests {
         }));
 
         assert_eq!(local_pull_delay(&state, now), Duration::from_mins(3));
+    }
+
+    #[test]
+    fn a_manual_refresh_pulls_even_while_the_snapshot_is_still_fresh() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(now - Duration::from_mins(1))),
+            quota_refresh_interval: Duration::from_mins(5),
+            ..AppState::default()
+        }));
+
+        // 自动路径还要等 4 分钟；手动刷新必须立刻拉。
+        assert_eq!(local_pull_delay(&state, now), Duration::from_mins(4));
+        assert_eq!(pull_delay(true, &state, now), Duration::ZERO);
+        assert_eq!(pull_delay(false, &state, now), Duration::from_mins(4));
     }
 
     #[test]

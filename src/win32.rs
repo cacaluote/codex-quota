@@ -30,7 +30,9 @@ use layout::{
 };
 use presence::CodexPresenceWatcher;
 use renderer::Renderer;
-use system::{SingleInstance, disable_ime_for_current_thread, register_window_class};
+use system::{
+    SingleInstance, disable_ime_for_current_thread, register_app_identity, register_window_class,
+};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -77,6 +79,11 @@ const CMD_REFRESH_30_MIN: usize = 1011;
 const CMD_FOLLOW_CODEX: usize = 1012;
 const CMD_REFRESH_2_MIN: usize = 1013;
 const CMD_NOTIFY_RESET: usize = 1014;
+#[cfg(debug_assertions)]
+/// 仅调试构建：手动弹一条通知，用来验证声音、点击展开与通知中心里的应用名。
+const CMD_TEST_NOTIFY_RESET: usize = 1090;
+#[cfg(debug_assertions)]
+const CMD_TEST_NOTIFY_BALANCE: usize = 1091;
 const CMD_NOTIFY_OVERFLOW: usize = 1015;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
@@ -94,6 +101,8 @@ static OUTSIDE_CLICK_HWND: AtomicUsize = AtomicUsize::new(0);
 pub fn run() -> Result<(), AppError> {
     let app_dir = config::app_data_dir()?;
     crate::logging::init(&app_dir);
+    // 必须在创建任何 shell UI 之前登记，否则通知标题会退回可执行文件名。
+    register_app_identity();
     if !disable_ime_for_current_thread() {
         crate::logging::log("无法禁用 UI 线程输入法，将继续启动");
     }

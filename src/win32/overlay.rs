@@ -4,6 +4,7 @@ use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, KillTimer, SetTimer};
 
+use super::clipboard;
 use super::layout::{
     PanelAnimation, anchored_destination, animation_shape_rect, dip_to_px, expanded_destination,
     monitor_info, px_to_dip,
@@ -225,6 +226,45 @@ impl AppWindow {
         // UpdateLayeredWindow commits the new pixels, position, and size together. Calling
         // SetWindowPos first exposes the old 56-DIP bitmap for one compositor frame.
         self.render_at(destination, width, height)
+    }
+
+    /// 托盘「复制面板截图」：离屏渲染完整展开面板并写入剪贴板。
+    ///
+    /// 用临时渲染器画进独立位图，所以不碰悬浮窗的可见性、展开态与动画；收起或
+    /// 隐藏状态下截出来的同样是完整展开面板（与屏幕上看到的不一致，这是本意）。
+    pub(super) fn copy_panel_snapshot(&mut self) -> Result<(), AppError> {
+        if !self.overlay_active {
+            return Ok(());
+        }
+        // 高度与行集都由超额行可见性决定，必须取自同一份快照：锁里读到两次不同
+        // 数据会截出底部被裁掉或留白的面板。
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::Render("额度状态锁已损坏".to_owned()))?
+            .clone();
+        let width = dip_to_px(PANEL_WIDTH_DIP, self.dpi);
+        let height = dip_to_px(panel_height_dip(&state), self.dpi);
+
+        // 渲染与写入合并成同一条失败路径：设备创建、绘制、剪贴板占用、内存不足
+        // 都会落到这里。不走 `?`——消息循环对 `Err` 只写日志、不弹气泡，那会让
+        // 渲染侧的失败在界面上一声不响。气泡正文不指向具体原因（一条正文要覆盖
+        // 好几种原因，写死某一个就会骗人），真实原因留在日志里，因此这里用
+        // post 而不是 show：日志只记带细节的这一条。
+        match Renderer::new(width, height, self.dpi)
+            .and_then(|mut renderer| renderer.panel_snapshot(&state))
+            .and_then(|bitmap| clipboard::copy_panel_bitmap(&bitmap))
+        {
+            Ok(()) => {
+                crate::logging::log(&format!("面板截图已复制（{width}×{height}）"));
+                self.post_tray_balloon("面板截图", "已复制到剪贴板");
+            }
+            Err(error) => {
+                crate::logging::log(&format!("面板截图失败：{error}"));
+                self.post_tray_balloon("面板截图失败", "面板截图未完成，请重试");
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn toggle_expanded(&mut self) -> Result<(), AppError> {

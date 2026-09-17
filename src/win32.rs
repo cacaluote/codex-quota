@@ -9,6 +9,7 @@
     clippy::struct_excessive_bools
 )]
 
+mod clipboard;
 mod interaction;
 mod layout;
 mod notify;
@@ -85,6 +86,7 @@ const CMD_TEST_NOTIFY_RESET: usize = 1090;
 #[cfg(debug_assertions)]
 const CMD_TEST_NOTIFY_BALANCE: usize = 1091;
 const CMD_NOTIFY_OVERFLOW: usize = 1015;
+const CMD_COPY_PANEL: usize = 1016;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
 // 面板高度是动态的：随超额行可见性在 227/254/281 dip 间收缩，
@@ -120,6 +122,7 @@ pub fn run() -> Result<(), AppError> {
         return Ok(());
     }
     crate::logging::log("应用已启动");
+    let _ole = clipboard::OleGuard::try_init();
 
     // SAFETY: a null module name requests the current executable module.
     let module = unsafe { GetModuleHandleW(None) }?;

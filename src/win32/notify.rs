@@ -173,12 +173,18 @@ impl Notifier {
                 && !interrupted
                 && blind_gap <= blind_gap_limit(refresh_interval)
             {
-                for window in reset_windows(previous, next) {
-                    if switches.reset {
-                        notifications.push(Notification::Reset {
-                            window: window.window_short_label(),
-                            remaining_percent: window.remaining_percent(),
-                        });
+                // 重置通知要的是"现在可以用了"。另一个窗口仍然打满时这次换窗
+                // 没换来任何可用容量（账号照样发不出请求），"剩余 99%"就是一句
+                // 假承诺——周额度打满后每 5 小时一次的滚动都属于这一档。真正
+                // 恢复可用的那次换窗新快照不再 blocked，照常提醒。
+                if !next.is_blocked(now) {
+                    for window in reset_windows(previous, next) {
+                        if switches.reset {
+                            notifications.push(Notification::Reset {
+                                window: window.window_short_label(),
+                                remaining_percent: window.remaining_percent(),
+                            });
+                        }
                     }
                 }
             }
@@ -480,6 +486,265 @@ mod tests {
             notifications,
             vec![Notification::Reset {
                 window: "周".to_owned(),
+                remaining_percent: 100.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_five_hour_rollover_does_not_notify_while_the_weekly_window_is_exhausted() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        let weekly_reset = start + WEEK;
+
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(45.0, FIVE_HOURS, start + FIVE_HOURS),
+                Some(window(100.0, WEEK, weekly_reset)),
+                start,
+            ),
+            Some(0.0),
+        );
+        // 周额度打满，5h 窗口照常换窗：5h 的时钟确实重开了，但账号依旧发不出
+        // 请求，这条"剩余 100%"帮不上任何忙。
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(0.0, FIVE_HOURS, start + FIVE_HOURS * 2),
+                Some(window(100.0, WEEK, weekly_reset)),
+                start + Duration::from_mins(5),
+            ),
+            Some(0.0),
+        );
+
+        assert!(
+            notifications.is_empty(),
+            "周额度打满时 5h 换窗不提醒：{notifications:?}"
+        );
+    }
+
+    #[test]
+    fn the_rollover_that_restores_capacity_still_notifies() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        let weekly_reset = start + WEEK;
+        let short = || window(0.0, FIVE_HOURS, start + FIVE_HOURS * 2);
+
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(45.0, FIVE_HOURS, start + FIVE_HOURS),
+                Some(window(100.0, WEEK, weekly_reset)),
+                start,
+            ),
+            Some(0.0),
+        );
+        // 周额度打满期间的 5h 换窗保持静默。
+        assert!(
+            observe(
+                &mut notifier,
+                &mut state,
+                &snapshot(
+                    short(),
+                    Some(window(100.0, WEEK, weekly_reset)),
+                    start + Duration::from_mins(5),
+                ),
+                Some(0.0),
+            )
+            .is_empty()
+        );
+
+        // 周窗口自己换窗：账号真正恢复可用，这次必须提醒。
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                short(),
+                Some(window(0.0, WEEK, weekly_reset + WEEK)),
+                start + Duration::from_mins(10),
+            ),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            notifications,
+            vec![Notification::Reset {
+                window: "周".to_owned(),
+                remaining_percent: 100.0,
+            }],
+            "恢复可用的那次换窗不得被抑制"
+        );
+    }
+
+    #[test]
+    fn a_weekly_rollover_does_not_notify_while_the_five_hour_window_is_exhausted() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        // 周窗口在 start+5min 换窗，两次观测相隔 10 分钟——远小于盲区上限，
+        // 排除"中断不补发"这条规则的干扰。
+        let weekly_reset = start + Duration::from_mins(5);
+        let short = window(100.0, FIVE_HOURS, start + FIVE_HOURS);
+
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(short.clone(), Some(window(90.0, WEEK, weekly_reset)), start),
+            Some(0.0),
+        );
+        // 周额度回来了，5h 却还打满：账号仍被卡住，同样不值得打扰。
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                short,
+                Some(window(0.0, WEEK, weekly_reset + WEEK)),
+                start + Duration::from_mins(10),
+            ),
+            Some(0.0),
+        );
+        assert!(
+            notifications.is_empty(),
+            "5h 打满时周换窗不提醒：{notifications:?}"
+        );
+
+        // 5h 随后换窗，两个窗口都可用：这才是"可以干活了"。
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(0.0, FIVE_HOURS, start + FIVE_HOURS * 2),
+                Some(window(0.0, WEEK, weekly_reset + WEEK)),
+                start + Duration::from_mins(15),
+            ),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            notifications,
+            vec![Notification::Reset {
+                window: "5h".to_owned(),
+                remaining_percent: 100.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn rolling_both_windows_in_one_frame_notifies_for_both() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(45.0, FIVE_HOURS, start + FIVE_HOURS),
+                Some(window(100.0, WEEK, start + WEEK)),
+                start,
+            ),
+            Some(0.0),
+        );
+        // 同一帧里两个窗口都换：账号完全恢复，两条都要弹。
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(0.0, FIVE_HOURS, start + FIVE_HOURS * 2),
+                Some(window(0.0, WEEK, start + WEEK * 2)),
+                start + Duration::from_mins(5),
+            ),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            notifications,
+            vec![
+                Notification::Reset {
+                    window: "5h".to_owned(),
+                    remaining_percent: 100.0,
+                },
+                Notification::Reset {
+                    window: "周".to_owned(),
+                    remaining_percent: 100.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_window_account_still_notifies_on_a_rollover() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+
+        // 只有 5h 的账号没有"另一个窗口打满"这回事。
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(window(80.0, FIVE_HOURS, start + FIVE_HOURS), None, start),
+            Some(0.0),
+        );
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(1.0, FIVE_HOURS, start + FIVE_HOURS * 2),
+                None,
+                start + Duration::from_mins(5),
+            ),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            notifications,
+            vec![Notification::Reset {
+                window: "5h".to_owned(),
+                remaining_percent: 99.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_expired_blocking_window_does_not_suppress_the_reset() {
+        let start = base();
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        // 周窗口的重置时间已过：服务端早已把它换掉了，百分比不可知，不能再拿
+        // 它当"账号还卡着"的依据。
+        let stale_weekly = window(100.0, WEEK, start + Duration::from_mins(3));
+
+        observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(45.0, FIVE_HOURS, start + FIVE_HOURS),
+                Some(stale_weekly.clone()),
+                start,
+            ),
+            Some(0.0),
+        );
+        let notifications = observe(
+            &mut notifier,
+            &mut state,
+            &snapshot(
+                window(0.0, FIVE_HOURS, start + FIVE_HOURS * 2),
+                Some(stale_weekly),
+                start + Duration::from_mins(8),
+            ),
+            Some(0.0),
+        );
+
+        assert_eq!(
+            notifications,
+            vec![Notification::Reset {
+                window: "5h".to_owned(),
                 remaining_percent: 100.0,
             }]
         );

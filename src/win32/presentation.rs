@@ -113,10 +113,12 @@ pub(super) fn ball_quota(state: &AppState, now: SystemTime) -> (String, f64, Quo
     let Some(window) = short_term.or(long_term) else {
         return ("--".to_owned(), 0.0, QuotaColor::Unknown);
     };
-    let blocked = [short_term, long_term]
-        .into_iter()
-        .flatten()
-        .any(|active| active.remaining_percent() <= 0.0);
+    // 与重置通知共用同一套「卡死」语义（`QuotaSnapshot::is_blocked`）；能走到
+    // 这里说明快照没过期门控，所以两种口径看到的是同一对窗口。
+    let blocked = state
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.is_blocked(now));
     if blocked {
         return ("0".to_owned(), 0.0, QuotaColor::Critical);
     }

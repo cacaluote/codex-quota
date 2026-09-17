@@ -60,6 +60,7 @@ dependencies = [
  "time",
  "ureq",
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 

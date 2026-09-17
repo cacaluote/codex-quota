@@ -30,10 +30,10 @@ use super::tray::{
     copy_wide_fixed, handle_tray_message, refresh_interval_for_command, tray_icon_flags,
 };
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET,
-    CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_REDRAW,
-    TIMER_RING, TRAY_ID, WM_APP_COLLAPSE, WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED, WM_APP_SHOW,
-    WM_APP_TRAY, WM_APP_UPDATED,
+    AppWindow, CMD_AUTOSTART, CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW,
+    CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION,
+    TIMER_REDRAW, TIMER_RING, TRAY_ID, WM_APP_COLLAPSE, WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED,
+    WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
 };
 use crate::config::{self, AppConfigV1};
 use crate::error::AppError;
@@ -300,8 +300,20 @@ impl AppWindow {
     /// 因此调试入口可以复用它而不碰任何判定状态。
     fn show_notification(&self, notification: &Notification) {
         let (title, body) = notification.balloon_text();
+        self.show_tray_balloon(title, &body);
+    }
+
+    /// 投递一条托盘气泡并记日志。系统侧的通知设置（专注助手、通知总开关）同样
+    /// 能把它吞掉，所以靠气泡传达的反馈都只是尽力而为，真实结果以日志为准。
+    pub(super) fn show_tray_balloon(&self, title: &str, body: &str) {
         crate::logging::log(&format!("通知：{title} / {body}"));
-        if let Err(error) = notify::show_balloon(self.hwnd, title, &body) {
+        self.post_tray_balloon(title, body);
+    }
+
+    /// 只投递气泡，不记「通知：」日志。调用方自己记的那条往往带更多细节
+    /// （截图尺寸、失败原因），再补一条通用日志只是噪音。
+    pub(super) fn post_tray_balloon(&self, title: &str, body: &str) {
+        if let Err(error) = notify::show_balloon(self.hwnd, title, body) {
             crate::logging::log(&error.to_string());
         }
     }
@@ -449,6 +461,7 @@ impl AppWindow {
                 self.save_config();
                 Ok(())
             }
+            CMD_COPY_PANEL => self.copy_panel_snapshot(),
             CMD_FOLLOW_CODEX => self.set_follow_codex(!self.config.follow_codex),
             CMD_EXIT => {
                 // SAFETY: requests normal teardown of this live window.

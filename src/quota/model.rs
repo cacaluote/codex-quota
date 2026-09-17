@@ -99,6 +99,20 @@ impl QuotaSnapshot {
         )
     }
 
+    /// Whether any active window is exhausted. The account cannot serve
+    /// requests while any window sits at 100%, so a window that just rolled
+    /// over restored no usable capacity while another one is still full. This
+    /// is the one definition of "blocked" shared by the floating ball's zero
+    /// reading and by the reset notifications.
+    #[must_use]
+    pub fn is_blocked(&self, now: SystemTime) -> bool {
+        let (short_term, long_term) = self.active_windows(now);
+        [short_term, long_term]
+            .into_iter()
+            .flatten()
+            .any(|window| window.remaining_percent() <= 0.0)
+    }
+
     /// Whether any window of this snapshot has been reset server-side, which
     /// makes an on-demand refresh due regardless of the snapshot's age.
     #[must_use]
@@ -361,5 +375,55 @@ mod tests {
         assert!(short_term.is_none());
         assert!(long_term.is_some_and(|window| !window.has_expired(now)));
         assert!(snapshot.has_expired_window(now));
+    }
+
+    /// 快照带长短两个窗口：`now` 之后的重置时间保证两者都还活跃。
+    fn two_window_snapshot(
+        short_used: f64,
+        long_used: f64,
+        long_resets_at: SystemTime,
+        now: SystemTime,
+    ) -> QuotaSnapshot {
+        QuotaSnapshot {
+            limit_id: "codex".to_owned(),
+            primary: QuotaWindow {
+                used_percent: short_used,
+                window_duration: Duration::from_hours(5),
+                resets_at: now + Duration::from_hours(5),
+            },
+            secondary: Some(QuotaWindow {
+                used_percent: long_used,
+                window_duration: Duration::from_hours(168),
+                resets_at: long_resets_at,
+            }),
+            received_at: now,
+        }
+    }
+
+    #[test]
+    fn an_exhausted_active_window_blocks_the_account() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
+        // 5h 还有 55%：卡住账号的是打满的周窗口，不是短窗口。
+        let snapshot = two_window_snapshot(45.0, 100.0, now + Duration::from_hours(72), now);
+
+        assert!(snapshot.is_blocked(now));
+    }
+
+    #[test]
+    fn remaining_quota_in_both_windows_is_not_blocked() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
+        let snapshot = two_window_snapshot(10.0, 90.0, now + Duration::from_hours(72), now);
+
+        assert!(!snapshot.is_blocked(now));
+    }
+
+    #[test]
+    fn a_window_past_its_reset_time_does_not_block() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
+        // 周窗口的重置时间已过：它已被服务端换掉，百分比不可知，不能据此
+        // 认定账号被卡住。
+        let snapshot = two_window_snapshot(1.0, 100.0, now - Duration::from_mins(1), now);
+
+        assert!(!snapshot.is_blocked(now));
     }
 }

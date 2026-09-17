@@ -12,10 +12,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET,
-    CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN, CMD_REFRESH_5_MIN,
-    CMD_REFRESH_10_MIN, CMD_REFRESH_30_MIN, CMD_SHOW, CMD_TOPMOST, TRAY_REOPEN_GUARD,
-    WM_APP_EXPAND,
+    AppWindow, CMD_AUTOSTART, CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW,
+    CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN,
+    CMD_REFRESH_5_MIN, CMD_REFRESH_10_MIN, CMD_REFRESH_30_MIN, CMD_SHOW, CMD_TOPMOST,
+    TRAY_REOPEN_GUARD, WM_APP_EXPAND,
 };
 #[cfg(debug_assertions)]
 use super::{CMD_TEST_NOTIFY_BALANCE, CMD_TEST_NOTIFY_RESET};
@@ -134,6 +134,7 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
         "显示悬浮球"
     });
     let refresh = wide("立即刷新");
+    let copy_panel = wide("复制面板截图");
     let refresh_interval = wide("刷新间隔");
     let notifications = wide("通知");
     let topmost = wide("始终置顶");
@@ -150,6 +151,13 @@ fn display_tray_menu(hwnd: HWND, state: TrayMenuState) -> Result<(), AppError> {
         &refresh,
         false,
         refresh_command_is_enabled(state),
+    )?;
+    append_menu_command(
+        menu.0,
+        CMD_COPY_PANEL,
+        &copy_panel,
+        false,
+        screenshot_command_is_enabled(state),
     )?;
     // SAFETY: menu is valid and each string is NUL-terminated for the duration of appending.
     unsafe {
@@ -333,6 +341,13 @@ fn refresh_command_is_enabled(state: TrayMenuState) -> bool {
     state.overlay_active
 }
 
+/// 截图命令与「立即刷新」同一门控：面板资源没激活（跟随 Codex 且 Codex 未运行）
+/// 时既没有可刷新的数据，也没有可截的画面。悬浮球只是隐藏或收起不影响截图。
+/// 转发给刷新门控，避免两处条件各写一份后漂移。
+fn screenshot_command_is_enabled(state: TrayMenuState) -> bool {
+    refresh_command_is_enabled(state)
+}
+
 fn should_suppress_tray_reopen(closed: Instant, event: Instant) -> bool {
     event
         .checked_duration_since(closed)
@@ -420,6 +435,32 @@ mod tests {
     #[test]
     fn immediate_refresh_is_disabled_without_active_overlay_resources() {
         assert!(!refresh_command_is_enabled(TrayMenuState::default()));
+    }
+
+    #[test]
+    fn screenshot_is_disabled_while_following_codex_without_codex() {
+        // 跟随模式且 Codex 未运行：面板资源已释放，没有可截的画面。
+        assert!(!screenshot_command_is_enabled(TrayMenuState::default()));
+        assert!(!screenshot_command_is_enabled(TrayMenuState {
+            follow_codex: true,
+            overlay_active: false,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn screenshot_stays_enabled_while_the_ball_is_hidden_or_collapsed() {
+        // 隐藏或收起都不释放面板资源，截图仍然可用。
+        assert!(screenshot_command_is_enabled(TrayMenuState {
+            overlay_active: true,
+            visible: false,
+            ..Default::default()
+        }));
+        assert!(screenshot_command_is_enabled(TrayMenuState {
+            overlay_active: true,
+            visible: true,
+            ..Default::default()
+        }));
     }
 
     #[test]

@@ -50,7 +50,11 @@ use super::presentation::{
 use crate::error::AppError;
 use crate::quota::{AppState, QuotaColor, QuotaWindow};
 
-const BACKGROUND: D2D1_COLOR_F = rgba(0x12, 0x17, 0x20, 0.94);
+const BACKGROUND_RGB: (u8, u8, u8) = (0x12, 0x17, 0x20);
+const BACKGROUND: D2D1_COLOR_F = rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGROUND_RGB.2, 0.94);
+/// 截图铺满位图的实心底。RGB 与 [`BACKGROUND`] 共用 [`BACKGROUND_RGB`]，仅 alpha 为 1。
+const SNAPSHOT_BACKGROUND: D2D1_COLOR_F =
+    rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGROUND_RGB.2, 1.0);
 const TRACK: D2D1_COLOR_F = rgba(0x42, 0x4a, 0x57, 0.88);
 const PRIMARY_TEXT: D2D1_COLOR_F = rgba(0xf2, 0xf5, 0xf8, 1.0);
 const SECONDARY_TEXT: D2D1_COLOR_F = rgba(0xa8, 0xb1, 0xbe, 1.0);
@@ -141,6 +145,17 @@ struct DibSurface {
     bits: *mut u8,
     width: i32,
     height: i32,
+}
+
+/// 面板的离屏像素快照：像素尺寸与预乘 BGRA 缓冲。
+///
+/// 缓冲是独立于 [`Renderer`] 的一份拷贝：`DibSurface` 在 Drop 里会释放 DIB，
+/// 导出时必须拷出来，不能借用渲染器的内存。
+pub(super) struct PanelBitmap {
+    pub(super) width: i32,
+    pub(super) height: i32,
+    /// 自上而下、每行 `width * 4` 字节，通道顺序 BGRA，alpha 已预乘。
+    pub(super) pixels: Vec<u8>,
 }
 
 /// 悬浮球百分环的动画状态：额度补间 + 低额度脉冲。
@@ -363,6 +378,22 @@ impl Renderer {
         self.surface.commit(hwnd, destination)
     }
 
+    /// 把当前展开面板画进本渲染器，并把像素拷成一份独立快照。
+    ///
+    /// 只在临时渲染器上调用：画面尺寸取自 surface 自身的像素尺寸，调用方按面板
+    /// 的 DIP 尺寸乘 DPI 建好渲染器即可。不走 `draw` 的 `Expanded` 分支——那条路
+    /// 清成透明再画圆角玻璃底，截图贴到白底/黑底上会在四角露馅。这里铺不透明
+    /// 面板色再画内容，整张图是直角实心卡。`draw_panel_content` 取 `&self`，不
+    /// 推进 `RingState`；`draw_snapshot` 的 `&mut self` 只作用于这个临时渲染器。
+    pub(super) fn panel_snapshot(&mut self, state: &AppState) -> Result<PanelBitmap, AppError> {
+        self.draw_snapshot(state)?;
+        Ok(PanelBitmap {
+            width: self.surface.width,
+            height: self.surface.height,
+            pixels: self.copy_pixels(),
+        })
+    }
+
     fn recreate_device_resources(&mut self, dpi: u32) -> Result<(), AppError> {
         self.target = create_target(&self.factory, dpi)?;
         self.brushes = create_brushes(&self.target)?;
@@ -374,6 +405,27 @@ impl Renderer {
     }
 
     fn draw(&mut self, visual: VisualState, state: &AppState) -> Result<(), AppError> {
+        self.prepare_draw(&TRANSPARENT)?;
+
+        match visual {
+            VisualState::Collapsed => self.draw_ball(state)?,
+            VisualState::Expanded => self.draw_panel(state),
+            VisualState::Transition(transition) => {
+                self.draw_transition(state, transition)?;
+            }
+        }
+
+        self.end_draw()
+    }
+
+    /// 截图专用：不透明面板色铺满位图，再画文字，不画圆角透明底。
+    fn draw_snapshot(&mut self, state: &AppState) -> Result<(), AppError> {
+        self.prepare_draw(&SNAPSHOT_BACKGROUND)?;
+        self.draw_panel_content(state, 1.0);
+        self.end_draw()
+    }
+
+    fn prepare_draw(&mut self, clear: &D2D1_COLOR_F) -> Result<(), AppError> {
         self.surface.clear();
         let bounds = RECT {
             left: 0,
@@ -387,20 +439,21 @@ impl Renderer {
             self.target
                 .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             self.target.BeginDraw();
-            self.target.Clear(Some(&TRANSPARENT));
+            self.target.Clear(Some(clear));
         }
+        Ok(())
+    }
 
-        match visual {
-            VisualState::Collapsed => self.draw_ball(state)?,
-            VisualState::Expanded => self.draw_panel(state),
-            VisualState::Transition(transition) => {
-                self.draw_transition(state, transition)?;
-            }
-        }
-
-        // SAFETY: EndDraw balances BeginDraw above on the same UI thread.
+    fn end_draw(&mut self) -> Result<(), AppError> {
+        // SAFETY: EndDraw balances the BeginDraw in prepare_draw on the same UI thread.
         unsafe { self.target.EndDraw(None, None) }?;
         Ok(())
+    }
+
+    fn copy_pixels(&self) -> Vec<u8> {
+        // SAFETY: bits points to this surface's byte_len()-byte DIB allocation, which stays
+        // valid while the surface is alive; the bytes are copied out before the renderer drops.
+        unsafe { std::slice::from_raw_parts(self.surface.bits, self.surface.byte_len()) }.to_vec()
     }
 
     fn draw_ball(&mut self, state: &AppState) -> Result<(), AppError> {
@@ -1106,17 +1159,20 @@ impl DibSurface {
         })
     }
 
-    fn clear(&self) {
-        let byte_len = usize::try_from(self.width)
+    fn byte_len(&self) -> usize {
+        usize::try_from(self.width)
             .ok()
             .and_then(|width| {
                 usize::try_from(self.height)
                     .ok()
                     .map(|height| width * height * 4)
             })
-            .unwrap_or(0);
-        // SAFETY: bits points to this surface's width*height*4-byte DIB allocation.
-        unsafe { ptr::write_bytes(self.bits, 0, byte_len) };
+            .unwrap_or(0)
+    }
+
+    fn clear(&self) {
+        // SAFETY: bits points to this surface's byte_len()-byte DIB allocation.
+        unsafe { ptr::write_bytes(self.bits, 0, self.byte_len()) };
     }
 
     fn commit(&self, hwnd: HWND, destination: POINT) -> Result<(), AppError> {
@@ -1168,7 +1224,7 @@ fn wide(value: &str) -> Vec<u16> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::RingState;
+    use super::{AppState, Renderer, RingState, VisualState};
     use crate::win32::layout::{
         PULSE_MIN_OPACITY, PULSE_PERIOD, RING_PULSE_FRAME_MILLIS, RING_TWEEN_FRAME_MILLIS,
         RingAnimation, pulse_opacity,
@@ -1431,5 +1487,104 @@ mod tests {
         // 相位起点后 10ms 仍接近最亮（脉冲从最亮处起步）。
         assert!(ring.pulse_factor(later, true) > 0.99);
         assert_eq!(ring.frame_interval(later), Some(RING_TWEEN_FRAME_MILLIS));
+    }
+
+    /// 离屏 D2D 绘制。这是全仓库唯一依赖真实 GDI/D2D 的测试，需要能创建内存 DC
+    /// 的桌面会话；断言只取不变量（尺寸、透明度、预乘关系），不比对具体文字像素，
+    /// 避免随字体与 DPI 漂移。
+    fn offscreen_panel_renderer() -> (Renderer, AppState, i32, i32) {
+        use crate::win32::PANEL_WIDTH_DIP;
+        use crate::win32::layout::dip_to_px;
+        use crate::win32::presentation::panel_height_dip;
+
+        let state = AppState::default();
+        let width = dip_to_px(PANEL_WIDTH_DIP, 96);
+        let height = dip_to_px(panel_height_dip(&state), 96);
+        let renderer = Renderer::new(width, height, 96).expect("创建离屏渲染器");
+        (renderer, state, width, height)
+    }
+
+    fn pixel_at(pixels: &[u8], width: i32, x: i32, y: i32) -> [u8; 4] {
+        let index = usize::try_from((y * width + x) * 4).unwrap();
+        pixels[index..index + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn expanded_draw_keeps_transparent_corners() {
+        let (mut renderer, state, width, height) = offscreen_panel_renderer();
+        renderer
+            .draw(VisualState::Expanded, &state)
+            .expect("绘制展开面板");
+        let pixels = renderer.copy_pixels();
+
+        for (x, y) in [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ] {
+            assert_eq!(
+                pixel_at(&pixels, width, x, y)[3],
+                0,
+                "({x},{y}) 落在圆角之外，应当全透明"
+            );
+        }
+        let background = pixel_at(&pixels, width, width / 2, 1)[3];
+        assert!(background > 0, "面板顶边中点应当有背景");
+        assert!(background < 255, "悬浮窗背景是半透明的，不该出现不透明像素");
+
+        for pixel in pixels.chunks_exact(4) {
+            assert!(
+                pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3],
+                "像素通道超过了 alpha，说明缓冲不是预乘的"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_snapshot_is_opaque_without_rounded_corners() {
+        let (mut renderer, state, width, height) = offscreen_panel_renderer();
+        let bitmap = renderer.panel_snapshot(&state).expect("渲染面板");
+
+        assert_eq!((bitmap.width, bitmap.height), (width, height));
+        assert_eq!(
+            bitmap.pixels.len(),
+            usize::try_from(width * height * 4).unwrap()
+        );
+
+        const OPAQUE_BACKGROUND: [u8; 4] = [
+            super::BACKGROUND_RGB.2,
+            super::BACKGROUND_RGB.1,
+            super::BACKGROUND_RGB.0,
+            255,
+        ];
+        for (x, y) in [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ] {
+            assert_eq!(
+                pixel_at(&bitmap.pixels, width, x, y),
+                OPAQUE_BACKGROUND,
+                "({x},{y}) 截图四角应铺成不透明面板色"
+            );
+        }
+        assert_eq!(
+            pixel_at(&bitmap.pixels, width, width / 2, 1),
+            OPAQUE_BACKGROUND,
+            "截图顶边中点应是不透明面板色，不再留半透明内缩"
+        );
+        assert!(
+            bitmap.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255),
+            "截图每一像素都应当不透明"
+        );
+        assert!(
+            bitmap
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel != OPAQUE_BACKGROUND),
+            "截图应当含有文字等内容，不能整张都是纯底"
+        );
     }
 }

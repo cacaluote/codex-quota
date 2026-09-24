@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime};
 
+use crate::config::{ColorStyle, UnitStyle};
+
 /// 菜单未配置/状态锁损坏时的兜底刷新间隔。
 pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 
@@ -36,16 +38,6 @@ impl QuotaWindow {
         format_duration_name(self.window_duration)
     }
 
-    #[must_use]
-    pub fn reset_label(&self, now: SystemTime) -> String {
-        match self.resets_at.duration_since(now) {
-            Ok(remaining) if !remaining.is_zero() => {
-                format!("{}后重置", format_compact_duration(remaining))
-            }
-            _ => "等待刷新".to_owned(),
-        }
-    }
-
     /// A window whose reset time has passed was already replaced server-side,
     /// so its remaining percentage is unknowable and must not be displayed.
     #[must_use]
@@ -60,6 +52,24 @@ pub enum QuotaColor {
     Warning,
     Critical,
     Unknown,
+}
+
+/// 额度拉取的**在途**状态，驱动悬浮球上的不确定进度弧。
+///
+/// 只有真正在途才算：退避等待不是进度，让它无限旋转就等于又给应用装了一个
+/// 永不停止的动效。在途的时长由一次 RPC 决定（有超时兜底），因此这段旋转
+/// 天然有界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuotaPull {
+    /// 没有在拉取。
+    #[default]
+    Idle,
+    /// 用户手动刷新（托盘「立即刷新」）：无论球上有没有值都转，这是这次点击
+    /// 唯一的反馈，而托盘菜单一关就没有别的动静了。
+    Forced,
+    /// 自动拉取（快照变旧、窗口重置到期、或启动后的第一次）：只在球上本来
+    /// 没值可显示时才转，否则会按刷新间隔周期性闪动。
+    Automatic,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +147,8 @@ pub enum ConnectionStatus {
 pub struct AppState {
     pub status: ConnectionStatus,
     pub snapshot: Option<QuotaSnapshot>,
+    /// 是否正在向服务端拉取额度（见 [`QuotaPull`]）。
+    pub quota_pull: QuotaPull,
     pub plan_type: Option<String>,
     pub today_tokens: Option<u64>,
     pub current_period_tokens: Option<u64>,
@@ -160,6 +172,13 @@ pub struct AppState {
     pub current_period_overflow_credits: Option<f64>,
     /// 本期 credits 实扣折算美元（账户级）。
     pub current_period_overflow_cost: Option<f64>,
+    /// 重置时间列是否附带紧凑倒计时（配置 → 渲染的载体，与
+    /// [`AppState::quota_refresh_interval`] 同样的做法）。
+    pub show_reset_countdown: bool,
+    /// Token 用量的单位风格。
+    pub token_unit: UnitStyle,
+    /// 额度状态配色的风格（配置 → 渲染的载体，与 [`AppState::token_unit`] 同样的做法）。
+    pub color_style: ColorStyle,
 }
 
 impl Default for AppState {
@@ -167,6 +186,7 @@ impl Default for AppState {
         Self {
             status: ConnectionStatus::Connecting,
             snapshot: None,
+            quota_pull: QuotaPull::Idle,
             plan_type: None,
             today_tokens: None,
             current_period_tokens: None,
@@ -181,6 +201,11 @@ impl Default for AppState {
             current_period_overflow_tokens: None,
             current_period_overflow_credits: None,
             current_period_overflow_cost: None,
+            // 默认与 `AppConfigV1::default()` 一致；真正的来源是配置，这两项只是
+            // 在没有配置时的兜底（例如测试与截图路径）。
+            show_reset_countdown: true,
+            token_unit: UnitStyle::Zh,
+            color_style: ColorStyle::Soft,
         }
     }
 }
@@ -236,23 +261,6 @@ fn format_duration_name(duration: Duration) -> String {
         format!("{}小时", minutes / 60)
     } else {
         format!("{minutes}分钟")
-    }
-}
-
-fn format_compact_duration(duration: Duration) -> String {
-    let total_minutes = duration.as_secs() / 60;
-    let days = total_minutes / 1_440;
-    let hours = (total_minutes % 1_440) / 60;
-    let minutes = total_minutes % 60;
-
-    if days > 0 {
-        format!("{days}天{hours}小时")
-    } else if hours > 0 {
-        format!("{hours}小时{minutes}分")
-    } else if minutes > 0 {
-        format!("{minutes}分钟")
-    } else {
-        "不到1分钟".to_owned()
     }
 }
 

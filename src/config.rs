@@ -30,6 +30,31 @@ pub enum AnchorEdge {
     Bottom,
 }
 
+/// 数值单位风格：中文（万/亿）或西文（K/M/B）。
+///
+/// 只影响 Token 用量这类计数；重置时间列的倒计时固定用紧凑西文（`1d6h`），
+/// 因为中文写法（`1天6小时`）比它宽约 25 DIP，会超出重置列的宽度。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitStyle {
+    #[default]
+    Zh,
+    En,
+}
+
+/// 额度状态配色的风格。
+///
+/// 两套配色是同一个色相族（绿—琥珀—红）的两种处理方式，差别在饱和度与明度，
+/// 换的是渲染器里那三支状态笔刷；面板底色、文字、未知灰与套餐徽标色都不跟着变。
+/// 「柔和」是既有观感，新装机与老配置都落在这里。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorStyle {
+    #[default]
+    Soft,
+    Vivid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WindowPlacement {
@@ -63,8 +88,23 @@ pub struct AppConfigV1 {
     pub collapse_on_outside_click: bool,
     pub notify_on_reset: bool,
     pub notify_on_overflow: bool,
+    /// 重置时间列是否在本地时间后附带紧凑倒计时。
+    ///
+    /// 默认开，因此旧配置文件（没有这个键）也必须落到 `true`：字段级
+    /// `serde(default = ...)` 会覆盖结构体级的 `#[serde(default)]`。
+    #[serde(default = "default_true")]
+    pub show_reset_countdown: bool,
+    /// Token 用量的单位风格。
+    pub token_unit: UnitStyle,
+    /// 额度状态配色的风格。
+    pub color_style: ColorStyle,
     pub quota_refresh_interval_secs: u64,
     pub follow_codex_check_interval_secs: u64,
+}
+
+/// 旧配置文件里缺失该键时的默认值。
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfigV1 {
@@ -78,6 +118,9 @@ impl Default for AppConfigV1 {
             collapse_on_outside_click: true,
             notify_on_reset: true,
             notify_on_overflow: true,
+            show_reset_countdown: true,
+            token_unit: UnitStyle::Zh,
+            color_style: ColorStyle::Soft,
             quota_refresh_interval_secs: DEFAULT_QUOTA_REFRESH_INTERVAL_SECS,
             follow_codex_check_interval_secs: DEFAULT_FOLLOW_CODEX_CHECK_INTERVAL_SECS,
         }
@@ -292,6 +335,49 @@ mod tests {
             }"#,
         );
         assert_eq!(config.ok().map(|value| value.follow_codex), Some(false));
+    }
+
+    #[test]
+    fn legacy_config_enables_the_reset_countdown_and_chinese_units() {
+        let config = serde_json::from_str::<AppConfigV1>(
+            r#"{
+                "version": 1,
+                "always_on_top": true,
+                "start_with_windows": false
+            }"#,
+        );
+
+        let config = config.expect("旧配置应当仍能解析");
+        assert!(
+            config.show_reset_countdown,
+            "缺失该键时必须落到 true：它默认是开的"
+        );
+        assert_eq!(config.token_unit, UnitStyle::Zh, "单位风格默认中文");
+        assert_eq!(
+            config.color_style,
+            ColorStyle::Soft,
+            "配色默认柔和：老用户的观感不能因为加了这套风格就变"
+        );
+        assert_eq!(config, AppConfigV1::default());
+    }
+
+    #[test]
+    fn display_settings_round_trip_through_json() {
+        let mut config = AppConfigV1 {
+            show_reset_countdown: false,
+            token_unit: UnitStyle::En,
+            color_style: ColorStyle::Vivid,
+            ..AppConfigV1::default()
+        };
+        config.normalize();
+        let text = serde_json::to_string(&config).expect("序列化");
+        assert!(text.contains("\"show_reset_countdown\":false"), "{text}");
+        assert!(text.contains("\"token_unit\":\"en\""), "{text}");
+        assert!(text.contains("\"color_style\":\"vivid\""), "{text}");
+        let parsed = serde_json::from_str::<AppConfigV1>(&text).expect("反序列化");
+        assert!(!parsed.show_reset_countdown);
+        assert_eq!(parsed.token_unit, UnitStyle::En);
+        assert_eq!(parsed.color_style, ColorStyle::Vivid);
     }
 
     #[test]

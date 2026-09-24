@@ -52,7 +52,11 @@ pub(super) enum Notification {
 
 impl Notification {
     /// 通知气泡的标题与正文。
-    pub(super) fn balloon_text(&self) -> (&'static str, String) {
+    ///
+    /// `period` 是期间前缀（`本周` / `本月`），由调用方从当前长期额度窗口取，
+    /// 与面板的「本周使用」等行**同一个来源**——否则面板说周、通知说"本期"，
+    /// 两处读的是同一段时间却用两个词。
+    pub(super) fn balloon_text(&self, period: &str) -> (&'static str, String) {
         match self {
             Self::Reset {
                 window,
@@ -69,7 +73,7 @@ impl Notification {
             Self::Overflow { credits } => (
                 "已开始动用余额",
                 format!(
-                    "本期已扣 {} credits（约 {}）",
+                    "{period}已扣 {} credits（约 {}）",
                     format_credits(*credits),
                     format_usd(Some(credits * CREDITS_USD_RATE))
                 ),
@@ -1393,7 +1397,7 @@ mod tests {
             remaining_percent: 99.4,
         };
         assert_eq!(
-            five_hour.balloon_text(),
+            five_hour.balloon_text("本周"),
             ("额度已重置", "5h 窗口已重置，当前剩余 99%".to_owned())
         );
 
@@ -1402,11 +1406,31 @@ mod tests {
             window: "周".to_owned(),
             remaining_percent: 100.0,
         };
-        assert_eq!(weekly.balloon_text().1, "周窗口已重置，当前剩余 100%");
+        assert_eq!(weekly.balloon_text("本周").1, "周窗口已重置，当前剩余 100%");
 
-        let (title, body) = Notification::Overflow { credits: 310.25 }.balloon_text();
+        let (title, body) = Notification::Overflow { credits: 310.25 }.balloon_text("本周");
         assert_eq!(title, "已开始动用余额");
-        assert_eq!(body, "本期已扣 310.25 credits（约 $12.41）");
+        assert_eq!(body, "本周已扣 310.25 credits（约 $12.41）");
+    }
+
+    /// 余额正文里的期间前缀跟着长期窗口走，和面板同一套词。
+    #[test]
+    fn overflow_balloon_uses_the_panel_period_wording() {
+        let overflow = Notification::Overflow { credits: 1.0 };
+        assert_eq!(
+            overflow.balloon_text("本周").1,
+            "本周已扣 1 credits（约 $0.04）"
+        );
+        assert_eq!(
+            overflow.balloon_text("本月").1,
+            "本月已扣 1 credits（约 $0.04）"
+        );
+        // 5h 单窗口账号拿不到期间键（`period_key` 为 None），这条通知根本不会弹；
+        // 真弹了也退回中性说法，不会硬说"本周"。
+        assert_eq!(
+            overflow.balloon_text("本期").1,
+            "本期已扣 1 credits（约 $0.04）"
+        );
     }
 
     #[test]

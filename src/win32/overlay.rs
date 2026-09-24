@@ -13,7 +13,7 @@ use super::presentation::{COMPACT_PANEL_HEIGHT_DIP, panel_height_dip};
 use super::renderer::{Renderer, TransitionVisual, VisualState};
 use super::{
     ANIMATION_FRAME_MILLIS, AppWindow, COLLAPSE_ANIMATION_DURATION, COLLAPSED_DIP,
-    EXPAND_ANIMATION_DURATION, PANEL_WIDTH_DIP, TIMER_ANIMATION, TIMER_RING,
+    EXPAND_ANIMATION_DURATION, PANEL_WIDTH_DIP, TIMER_ANIMATION, TIMER_BALL,
 };
 use crate::error::AppError;
 
@@ -87,21 +87,23 @@ impl AppWindow {
                 .map_err(|_| AppError::Render("额度状态锁已损坏".to_owned()))?
                 .clone();
             // 动效开关必须在绘制前推送，否则关闭动效后仍会画出某一帧的暗色。
-            let ring_enabled = self.ring_animations_allowed();
+            let animations_enabled = self.ball_animations_allowed();
+            let (hovered, pressed) = self.pointer_targets();
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_ring_animation_enabled(ring_enabled);
+                renderer.set_animations_enabled(animations_enabled);
+                renderer.set_pointer_targets(hovered, pressed);
                 renderer.resize(width, height, self.dpi)?;
                 renderer.render(self.hwnd, destination, visual, &state)?;
             }
         }
         // 绘制推进了动效状态，据此驱动或停掉帧定时器。
-        self.sync_ring_frames();
+        self.sync_ball_frames();
         Ok(())
     }
 
     /// 悬浮球动效是否允许运行：系统动画开关 ∧ 已激活 ∧ 球可见 ∧ 面板未展开
     /// ∧ 未在拖拽。绘制前推送与帧定时器门控共用这一处判定，避免两份条件漂移。
-    fn ring_animations_allowed(&self) -> bool {
+    fn ball_animations_allowed(&self) -> bool {
         self.overlay_active
             && self.visible
             && !self.expanded
@@ -109,43 +111,61 @@ impl AppWindow {
             && self.animations_enabled
     }
 
+    /// 本帧的指针态：光标在不在球上、左键按没按下。
+    ///
+    /// 拖拽期间两者**保持为真**：球这时候最该说明"它在我手里"。拖拽本身不跑
+    /// 补间（`ball_animations_allowed` 会关掉），保持按下不多出一帧；而如果不
+    /// 保持，越过拖拽阈值的那一刻球会弹回原大小，按下的反馈正好在它该持续的
+    /// 时候消失。
+    fn pointer_targets(&self) -> (bool, bool) {
+        let interactive = self.overlay_active && self.visible && !self.expanded;
+        (
+            interactive && self.hovered,
+            interactive && self.pointer_down,
+        )
+    }
+
     /// 按渲染器给出的间隔驱动悬浮球动效的帧定时器。只在目标间隔变化时重设，
     /// 避免每帧重置定时器导致它永远不触发。
-    fn sync_ring_frames(&mut self) {
-        let desired = if self.ring_animations_allowed() {
+    fn sync_ball_frames(&mut self) {
+        let desired = if self.ball_animations_allowed() {
             self.renderer
                 .as_ref()
-                .and_then(Renderer::ring_frame_interval)
+                .and_then(Renderer::animation_frame_interval)
         } else {
             None
         };
-        if desired == self.ring_frame_millis {
+        if desired == self.ball_frame_millis {
             return;
         }
         let Some(millis) = desired else {
-            self.stop_ring_frames();
+            self.stop_ball_frames();
             return;
         };
         if self.hwnd.is_invalid() {
             return;
         }
-        self.ring_frame_millis = Some(millis);
-        // SAFETY: the HWND timer is UI-thread-owned and removed by stop_ring_frames.
-        if unsafe { SetTimer(Some(self.hwnd), TIMER_RING, millis, None) } == 0 {
+        self.ball_frame_millis = Some(millis);
+        // SAFETY: the HWND timer is UI-thread-owned and removed by stop_ball_frames.
+        if unsafe { SetTimer(Some(self.hwnd), TIMER_BALL, millis, None) } == 0 {
             crate::logging::log("无法创建悬浮球动画计时器，本次动效已跳过");
-            self.ring_frame_millis = None;
+            self.ball_frame_millis = None;
         }
     }
 
-    pub(super) fn stop_ring_frames(&mut self) {
-        self.ring_frame_millis = None;
+    pub(super) fn stop_ball_frames(&mut self) {
+        self.ball_frame_millis = None;
         if !self.hwnd.is_invalid() {
-            // SAFETY: removes only this window's fixed ring animation timer ID.
-            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_RING) };
+            // SAFETY: removes only this window's fixed ball animation timer ID.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_BALL) };
         }
     }
 
     pub(super) fn render_animation_frame(&mut self, now: Instant) -> Result<(), AppError> {
+        // 吸附动画与面板动画互斥，但都可能占用 TIMER_ANIMATION，先看吸附。
+        if self.snap.is_some() {
+            return self.render_snap_frame(now);
+        }
         let Some(animation) = self.animation else {
             return self.render();
         };
@@ -275,6 +295,8 @@ impl AppWindow {
         if !self.overlay_active {
             return Ok(());
         }
+        // 展开/收起要按当前真实位置重新算落点，所以先把吸附收尾。
+        self.finish_snap()?;
         if self.animation.is_some() {
             self.finish_animation()?;
         }

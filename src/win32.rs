@@ -25,8 +25,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use interaction::DragVelocity;
 use layout::{
-    ExpansionAlignment, PanelAnimation, dip_to_px, monitor_for_device, monitor_info,
+    ExpansionAlignment, PanelAnimation, SnapAnimation, dip_to_px, monitor_for_device, monitor_info,
     position_from_config, primary_monitor,
 };
 use presence::CodexPresenceWatcher;
@@ -61,8 +62,16 @@ const WM_APP_PRESENCE_CHANGED: u32 = WM_APP + 5;
 const WM_APP_EXPAND: u32 = WM_APP + 6;
 const TIMER_REDRAW: usize = 1;
 const TIMER_ANIMATION: usize = 2;
-const TIMER_RING: usize = 3;
-const ANIMATION_FRAME_MILLIS: u32 = 16;
+const TIMER_BALL: usize = 3;
+/// `WM_MOUSELEAVE`：windows crate 只把它绑在 `Win32_UI_Controls` 下，为一个常量
+/// 开整个 feature 不划算，这里按 SDK 值自己定义。
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// 面板动画（展开/收起）与吸附滑动的帧间隔。
+///
+/// 与 `layout::RING_TWEEN_FRAME_MILLIS` 同因同果：`SetTimer` 的到期时间被量化到
+/// 系统时钟节拍（默认 15.625ms）上，请求 16ms 会稳定地退化成两拍（31.2ms /
+/// 32fps），请求 10ms 才能每拍都触发（15.6ms / 64fps）。
+const ANIMATION_FRAME_MILLIS: u32 = 10;
 const EXPAND_ANIMATION_DURATION: Duration = Duration::from_millis(160);
 const COLLAPSE_ANIMATION_DURATION: Duration = Duration::from_millis(130);
 const TRAY_ID: u32 = 1;
@@ -87,6 +96,11 @@ const CMD_TEST_NOTIFY_RESET: usize = 1090;
 const CMD_TEST_NOTIFY_BALANCE: usize = 1091;
 const CMD_NOTIFY_OVERFLOW: usize = 1015;
 const CMD_COPY_PANEL: usize = 1016;
+const CMD_RESET_COUNTDOWN: usize = 1017;
+const CMD_TOKEN_UNIT_ZH: usize = 1018;
+const CMD_TOKEN_UNIT_EN: usize = 1019;
+const CMD_COLOR_STYLE_SOFT: usize = 1020;
+const CMD_COLOR_STYLE_VIVID: usize = 1021;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
 // 面板高度是动态的：随超额行可见性在 227/254/281 dip 间收缩，
@@ -133,10 +147,9 @@ pub fn run() -> Result<(), AppError> {
         crate::logging::log(&error.to_string());
         AppConfigV1::default()
     });
-    let state = Arc::new(Mutex::new(AppState {
-        quota_refresh_interval: config.quota_refresh_interval(),
-        ..AppState::default()
-    }));
+    // 显示偏好（倒计时、用量单位、配色）与刷新间隔都来自配置，单一映射见
+    // `window::state_from_config`——跟随模式重启时换的那份状态走的是同一处。
+    let state = Arc::new(Mutex::new(window::state_from_config(&config)));
     let initial_monitor =
         monitor_for_device(&config.placement.monitor_device).unwrap_or_else(primary_monitor);
     let dpi = 96;
@@ -209,8 +222,10 @@ struct AppWindow {
     renderer: Option<Renderer>,
     outside_click_hook: Option<HHOOK>,
     animation: Option<PanelAnimation>,
+    /// 拖拽松手后的边缘吸附动画；与面板动画互斥（不可能同时展开面板又拖球）。
+    snap: Option<SnapAnimation>,
     /// 悬浮球动效帧定时器当前设定的间隔（毫秒）；None 表示未在跑。
-    ring_frame_millis: Option<u32>,
+    ball_frame_millis: Option<u32>,
     animations_enabled: bool,
     expanded: bool,
     expansion_alignment: ExpansionAlignment,
@@ -218,10 +233,14 @@ struct AppWindow {
     overlay_active: bool,
     codex_present: bool,
     presence_generation: u32,
+    /// 光标是否停在球上（靠 `WM_MOUSEMOVE` 与 `WM_MOUSELEAVE` 维护）。
+    hovered: bool,
     dragging: bool,
     pointer_down: bool,
     drag_cursor_origin: POINT,
     drag_window_origin: POINT,
+    /// 拖拽期间的光标速度：松手后的吸附用它作为起点速度，做到速度连续。
+    drag_velocity: DragVelocity,
     dpi: u32,
     taskbar_created: u32,
     tray_added: bool,

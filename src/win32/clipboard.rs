@@ -919,8 +919,13 @@ mod tests {
             let handle = unsafe { GetClipboardData(u32::from(CF_BITMAP)) }.expect("读取 CF_BITMAP");
             let mut info = BITMAP::default();
             let expected = i32::try_from(size_of::<BITMAP>()).unwrap();
-            let copied =
-                unsafe { GetObjectW(HGDIOBJ(handle.0), expected, Some(ptr::from_mut(&mut info).cast())) };
+            let copied = unsafe {
+                GetObjectW(
+                    HGDIOBJ(handle.0),
+                    expected,
+                    Some(ptr::from_mut(&mut info).cast()),
+                )
+            };
             assert_eq!(copied, expected, "CF_BITMAP 应是一只可查询的位图");
             assert_eq!(info.bmWidth, width, "CF_BITMAP 的宽度");
             // 顶向下 DIB section 的高度符号由实现决定，只比绝对值。

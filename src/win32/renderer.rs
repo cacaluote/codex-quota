@@ -16,11 +16,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_ROUND,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory,
-    ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -39,16 +40,20 @@ use windows::core::{Interface, PCWSTR};
 use windows_numerics::Vector2;
 
 use super::layout::{
-    PULSE_PERIOD, RING_PULSE_FRAME_MILLIS, RING_TWEEN_FRAME_MILLIS, RingAnimation, pulse_opacity,
+    HOVER_TWEEN, PRESS_TWEEN, PULSE_PERIOD, RELEASE_TWEEN, RING_PULSE_FRAME_MILLIS,
+    RING_SPIN_FRAME_MILLIS, RING_TWEEN_FRAME_MILLIS, SPIN_PERIOD, SPIN_SWEEP, Tween, phase_at,
+    pulse_opacity,
 };
 use super::presentation::{
-    COMMUNITY_WEEKLY_VALUE_USD, FIRST_ROW_TOP_DIP, PlanColor, ROW_STEP_DIP, ball_quota,
-    display_period_total_value, display_windows, format_local_timestamp, format_token_usage,
-    format_usd, panel_title, period_overflow_visible, plan_type_color, plan_type_label,
-    quota_window_label, today_overflow_visible,
+    FIRST_ROW_TOP_DIP, PlanColor, ROW_STEP_DIP, ball_is_pulling, ball_quota,
+    display_period_total_token_estimate, display_period_total_value, display_windows,
+    format_local_timestamp, format_reset_column, format_token_usage, format_usd, panel_title,
+    period_labels, period_overflow_visible, plan_type_color, plan_type_label, quota_window_label,
+    today_overflow_visible,
 };
+use crate::config::{ColorStyle, UnitStyle};
 use crate::error::AppError;
-use crate::quota::{AppState, QuotaColor, QuotaWindow};
+use crate::quota::{AppState, QuotaColor, QuotaPull, QuotaWindow};
 
 const BACKGROUND_RGB: (u8, u8, u8) = (0x12, 0x17, 0x20);
 const BACKGROUND: D2D1_COLOR_F = rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGROUND_RGB.2, 0.94);
@@ -56,12 +61,56 @@ const BACKGROUND: D2D1_COLOR_F = rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGR
 const SNAPSHOT_BACKGROUND: D2D1_COLOR_F =
     rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGROUND_RGB.2, 1.0);
 const TRACK: D2D1_COLOR_F = rgba(0x42, 0x4a, 0x57, 0.88);
+/// 悬停时的底色与轨道：只提亮、不换色相——球上唯一的彩色语义是额度。
+const BACKGROUND_HOVER: D2D1_COLOR_F = rgba(0x1e, 0x25, 0x33, 0.97);
+const TRACK_HOVER: D2D1_COLOR_F = rgba(0x54, 0x5e, 0x6e, 0.95);
+/// 不确定进度弧：中性浅灰，与绿/黄/红三个额度色都不撞。
+const SPINNER: D2D1_COLOR_F = rgba(0xc3, 0xcb, 0xd6, 1.0);
 const PRIMARY_TEXT: D2D1_COLOR_F = rgba(0xf2, 0xf5, 0xf8, 1.0);
 const SECONDARY_TEXT: D2D1_COLOR_F = rgba(0xa8, 0xb1, 0xbe, 1.0);
-const GREEN: D2D1_COLOR_F = rgba(0x45, 0xd4, 0x83, 1.0);
-const YELLOW: D2D1_COLOR_F = rgba(0xf2, 0xc9, 0x4c, 1.0);
-const RED: D2D1_COLOR_F = rgba(0xf0, 0x66, 0x66, 1.0);
 const UNKNOWN: D2D1_COLOR_F = rgba(0x7d, 0x87, 0x95, 1.0);
+
+/// 一套额度状态配色：健康 / 警告 / 紧张。
+///
+/// 两套的色相基本同族（绿—琥珀—红），差别只在饱和度与明度，因此风格名按
+/// 「处理方式」取而不是按颜色本身取（「薄荷」「珊瑚」在两套里都成立，读不出
+/// 区别）。这是这三个色值唯一的出处，别处不许再写字面量。
+///
+/// 「未知」灰（[`UNKNOWN`]）与套餐徽标色不属于这套配色：前者是"没有数据"，
+/// 两套风格下都该保持沉默；后者是身份不是严重度，换配色不该动它。
+#[derive(Clone, Copy)]
+struct Palette {
+    healthy: D2D1_COLOR_F,
+    warning: D2D1_COLOR_F,
+    critical: D2D1_COLOR_F,
+}
+
+/// 「柔和」：为深色玻璃底调的一组中等饱和色。既有观感，也是默认。
+const SOFT_PALETTE: Palette = Palette {
+    healthy: rgba(0x45, 0xd4, 0x83, 1.0),
+    warning: rgba(0xf2, 0xc9, 0x4c, 1.0),
+    critical: rgba(0xf0, 0x66, 0x66, 1.0),
+};
+
+/// 「鲜艳」：同一族色相拉满饱和度与明度，在暗底上更抢眼。
+///
+/// 「紧张」取珊瑚红而非纯红：饱和度拉满后纯红在暗底上会显得发闷，往品红偏
+/// 一点才和其它两色一样"亮"。注意它和「正常」青绿一样偏离了「柔和」的色相，
+/// 前者靠近套餐徽标的 Business/Edu 青绿，换这套配色时这两处会读成一族颜色。
+const VIVID_PALETTE: Palette = Palette {
+    healthy: rgba(0x3d, 0xf2, 0xc1, 1.0),
+    warning: rgba(0xff, 0xc8, 0x57, 1.0),
+    critical: rgba(0xff, 0x64, 0x7c, 1.0),
+};
+
+impl Palette {
+    const fn of(style: ColorStyle) -> Self {
+        match style {
+            ColorStyle::Soft => SOFT_PALETTE,
+            ColorStyle::Vivid => VIVID_PALETTE,
+        }
+    }
+}
 const PLAN_NEUTRAL: D2D1_COLOR_F = rgba(0x8f, 0x9b, 0xaa, 1.0);
 const PLAN_PLUS: D2D1_COLOR_F = rgba(0x5a, 0xa7, 0xff, 1.0);
 const PLAN_PRO: D2D1_COLOR_F = rgba(0xa7, 0x8b, 0xfa, 1.0);
@@ -70,6 +119,25 @@ const PLAN_ENTERPRISE: D2D1_COLOR_F = rgba(0xd8, 0xb4, 0x5c, 1.0);
 const PLAN_EDU: D2D1_COLOR_F = rgba(0x56, 0xc7, 0xd9, 1.0);
 const TRANSPARENT: D2D1_COLOR_F = rgba(0, 0, 0, 0.0);
 const TIME_COLUMN_LEFT: f32 = 148.0;
+/// 重置列的右边界（dip）：比面板内边距（18）再靠近边缘一点。
+///
+/// 这一列要装 `09/18 23:26 (23h59m)` 这类最长的组合（实测 125.5 DIP），而
+/// 148 → `width - 18` 只有 122 DIP。文字左对齐，这里放宽的是**裁剪边界**、
+/// 不是文字位置：日常长度看起来毫无变化，只有最长的那几种才会用到这几点余量。
+/// 右边界不能靠"让给左边"来换——左侧紧邻百分比/价值列，见下面的 const 守卫。
+const RESET_COLUMN_RIGHT_PADDING: f32 = 10.0;
+/// 重置列起点必须让开百分比/价值列（96 → 140）。
+///
+/// 与 `layout.rs` 里的节拍守卫同样的写法：`expect` 而不是 `assert!`，因为常量
+/// 断言会被 `clippy::assertions_on_constants` 判成"恒定的断言"（本仓库 deny），
+/// 而这个检查的对象恰恰就是常量本身。
+#[expect(
+    clippy::manual_assert,
+    reason = "常量断言会被 assertions_on_constants 拒绝，这里的检查对象就是常量本身"
+)]
+const _: () = if TIME_COLUMN_LEFT < 140.0 {
+    panic!("重置列会压到百分比/价值列");
+};
 /// 文本字号（dip）：居中百分比、面板标题、正文。初次创建与设备资源重建
 /// 必须共用同一组常量，否则 DPI 变化或一次绘制失败重试后字号会漂移。
 const PERCENT_FONT_SIZE: f32 = 18.0;
@@ -82,6 +150,12 @@ pub(super) const BALL_RADIUS_DIP: f32 = 27.0;
 /// 仍在背景圆 27 dip 之内，因此弧不会压到球的边缘。
 const RING_RADIUS_DIP: f32 = 23.0;
 const RING_STROKE_DIP: f32 = 3.0;
+/// 不确定进度弧画在内圈：比额度弧细、半径更小，任何额度值下都不会与它重叠，
+/// 也不会压到中心数字（数字半高 13 dip，内圈内沿 18 dip）。
+const SPIN_RADIUS_DIP: f32 = 19.0;
+const SPIN_STROKE_DIP: f32 = 2.0;
+/// 按下时球缩小 6%：够看出"被按住了"，又不会小到像换了个控件。
+const PRESS_SCALE: f32 = 0.06;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum VisualState {
@@ -114,21 +188,35 @@ pub struct Renderer {
     target: ID2D1DCRenderTarget,
     write_factory: IDWriteFactory,
     brushes: Brushes,
+    /// 圆角端点的描边样式，供额度弧与不确定进度弧共用。
+    stroke_style: ID2D1StrokeStyle,
     percent_format: IDWriteTextFormat,
     title_format: IDWriteTextFormat,
     body_format: IDWriteTextFormat,
     ring: RingState,
+    pointer: PointerState,
+    /// UI 层推送的指针目标（悬停、按下）；补间的推进发生在真正画球时。
+    pointer_targets: (bool, bool),
+    /// 当前笔刷用的配色风格。绘制前与状态里的风格比对，不一致就只重建那三支
+    /// 状态笔刷——面板截图是"克隆状态 + 新建渲染器"，把风格留在状态里，这条
+    /// 路径才不用自己记得同步。
+    palette: ColorStyle,
     dpi: u32,
 }
 
 struct Brushes {
     background: ID2D1SolidColorBrush,
+    background_hover: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
+    track_hover: ID2D1SolidColorBrush,
+    spinner: ID2D1SolidColorBrush,
     primary_text: ID2D1SolidColorBrush,
     secondary_text: ID2D1SolidColorBrush,
-    green: ID2D1SolidColorBrush,
-    yellow: ID2D1SolidColorBrush,
-    red: ID2D1SolidColorBrush,
+    /// 额度状态三色（配色风格决定具体色值，见 [`Palette`]）。字段名按语义取，
+    /// 不按颜色取：换一套风格它们就不再是"绿/黄/红"了。
+    healthy: ID2D1SolidColorBrush,
+    warning: ID2D1SolidColorBrush,
+    critical: ID2D1SolidColorBrush,
     unknown: ID2D1SolidColorBrush,
     plan_neutral: ID2D1SolidColorBrush,
     plan_plus: ID2D1SolidColorBrush,
@@ -158,23 +246,27 @@ pub(super) struct PanelBitmap {
     pub(super) pixels: Vec<u8>,
 }
 
-/// 悬浮球百分环的动画状态：额度补间 + 低额度脉冲。
+/// 悬浮球百分环的动画状态：额度补间 + 低额度脉冲 + 不确定进度弧。
 ///
 /// 状态放在渲染器里，因为动画只在真正画球时推进；UI 层只负责按
-/// [`RingState::frame_interval`] 驱动帧定时器，并在不需要帧时停表。
+/// [`Renderer::animation_frame_interval`] 驱动帧定时器，并在不需要帧时停表。
 #[derive(Debug)]
 struct RingState {
-    animation: Option<RingAnimation>,
+    animation: Option<Tween>,
     /// 中心数字的滚动动画：与弧同时起步，但用更短的时长先落定。
-    label_animation: Option<RingAnimation>,
+    label_animation: Option<Tween>,
     /// 上一次已知的目标比例；None 表示不可知或为 0（此时不画弧）。
     target: Option<f64>,
     /// 脉冲相位起点：渲染器创建时开始，使球每次出现都从最亮处起步。
     pulse_epoch: Instant,
+    /// 不确定进度弧的相位起点：同样从创建时开始，转动方向与弧一致。
+    spin_epoch: Instant,
     /// 是否允许动效：系统动画开关 ∧ 球可见 ∧ 面板未展开 ∧ 未在拖拽。
     enabled: bool,
     /// 上一帧是否有脉冲在跑（决定帧率与是否需要继续出帧）。
     pulsing: bool,
+    /// 上一帧是否有旋转弧在跑。
+    spinning: bool,
     /// 下一个已知值要从 0 扫入：只在球刚出现时置位，消费一次即清。
     sweep_pending: bool,
 }
@@ -186,8 +278,10 @@ impl RingState {
             label_animation: None,
             target: None,
             pulse_epoch: now,
+            spin_epoch: now,
             enabled: true,
             pulsing: false,
+            spinning: false,
             // 渲染器随悬浮窗一起创建，因此首个值就是"球刚出现"。
             sweep_pending: true,
         }
@@ -200,6 +294,7 @@ impl RingState {
             self.animation = None;
             self.label_animation = None;
             self.pulsing = false;
+            self.spinning = false;
         }
     }
 
@@ -208,6 +303,14 @@ impl RingState {
         self.animation = None;
         self.label_animation = None;
         self.target = None;
+        self.sweep_pending = true;
+    }
+
+    /// 下一次拿到已知值时重新扫入，但**不清掉**当前值。
+    ///
+    /// 手动刷新期间球被清空（见 `draw_ball_content`），刷新结束后新值应该像球刚
+    /// 出现那样从 0 扫进去，而不是"啪"地跳回来。
+    fn expect_resweep(&mut self) {
         self.sweep_pending = true;
     }
 
@@ -233,14 +336,14 @@ impl RingState {
             (None, Some(to)) if self.sweep_pending => {
                 self.sweep_pending = false;
                 (
-                    Some(RingAnimation::sweep(to, now)),
-                    Some(RingAnimation::label_sweep(to, now)),
+                    Some(Tween::sweep(to, now)),
+                    Some(Tween::label_sweep(to, now)),
                 )
             }
             // 值变化：以当前插值结果为新起点，补间中途换目标时不会跳变。
             (Some(from), Some(to)) => (
-                Some(RingAnimation::new(from, to, now)),
-                label_from.map(|from| RingAnimation::label_tween(from, to, now)),
+                Some(Tween::new(from, to, now)),
+                label_from.map(|from| Tween::label_tween(from, to, now)),
             ),
             // 其余情况直接跳：变得不可知或归零是离散状态，插值会停在无意义的
             // 位置；数据从不可知恢复时球一直在，也无需再扫入一次。
@@ -274,21 +377,31 @@ impl RingState {
         Some(sample.fraction)
     }
 
-    /// 本帧脉冲的不透明度系数；`wanted` 表示当前处于低额度状态。
+    /// 本帧脉冲的不透明度系数；`wanted` 表示当前处于**仍有余额**的低额度。
+    ///
+    /// 已耗尽（0%）不在其中：它是冻结状态，只有时钟能改变它，重复的动效不带
+    /// 来新信息，而它恰恰是停留最久的状态（5 小时窗口按小时、周窗口按天）。
     fn pulse_factor(&mut self, now: Instant, wanted: bool) -> f32 {
         self.pulsing = wanted && self.enabled;
         if !self.pulsing {
             return 1.0;
         }
-        // 相位重新锚定：`now - epoch` 长时间运行后会到 10^6 秒量级，转成 f32
-        // 只剩约 0.1 秒分辨率，脉冲会变粗糙。锚定到"当前相位"后精度恒定，
-        // 且 epoch 只前进整数个周期，相位本身不变。
-        let elapsed = now.saturating_duration_since(self.pulse_epoch);
-        // `Duration` 没实现取模，按纳秒取余；余数必然小于一个周期（1.4e9 ns）。
-        let phase = Duration::from_nanos((elapsed.as_nanos() % PULSE_PERIOD.as_nanos()) as u64);
-        // phase ≤ elapsed = now − epoch，减法不会下溢；退路只是保留原锚点。
-        self.pulse_epoch = now.checked_sub(phase).unwrap_or(self.pulse_epoch);
+        let phase = phase_at(&mut self.pulse_epoch, now, PULSE_PERIOD);
         pulse_opacity(phase)
+    }
+
+    /// 本帧不确定进度弧的起点比例；None 表示不画。
+    ///
+    /// 它只在**真正在途**时出现（见 `ball_is_pulling`）：一次拉取在途，或启动阶段
+    /// 还没拿到第一份额度。两种都终结在同一处——首次读取成功（球上有值了），
+    /// 或彻底失败（`status` 离开 `Connecting`），因此不会像"等待重试"那样无限转。
+    fn spin_phase(&mut self, now: Instant, wanted: bool) -> Option<f64> {
+        self.spinning = wanted && self.enabled;
+        if !self.spinning {
+            return None;
+        }
+        let phase = phase_at(&mut self.spin_epoch, now, SPIN_PERIOD);
+        Some(phase.as_secs_f64() / SPIN_PERIOD.as_secs_f64())
     }
 
     /// 还需要多少毫秒出一帧；None 表示当前不需要帧定时器。
@@ -306,7 +419,127 @@ impl RingState {
         if tweening {
             return Some(RING_TWEEN_FRAME_MILLIS);
         }
+        if self.spinning {
+            return Some(RING_SPIN_FRAME_MILLIS);
+        }
         self.pulsing.then_some(RING_PULSE_FRAME_MILLIS)
+    }
+}
+
+/// 一条由布尔驱动的补间：目标是"在不在"，值是 0..1 的强度。
+///
+/// 值本身是唯一的事实来源，补间只是它的一次过渡；目标没变就绝不重起补间，
+/// 否则每帧都会从当前值重新出发、永远到不了终点。
+#[derive(Debug)]
+struct BoolTween {
+    target: bool,
+    value: f32,
+    tween: Option<Tween>,
+}
+
+impl BoolTween {
+    fn new() -> Self {
+        Self {
+            target: false,
+            value: 0.0,
+            tween: None,
+        }
+    }
+
+    /// 目标变化时从当前值起步；`enabled` 为假则直接落到目标值。
+    fn set_target(&mut self, target: bool, duration: Duration, enabled: bool, now: Instant) {
+        if target == self.target {
+            return;
+        }
+        self.target = target;
+        let to = if target { 1.0 } else { 0.0 };
+        if enabled {
+            self.tween = Some(Tween::timed(
+                f64::from(self.value),
+                f64::from(to),
+                now,
+                duration,
+            ));
+        } else {
+            self.tween = None;
+            self.value = to;
+        }
+    }
+
+    /// 立即落到目标值并丢弃在途补间。
+    fn snap(&mut self) {
+        self.tween = None;
+        self.value = if self.target { 1.0 } else { 0.0 };
+    }
+
+    fn sample(&mut self, now: Instant) -> f32 {
+        if let Some(tween) = self.tween {
+            let sample = tween.sample(now);
+            self.value = sample.fraction as f32;
+            if sample.finished {
+                self.tween = None;
+            }
+        }
+        self.value
+    }
+
+    /// 是否有一条补间在跑。稳态（值已达目标）不算——悬停住不动时不该有帧。
+    fn tweening(&self) -> bool {
+        self.tween.is_some()
+    }
+}
+/// 指针态动效：悬停提亮与按下缩放。
+///
+/// 目标是布尔（光标在不在球上、按钮按没按下），采样出 0..1 的强度。关闭动效
+/// 时直接给目标值："不播放动画"不等于"不指示状态"。
+#[derive(Debug)]
+struct PointerState {
+    hover: BoolTween,
+    press: BoolTween,
+    enabled: bool,
+}
+
+impl PointerState {
+    fn new() -> Self {
+        Self {
+            hover: BoolTween::new(),
+            press: BoolTween::new(),
+            enabled: true,
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.hover.snap();
+            self.press.snap();
+        }
+    }
+
+    fn set_targets(&mut self, hovered: bool, pressed: bool, now: Instant) {
+        self.hover
+            .set_target(hovered, HOVER_TWEEN, self.enabled, now);
+        // 按下快、回弹慢：手感差别全在这两个时长上。
+        let press_duration = if pressed { PRESS_TWEEN } else { RELEASE_TWEEN };
+        self.press
+            .set_target(pressed, press_duration, self.enabled, now);
+    }
+
+    /// 本帧的（悬停强度, 按下强度）。
+    fn sample(&mut self, now: Instant) -> (f32, f32) {
+        (self.hover.sample(now), self.press.sample(now))
+    }
+
+    fn tweening(&self) -> bool {
+        self.hover.tweening() || self.press.tweening()
+    }
+}
+
+/// 两个候选帧间隔取更快的那个；都是 None 才是真的不需要出帧。
+fn faster_interval(first: Option<u32>, second: Option<u32>) -> Option<u32> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (first, None) | (None, first) => first,
     }
 }
 
@@ -318,7 +551,9 @@ impl Renderer {
         // SAFETY: Shared DirectWrite factory creation has no borrowed output lifetime.
         let write_factory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
         let target = create_target(&factory, dpi)?;
-        let brushes = create_brushes(&target)?;
+        let brushes = create_brushes(&target, ColorStyle::default())?;
+        // 描边样式是工厂级资源（与设备无关），因此不随设备资源重建。
+        let stroke_style = create_round_stroke_style(&factory)?;
         let percent_format = create_text_format(&write_factory, PERCENT_FONT_SIZE, true)?;
         let title_format = create_text_format(&write_factory, TITLE_FONT_SIZE, false)?;
         let body_format = create_text_format(&write_factory, BODY_FONT_SIZE, false)?;
@@ -329,23 +564,38 @@ impl Renderer {
             target,
             write_factory,
             brushes,
+            stroke_style,
             percent_format,
             title_format,
             body_format,
             ring: RingState::new(Instant::now()),
+            pointer: PointerState::new(),
+            pointer_targets: (false, false),
+            palette: ColorStyle::default(),
             dpi,
         })
     }
 
     /// 由 UI 层在每帧绘制前设置：系统动画开关 ∧ 球可见 ∧ 面板未展开 ∧ 未拖拽。
-    /// 关闭时会丢弃进行中的补间，避免停在中间帧。
-    pub(super) fn set_ring_animation_enabled(&mut self, enabled: bool) {
+    /// 关闭时会丢弃进行中的补间，避免停在中间帧；但悬停与按下本身仍会立刻
+    /// 显示出来——系统要的是"别播放动画"，不是"别指示状态"。
+    pub(super) fn set_animations_enabled(&mut self, enabled: bool) {
         self.ring.set_enabled(enabled);
+        self.pointer.set_enabled(enabled);
+    }
+
+    /// 由 UI 层在每帧绘制前推送当前的指针态。
+    pub(super) fn set_pointer_targets(&mut self, hovered: bool, pressed: bool) {
+        self.pointer_targets = (hovered, pressed);
     }
 
     /// 悬浮球动效还需多少毫秒出一帧；None 表示可以停掉帧定时器。
-    pub(super) fn ring_frame_interval(&self) -> Option<u32> {
-        self.ring.frame_interval(Instant::now())
+    pub(super) fn animation_frame_interval(&self) -> Option<u32> {
+        let now = Instant::now();
+        let ring = self.ring.frame_interval(now);
+        // 指针补间固定用补间帧率：它只有 80–150ms，值得跑满帧。
+        let pointer = self.pointer.tweening().then_some(RING_TWEEN_FRAME_MILLIS);
+        faster_interval(ring, pointer)
     }
 
     /// 悬浮球重新出现（取消隐藏后再次显示）时调用，让弧重新从 0 扫入。
@@ -396,7 +646,7 @@ impl Renderer {
 
     fn recreate_device_resources(&mut self, dpi: u32) -> Result<(), AppError> {
         self.target = create_target(&self.factory, dpi)?;
-        self.brushes = create_brushes(&self.target)?;
+        self.brushes = create_brushes(&self.target, self.palette)?;
         self.percent_format = create_text_format(&self.write_factory, PERCENT_FONT_SIZE, true)?;
         self.title_format = create_text_format(&self.write_factory, TITLE_FONT_SIZE, false)?;
         self.body_format = create_text_format(&self.write_factory, BODY_FONT_SIZE, false)?;
@@ -404,7 +654,27 @@ impl Renderer {
         Ok(())
     }
 
+    /// 把状态里的配色风格落到笔刷上：只有真的换了风格才重建，且只重建那三支
+    /// 状态笔刷（底色、文字、轨道、徽标都不随风格变）。
+    fn sync_palette(&mut self, style: ColorStyle) -> Result<(), AppError> {
+        if self.palette == style {
+            return Ok(());
+        }
+        let palette = Palette::of(style);
+        let render_target: ID2D1RenderTarget = self.target.cast()?;
+        let brush = |color: &D2D1_COLOR_F| {
+            // SAFETY: color is borrowed only for this synchronous factory call.
+            unsafe { render_target.CreateSolidColorBrush(color, None) }
+        };
+        self.brushes.healthy = brush(&palette.healthy)?;
+        self.brushes.warning = brush(&palette.warning)?;
+        self.brushes.critical = brush(&palette.critical)?;
+        self.palette = style;
+        Ok(())
+    }
+
     fn draw(&mut self, visual: VisualState, state: &AppState) -> Result<(), AppError> {
+        self.sync_palette(state.color_style)?;
         self.prepare_draw(&TRANSPARENT)?;
 
         match visual {
@@ -420,6 +690,7 @@ impl Renderer {
 
     /// 截图专用：不透明面板色铺满位图，再画文字，不画圆角透明底。
     fn draw_snapshot(&mut self, state: &AppState) -> Result<(), AppError> {
+        self.sync_palette(state.color_style)?;
         self.prepare_draw(&SNAPSHOT_BACKGROUND)?;
         self.draw_panel_content(state, 1.0);
         self.end_draw()
@@ -457,24 +728,39 @@ impl Renderer {
     }
 
     fn draw_ball(&mut self, state: &AppState) -> Result<(), AppError> {
-        let scale = self.dpi as f32 / 96.0;
+        let now = Instant::now();
+        self.pointer
+            .set_targets(self.pointer_targets.0, self.pointer_targets.1, now);
+        let (hover, press) = self.pointer.sample(now);
+        // 按下把整个球（底色 + 两个环 + 数字）一起缩小，不是只改某一层。
+        let ball_scale = 1.0 - PRESS_SCALE * press;
+        let dpi_scale = self.dpi as f32 / 96.0;
         let center = Vector2 {
-            X: self.surface.width as f32 / (2.0 * scale),
-            Y: self.surface.height as f32 / (2.0 * scale),
+            X: self.surface.width as f32 / (2.0 * dpi_scale),
+            Y: self.surface.height as f32 / (2.0 * dpi_scale),
         };
-        self.draw_ball_background(center);
-        self.draw_ball_content(state, center, 1.0)
+        self.draw_ball_background(center, ball_scale, hover);
+        self.draw_ball_content(state, center, 1.0, ball_scale, hover, now)
     }
 
-    fn draw_ball_background(&self, center: Vector2) {
+    /// 球的底色。悬停时把底色整体提亮一档：分层窗口的圆角外没有任何边界可画，
+    /// 而底色一变，整个球的存在感就变了——这是"可以点"最省的提示。
+    fn draw_ball_background(&self, center: Vector2, ball_scale: f32, hover: f32) {
+        let radius = BALL_RADIUS_DIP * ball_scale;
         let circle = D2D1_ELLIPSE {
             point: center,
-            radiusX: BALL_RADIUS_DIP,
-            radiusY: BALL_RADIUS_DIP,
+            radiusX: radius,
+            radiusY: radius,
         };
         // SAFETY: the geometry and brush are renderer-owned and valid for this immediate call.
         unsafe {
             self.target.FillEllipse(&circle, &self.brushes.background);
+            if hover > 0.0 {
+                self.brushes.background_hover.SetOpacity(hover);
+                self.target
+                    .FillEllipse(&circle, &self.brushes.background_hover);
+                self.brushes.background_hover.SetOpacity(1.0);
+            }
         }
     }
 
@@ -483,13 +769,22 @@ impl Renderer {
         state: &AppState,
         center: Vector2,
         opacity: f32,
+        ball_scale: f32,
+        hover: f32,
+        now: Instant,
     ) -> Result<(), AppError> {
         let opacity = opacity.clamp(0.0, 1.0);
-        let now = Instant::now();
+        let hover = hover.clamp(0.0, 1.0);
+        let ring_radius = RING_RADIUS_DIP * ball_scale;
         // The ball is the glanceable summary: primary window remaining (or the
         // only window of single-window accounts), reading 0 while any active
         // window is exhausted and -- while no fresh snapshot is known.
         let (label, remaining, color) = ball_quota(state, SystemTime::now());
+        // 手动刷新期间球被清空（见 `ball_quota`），刷新结束后新值应该像球刚出现
+        // 那样从 0 扫进去，而不是"啪"地跳回来。
+        if matches!(state.quota_pull, QuotaPull::Forced) {
+            self.ring.expect_resweep();
+        }
         // 只有 0 < 剩余量 才有弧；不可知与 0 都是离散状态，直接跳不做补间。
         self.ring
             .retarget((remaining > 0.0).then_some(remaining / 100.0), now);
@@ -500,35 +795,61 @@ impl Renderer {
             (Some(_), Some(fraction)) => format!("{:.0}", fraction * 100.0),
             _ => label,
         };
-        // 低额度（<20% 或已耗尽）时脉冲。没有弧可脉冲时改脉冲轨道圆——
-        // 否则这个状态下球面上没有任何在动的东西。
-        let pulse = self
-            .ring
-            .pulse_factor(now, matches!(color, QuotaColor::Critical));
+        // 只有"还有余额的低额度"才呼吸；0% 与不可知都不动，应用因此可以停表。
+        let low = matches!(color, QuotaColor::Critical) && remaining > 0.0;
+        let pulse = self.ring.pulse_factor(now, low);
         let track_opacity = if arc.is_some() {
             opacity
         } else {
             opacity * pulse
         };
-
+        // 已耗尽与无数据都没有弧，环一律保持中性轨道：这个球的视觉语言只有
+        // "弧长 = 余量""整环 = 接近满额"两条，红色也已经专属给 <20%，给 0% 换
+        // 一只红色整环会同时破坏两者（满额与耗尽共用一个形状）。0% 因此不靠环
+        // 也不靠动效说话，它只报中心那个 `0`。
         let track = D2D1_ELLIPSE {
             point: center,
-            radiusX: RING_RADIUS_DIP,
-            radiusY: RING_RADIUS_DIP,
+            radiusX: ring_radius,
+            radiusY: ring_radius,
         };
-        // SAFETY: the brush is renderer-owned and its opacity is restored before returning.
+        // 悬停时轨道在两种颜色之间交叉淡入，透明度不变：暗轨道变亮，但不会
+        // 看起来像多了一条额度弧。
+        // SAFETY: both brushes are renderer-owned and their opacity is restored below.
         unsafe {
-            self.brushes.track.SetOpacity(track_opacity);
-            self.target
-                .DrawEllipse(&track, &self.brushes.track, RING_STROKE_DIP, None);
-            self.brushes.track.SetOpacity(1.0);
+            let base = track_opacity * (1.0 - hover);
+            if base > 0.0 {
+                self.brushes.track.SetOpacity(base);
+                self.target
+                    .DrawEllipse(&track, &self.brushes.track, RING_STROKE_DIP, None);
+                self.brushes.track.SetOpacity(1.0);
+            }
+            if hover > 0.0 {
+                self.brushes.track_hover.SetOpacity(track_opacity * hover);
+                self.target
+                    .DrawEllipse(&track, &self.brushes.track_hover, RING_STROKE_DIP, None);
+                self.brushes.track_hover.SetOpacity(1.0);
+            }
+        }
+
+        // 不确定进度弧画在内圈：无论额度弧取什么值都不会与它重叠。
+        let spinning = ball_is_pulling(state, color);
+        if let Some(phase) = self.ring.spin_phase(now, spinning) {
+            let result = self.draw_arc(
+                center,
+                SPIN_RADIUS_DIP * ball_scale,
+                SPIN_STROKE_DIP,
+                phase,
+                SPIN_SWEEP,
+                &self.brushes.spinner,
+            );
+            result?;
         }
 
         if let Some(fraction) = arc {
             let brush = self.brush_for(color);
             // SAFETY: the brush is renderer-owned and its opacity is restored after the draw.
             unsafe { brush.SetOpacity(opacity * pulse) };
-            let result = self.draw_progress_arc(center, RING_RADIUS_DIP, fraction, brush);
+            let result = self.draw_progress_arc(center, ring_radius, fraction, brush);
             // SAFETY: restores the shared brush even if geometry creation failed.
             unsafe { brush.SetOpacity(1.0) };
             result?;
@@ -576,6 +897,11 @@ impl Renderer {
         };
         self.draw_rounded_background(shape, radius);
         if transition.ball_opacity > 0.0 {
+            // 过渡中的球只是淡出/淡入的一层，不跟着指针缩放或提亮：那两件事
+            // 属于"球是一个可点的控件"，而这一刻它正在变成面板。（试过把按下
+            // 那一刻的缩放冻结下来带进过渡，但过渡里球的外圈已经变成面板的容器
+            // 形状，缩放带不走——结果会是"外圈弹回、内圈还缩着"的不一致，而球
+            // 在展开的头 30% 就淡完了，那点差别看不出来。）
             self.draw_ball_content(
                 state,
                 Vector2 {
@@ -583,6 +909,9 @@ impl Renderer {
                     Y: transition.ball_center.1,
                 },
                 transition.ball_opacity,
+                1.0,
+                0.0,
+                Instant::now(),
             )?;
         }
         if transition.panel_opacity > 0.0 {
@@ -655,12 +984,29 @@ impl Renderer {
         let (short_term, long_term) = display_windows(state, SystemTime::now());
         let short_term_label = quota_window_label(short_term, state.plan_type.as_deref(), true);
         let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
+        // 期间行的前缀与上面那行的窗口名同源（周额度 → 本周，月额度 → 本月），
+        // 三个标签一起生成，免得某个调用点漏掉后缀。
+        let period = period_labels(long_term, state.plan_type.as_deref());
         // 行位按可见行顺序排布：超额行大多不发生，未发生时不占位，面板
         // 高度由 panel_height_dip 按同一可见性规则收缩。
         let mut top = FIRST_ROW_TOP_DIP;
-        self.draw_quota_row(&short_term_label, short_term, top, width, opacity);
+        self.draw_quota_row(
+            &short_term_label,
+            short_term,
+            top,
+            width,
+            opacity,
+            state.show_reset_countdown,
+        );
         top += ROW_STEP_DIP;
-        self.draw_quota_row(&long_term_label, long_term, top, width, opacity);
+        self.draw_quota_row(
+            &long_term_label,
+            long_term,
+            top,
+            width,
+            opacity,
+            state.show_reset_countdown,
+        );
         top += ROW_STEP_DIP;
         self.draw_token_usage_row(
             "今日使用",
@@ -669,6 +1015,7 @@ impl Renderer {
             top,
             width,
             opacity,
+            state.token_unit,
         );
         top += ROW_STEP_DIP;
         if today_overflow_visible(state) {
@@ -679,30 +1026,33 @@ impl Renderer {
                 top,
                 width,
                 opacity,
+                state.token_unit,
             );
             top += ROW_STEP_DIP;
         }
         self.draw_token_usage_row(
-            "本期使用",
+            &period.usage,
             state.current_period_tokens,
             Some(state.current_period_cost),
             top,
             width,
             opacity,
+            state.token_unit,
         );
         top += ROW_STEP_DIP;
         if period_overflow_visible(state) {
             self.draw_token_usage_row(
-                "本期超额",
+                &period.overflow,
                 state.current_period_overflow_tokens,
                 Some(state.current_period_overflow_cost),
                 top,
                 width,
                 opacity,
+                state.token_unit,
             );
             top += ROW_STEP_DIP;
         }
-        self.draw_period_total_value_row(state, top, opacity);
+        self.draw_period_total_value_row(state, &period.estimate, top, width, opacity);
         top += ROW_STEP_DIP;
         self.draw_update_row(state, top, width, opacity);
     }
@@ -714,6 +1064,7 @@ impl Renderer {
         top: f32,
         width: f32,
         opacity: f32,
+        show_countdown: bool,
     ) {
         self.draw_text_with_opacity(
             label,
@@ -735,7 +1086,7 @@ impl Renderer {
                 D2D_RECT_F {
                     left: TIME_COLUMN_LEFT,
                     top,
-                    right: width - 18.0,
+                    right: width - RESET_COLUMN_RIGHT_PADDING,
                     bottom: top + 23.0,
                 },
                 opacity,
@@ -755,13 +1106,13 @@ impl Renderer {
             opacity,
         );
         self.draw_text_with_opacity(
-            &format_local_timestamp(window.resets_at),
+            &format_reset_column(window, SystemTime::now(), show_countdown),
             &self.body_format,
             &self.brushes.secondary_text,
             D2D_RECT_F {
                 left: TIME_COLUMN_LEFT,
                 top,
-                right: width - 18.0,
+                right: width - RESET_COLUMN_RIGHT_PADDING,
                 bottom: top + 23.0,
             },
             opacity,
@@ -797,7 +1148,7 @@ impl Renderer {
             &value,
             &self.body_format,
             if state.is_stale(now) {
-                &self.brushes.yellow
+                &self.brushes.warning
             } else {
                 &self.brushes.secondary_text
             },
@@ -815,6 +1166,7 @@ impl Renderer {
     /// 内层 `None` 表示价值未知（价值列显示 `--`，同额度行的未知态）。
     /// 有价值列时布局与额度行对齐：label | $价值(96→140) | tokens(140→)。
     #[allow(clippy::option_option)] // 三态（无价值列 / 未知 / 有值）用双 Option 语义最直接。
+    #[allow(clippy::too_many_arguments)]
     fn draw_token_usage_row(
         &self,
         label: &str,
@@ -823,6 +1175,7 @@ impl Renderer {
         top: f32,
         width: f32,
         opacity: f32,
+        unit: UnitStyle,
     ) {
         let label_right = if cost.is_some() {
             94.0
@@ -842,12 +1195,12 @@ impl Renderer {
             opacity,
         );
         if let Some(cost) = cost {
-            // 价值列与额度百分比同色（健康绿），视觉上与额度行成组。
+            // 价值列与额度百分比同色（健康色），视觉上与额度行成组。
             self.draw_text_with_opacity(
                 &format_usd(cost),
                 &self.body_format,
                 if cost.is_some() {
-                    &self.brushes.green
+                    &self.brushes.healthy
                 } else {
                     &self.brushes.unknown
                 },
@@ -861,7 +1214,7 @@ impl Renderer {
             );
         }
         self.draw_text_with_opacity(
-            &format_token_usage(tokens),
+            &format_token_usage(tokens, unit),
             &self.body_format,
             if tokens.is_some() {
                 &self.brushes.secondary_text
@@ -878,12 +1231,21 @@ impl Renderer {
         );
     }
 
-    /// 本期估值行：账号侧估算（绿色，96→140 列）+ 社区参考值（灰字，
-    /// 时间列位置）。两个数值按约定不带文字标注，靠颜色深浅区分。
-    fn draw_period_total_value_row(&self, state: &AppState, top: f32, opacity: f32) {
-        let estimate = display_period_total_value(state, SystemTime::now());
+    /// 期间估值行：账号侧估算（健康色美元，96→140 列）+ 满额 token 估算（灰字，
+    /// token 列位置）。两个数值按约定不带文字标注，靠颜色深浅区分。
+    /// `label` 是已经拼好的行名（`本周估值`），由 `presentation` 统一生成。
+    fn draw_period_total_value_row(
+        &self,
+        state: &AppState,
+        label: &str,
+        top: f32,
+        width: f32,
+        opacity: f32,
+    ) {
+        let now = SystemTime::now();
+        let estimate = display_period_total_value(state, now);
         self.draw_text_with_opacity(
-            "本期估值",
+            label,
             &self.body_format,
             &self.brushes.secondary_text,
             D2D_RECT_F {
@@ -898,7 +1260,7 @@ impl Renderer {
             &format_usd(estimate),
             &self.body_format,
             if estimate.is_some() {
-                &self.brushes.green
+                &self.brushes.healthy
             } else {
                 &self.brushes.unknown
             },
@@ -910,14 +1272,22 @@ impl Renderer {
             },
             opacity,
         );
+        // 灰字列与别的行的 token 列同位同款（同为「多少 token」），所以宽度也
+        // 走同一条 `TIME_COLUMN_LEFT → width - 18`，而不是原来给 `$120` 那种短
+        // 文本留的窄矩形。
+        let tokens = display_period_total_token_estimate(state, now);
         self.draw_text_with_opacity(
-            &format_usd(Some(COMMUNITY_WEEKLY_VALUE_USD)),
+            &format_token_usage(tokens, state.token_unit),
             &self.body_format,
-            &self.brushes.secondary_text,
+            if tokens.is_some() {
+                &self.brushes.secondary_text
+            } else {
+                &self.brushes.unknown
+            },
             D2D_RECT_F {
                 left: TIME_COLUMN_LEFT,
                 top,
-                right: 200.0,
+                right: width - 18.0,
                 bottom: top + 23.0,
             },
             opacity,
@@ -931,7 +1301,24 @@ impl Renderer {
         fraction: f64,
         brush: &ID2D1SolidColorBrush,
     ) -> Result<(), AppError> {
-        if fraction >= 0.999 {
+        self.draw_arc(center, radius, RING_STROKE_DIP, 0.0, fraction, brush)
+    }
+
+    /// 从 `from` 起顺时针画 `sweep` 比例的一段弧（比例是整圈的占比，起点在 12 点）。
+    ///
+    /// 额度弧的 `from` 恒为 0，不确定进度弧靠 `from` 转动——两者共用同一段
+    /// 几何代码，所以描边宽度、圆角端点与抗锯齿表现完全一致。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_arc(
+        &self,
+        center: Vector2,
+        radius: f32,
+        stroke: f32,
+        from: f64,
+        sweep: f64,
+        brush: &ID2D1SolidColorBrush,
+    ) -> Result<(), AppError> {
+        if sweep >= 0.999 {
             let ellipse = D2D1_ELLIPSE {
                 point: center,
                 radiusX: radius,
@@ -940,19 +1327,20 @@ impl Renderer {
             // SAFETY: immediate draw with valid geometry and renderer-owned brush.
             unsafe {
                 self.target
-                    .DrawEllipse(&ellipse, brush, RING_STROKE_DIP, None);
+                    .DrawEllipse(&ellipse, brush, stroke, Some(&self.stroke_style));
             }
             return Ok(());
         }
 
-        let angle = std::f64::consts::TAU * fraction;
+        let start_angle = std::f64::consts::TAU * from;
+        let end_angle = std::f64::consts::TAU * (from + sweep);
         let start = Vector2 {
-            X: center.X,
-            Y: center.Y - radius,
+            X: center.X + (start_angle.sin() as f32 * radius),
+            Y: center.Y - (start_angle.cos() as f32 * radius),
         };
         let end = Vector2 {
-            X: center.X + (angle.sin() as f32 * radius),
-            Y: center.Y - (angle.cos() as f32 * radius),
+            X: center.X + (end_angle.sin() as f32 * radius),
+            Y: center.Y - (end_angle.cos() as f32 * radius),
         };
         // SAFETY: factory, geometry, and sink are UI-thread COM objects. The sink is closed before
         // the geometry is drawn, and all stack geometry data outlives its immediate COM call.
@@ -968,7 +1356,7 @@ impl Renderer {
                 },
                 rotationAngle: 0.0,
                 sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                arcSize: if fraction > 0.5 {
+                arcSize: if sweep > 0.5 {
                     D2D1_ARC_SIZE_LARGE
                 } else {
                     D2D1_ARC_SIZE_SMALL
@@ -977,7 +1365,7 @@ impl Renderer {
             sink.EndFigure(D2D1_FIGURE_END_OPEN);
             sink.Close()?;
             self.target
-                .DrawGeometry(&geometry, brush, RING_STROKE_DIP, None);
+                .DrawGeometry(&geometry, brush, stroke, Some(&self.stroke_style));
         }
         Ok(())
     }
@@ -1009,9 +1397,9 @@ impl Renderer {
 
     fn brush_for(&self, color: QuotaColor) -> &ID2D1SolidColorBrush {
         match color {
-            QuotaColor::Healthy => &self.brushes.green,
-            QuotaColor::Warning => &self.brushes.yellow,
-            QuotaColor::Critical => &self.brushes.red,
+            QuotaColor::Healthy => &self.brushes.healthy,
+            QuotaColor::Warning => &self.brushes.warning,
+            QuotaColor::Critical => &self.brushes.critical,
             QuotaColor::Unknown => &self.brushes.unknown,
         }
     }
@@ -1047,7 +1435,29 @@ fn create_target(factory: &ID2D1Factory, dpi: u32) -> Result<ID2D1DCRenderTarget
     unsafe { factory.CreateDCRenderTarget(&properties) }.map_err(AppError::from)
 }
 
-fn create_brushes(target: &ID2D1DCRenderTarget) -> Result<Brushes, AppError> {
+/// 圆角端点的描边样式：弧的两端是半圆而不是平口。
+///
+/// 短弧最能看出差别——剩余 2% 时平口端点是一条几乎看不见的细刺，圆角端点是一颗
+/// 小圆点；长弧两端也一样，平口会让"余量"在视觉上被削掉一截。额度弧与不确定
+/// 进度弧共用这一份样式，两处的端头形状因此必然一致。
+fn create_round_stroke_style(factory: &ID2D1Factory) -> Result<ID2D1StrokeStyle, AppError> {
+    let properties = D2D1_STROKE_STYLE_PROPERTIES {
+        startCap: D2D1_CAP_STYLE_ROUND,
+        endCap: D2D1_CAP_STYLE_ROUND,
+        dashCap: D2D1_CAP_STYLE_ROUND,
+        lineJoin: D2D1_LINE_JOIN_ROUND,
+        // 实线样式下 miterLimit 不参与，写上 D2D 文档的默认值以免依赖 0.0 的巧合。
+        miterLimit: 10.0,
+        dashStyle: D2D1_DASH_STYLE_SOLID,
+        dashOffset: 0.0,
+    };
+    // SAFETY: properties is a plain data struct and the factory stays alive for this call.
+    let style = unsafe { factory.CreateStrokeStyle(&properties, None) }?;
+    Ok(style)
+}
+
+fn create_brushes(target: &ID2D1DCRenderTarget, style: ColorStyle) -> Result<Brushes, AppError> {
+    let palette = Palette::of(style);
     let render_target: ID2D1RenderTarget = target.cast()?;
     let brush = |color: &D2D1_COLOR_F| {
         // SAFETY: color is borrowed only for this synchronous factory call.
@@ -1055,12 +1465,15 @@ fn create_brushes(target: &ID2D1DCRenderTarget) -> Result<Brushes, AppError> {
     };
     Ok(Brushes {
         background: brush(&BACKGROUND)?,
+        background_hover: brush(&BACKGROUND_HOVER)?,
         track: brush(&TRACK)?,
+        track_hover: brush(&TRACK_HOVER)?,
+        spinner: brush(&SPINNER)?,
         primary_text: brush(&PRIMARY_TEXT)?,
         secondary_text: brush(&SECONDARY_TEXT)?,
-        green: brush(&GREEN)?,
-        yellow: brush(&YELLOW)?,
-        red: brush(&RED)?,
+        healthy: brush(&palette.healthy)?,
+        warning: brush(&palette.warning)?,
+        critical: brush(&palette.critical)?,
         unknown: brush(&UNKNOWN)?,
         plan_neutral: brush(&PLAN_NEUTRAL)?,
         plan_plus: brush(&PLAN_PLUS)?,
@@ -1222,12 +1635,15 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
-    use super::{AppState, Renderer, RingState, VisualState};
+    use super::{AppState, PointerState, Renderer, RingState, VisualState};
+    use crate::config::ColorStyle;
+    use crate::quota::{QuotaPull, QuotaSnapshot, QuotaWindow};
     use crate::win32::layout::{
-        PULSE_MIN_OPACITY, PULSE_PERIOD, RING_PULSE_FRAME_MILLIS, RING_TWEEN_FRAME_MILLIS,
-        RingAnimation, pulse_opacity,
+        HOVER_TWEEN, PRESS_TWEEN, PULSE_MIN_OPACITY, PULSE_PERIOD, RELEASE_TWEEN,
+        RING_PULSE_FRAME_MILLIS, RING_SPIN_FRAME_MILLIS, RING_TWEEN_FRAME_MILLIS, SPIN_PERIOD,
+        Tween, pulse_opacity,
     };
 
     #[test]
@@ -1241,7 +1657,7 @@ mod tests {
         assert_eq!(ring.fraction(start), Some(0.0));
         assert_eq!(ring.frame_interval(start), Some(RING_TWEEN_FRAME_MILLIS));
 
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.4).abs() < 1e-9);
         // 扫入结束后没有脉冲，就不再需要帧定时器。
         assert_eq!(ring.frame_interval(swept), None);
@@ -1252,7 +1668,7 @@ mod tests {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.4).abs() < 1e-9);
 
         // 数据变得不可知（例如快照过期），随后又恢复。
@@ -1270,14 +1686,14 @@ mod tests {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.4).abs() < 1e-9);
 
         ring.expect_appearance();
         ring.retarget(Some(0.4), swept);
 
         assert_eq!(ring.fraction(swept), Some(0.0), "重新出现应再次从 0 扫入");
-        let reswept = swept + RingAnimation::SWEEP_DURATION;
+        let reswept = swept + Tween::SWEEP_DURATION;
         assert!((ring.fraction(reswept).unwrap_or_default() - 0.4).abs() < 1e-9);
     }
 
@@ -1299,7 +1715,7 @@ mod tests {
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
         // 先让"球刚出现"的扫入跑完，再改值。
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.4).abs() < 1e-9);
 
         ring.retarget(Some(0.1), swept);
@@ -1308,7 +1724,7 @@ mod tests {
         assert!((first - 0.4).abs() < 1e-9, "补间应从旧值起步：{first}");
         assert_eq!(ring.frame_interval(swept), Some(RING_TWEEN_FRAME_MILLIS));
 
-        let settled = swept + RingAnimation::DURATION;
+        let settled = swept + Tween::DURATION;
         let value = ring.fraction(settled).unwrap_or_default();
         assert!((value - 0.1).abs() < 1e-9);
         assert_eq!(ring.frame_interval(settled), None);
@@ -1319,11 +1735,11 @@ mod tests {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.5), start);
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.5).abs() < 1e-9);
         // 值变化才起补间：0.5 → 0.1。
         ring.retarget(Some(0.1), swept);
-        let middle = swept + RingAnimation::DURATION / 2;
+        let middle = swept + Tween::DURATION / 2;
         let interpolated = ring.fraction(middle).unwrap_or_default();
         assert!(
             interpolated < 0.5 && interpolated > 0.1,
@@ -1337,9 +1753,7 @@ mod tests {
             (restarted - interpolated).abs() < 1e-9,
             "补间中途换目标不得跳变：{interpolated} → {restarted}"
         );
-        let settled = ring
-            .fraction(middle + RingAnimation::DURATION)
-            .unwrap_or_default();
+        let settled = ring.fraction(middle + Tween::DURATION).unwrap_or_default();
         assert!((settled - 0.9).abs() < 1e-9, "新目标应能跑到位：{settled}");
     }
 
@@ -1400,13 +1814,13 @@ mod tests {
         // 数字与弧同时从 0 起步。
         assert_eq!(ring.label_fraction(start), Some(0.0));
         // 数字先落定：滚动结束后不再出值，交给静态标签；弧此时还在扫。
-        let rolled = start + RingAnimation::LABEL_SWEEP;
+        let rolled = start + Tween::LABEL_SWEEP;
         assert_eq!(ring.label_fraction(rolled), None);
         let arc = ring.fraction(rolled).unwrap_or_default();
         assert!(arc > 0.0 && arc < 0.5, "弧应仍在扫入中：{arc}");
         assert_eq!(ring.frame_interval(rolled), Some(RING_TWEEN_FRAME_MILLIS));
 
-        let settled = start + RingAnimation::SWEEP_DURATION;
+        let settled = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(settled).unwrap_or_default() - 0.5).abs() < 1e-9);
         assert_eq!(ring.frame_interval(settled), None);
     }
@@ -1416,21 +1830,21 @@ mod tests {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.5), start);
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
         assert!((ring.fraction(swept).unwrap_or_default() - 0.5).abs() < 1e-9);
 
         ring.retarget(Some(0.1), swept);
 
         assert_eq!(ring.label_fraction(swept), Some(0.5), "从当前显示值起步");
         // 数字用更短的时长先落定，此刻弧还在补间。
-        let rolled = swept + RingAnimation::LABEL_TWEEN;
+        let rolled = swept + Tween::LABEL_TWEEN;
         assert_eq!(ring.label_fraction(rolled), None);
         let arc = ring.fraction(rolled).unwrap_or_default();
         assert!(arc < 0.5 && arc > 0.1, "弧应仍在补间中：{arc}");
         assert_eq!(ring.frame_interval(rolled), Some(RING_TWEEN_FRAME_MILLIS));
 
         // 弧落定后必须停止请求帧——数字比弧长会把这条测试打红。
-        let settled = swept + RingAnimation::DURATION;
+        let settled = swept + Tween::DURATION;
         assert!((ring.fraction(settled).unwrap_or_default() - 0.1).abs() < 1e-9);
         assert_eq!(ring.frame_interval(settled), None);
     }
@@ -1440,7 +1854,7 @@ mod tests {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
-        let swept = start + RingAnimation::SWEEP_DURATION;
+        let swept = start + Tween::SWEEP_DURATION;
 
         ring.retarget(None, swept);
 
@@ -1487,6 +1901,161 @@ mod tests {
         // 相位起点后 10ms 仍接近最亮（脉冲从最亮处起步）。
         assert!(ring.pulse_factor(later, true) > 0.99);
         assert_eq!(ring.frame_interval(later), Some(RING_TWEEN_FRAME_MILLIS));
+    }
+
+    #[test]
+    fn hover_tween_fades_in_and_stops_asking_for_frames() {
+        let start = Instant::now();
+        let mut pointer = PointerState::new();
+
+        pointer.set_targets(true, false, start);
+        assert!(pointer.sample(start).0.abs() < f32::EPSILON);
+        assert!(pointer.tweening(), "补间期间应当要求出帧");
+
+        let middle = pointer.sample(start + HOVER_TWEEN / 2).0;
+        assert!(middle > 0.5, "缓出曲线中点应已过半：{middle}");
+
+        let settled = pointer.sample(start + HOVER_TWEEN).0;
+        assert!((settled - 1.0).abs() < 1e-6);
+        // 稳态不再要求出帧：光标停在球上不动时不该有帧定时器。
+        assert!(!pointer.tweening());
+    }
+
+    #[test]
+    fn hover_tween_fades_out_from_wherever_it_was() {
+        let start = Instant::now();
+        let mut pointer = PointerState::new();
+        pointer.set_targets(true, false, start);
+        let halfway = start + HOVER_TWEEN / 2;
+        let value = pointer.sample(halfway).0;
+        assert!(value > 0.5 && value < 1.0);
+
+        pointer.set_targets(false, false, halfway);
+
+        // 从当前值往回走，而不是先跳到 1.0 再淡出。
+        assert!((pointer.sample(halfway).0 - value).abs() < 1e-6);
+        assert!(pointer.sample(halfway + HOVER_TWEEN).0.abs() < 1e-6);
+    }
+
+    #[test]
+    fn press_scales_in_faster_than_it_releases() {
+        let start = Instant::now();
+        let mut pointer = PointerState::new();
+
+        pointer.set_targets(false, true, start);
+        assert!(
+            (pointer.sample(start + PRESS_TWEEN).1 - 1.0).abs() < 1e-6,
+            "按下要在 PRESS_TWEEN 内到位"
+        );
+
+        let released = start + PRESS_TWEEN;
+        pointer.set_targets(false, false, released);
+
+        // 回弹配得更长：走过同样长的按下时长时，还没有回到 0。
+        let mid_release = pointer.sample(released + PRESS_TWEEN).1;
+        assert!(mid_release > 0.0, "回弹不该和按下一样快：{mid_release}");
+        assert!(pointer.sample(released + RELEASE_TWEEN).1.abs() < 1e-6);
+    }
+
+    #[test]
+    fn disabled_animations_jump_the_pointer_state_to_its_target() {
+        let start = Instant::now();
+        let mut pointer = PointerState::new();
+        pointer.set_enabled(false);
+
+        pointer.set_targets(true, true, start);
+
+        // 没有动画，但状态照样指示出来——系统关的是"动画"，不是"提示"。
+        let (hover, press) = pointer.sample(start);
+        assert!((hover - 1.0).abs() < f32::EPSILON);
+        assert!((press - 1.0).abs() < f32::EPSILON);
+        assert!(!pointer.tweening());
+    }
+
+    #[test]
+    fn spinner_rotates_while_pulling_and_stops_asking_for_frames() {
+        let start = Instant::now();
+        let mut ring = RingState::new(start);
+
+        // 不在拉取：没有旋转弧，也没有帧。
+        assert_eq!(ring.spin_phase(start, false), None);
+        assert_eq!(ring.frame_interval(start), None);
+
+        let phase = ring.spin_phase(start, true).expect("拉取时应当有旋转弧");
+        assert!(phase.abs() < 1e-6, "旋转弧从 12 点起步");
+        assert_eq!(ring.frame_interval(start), Some(RING_SPIN_FRAME_MILLIS));
+
+        let half = ring
+            .spin_phase(start + SPIN_PERIOD / 2, true)
+            .expect("仍在拉取");
+        assert!((half - 0.5).abs() < 1e-6, "半个周期后应转过半圈：{half}");
+
+        // 拉取结束：旋转弧消失，帧定时器随之停表。
+        assert_eq!(ring.spin_phase(start + SPIN_PERIOD, false), None);
+        assert_eq!(ring.frame_interval(start + SPIN_PERIOD), None);
+    }
+
+    /// 手动刷新时环被清空：球上只剩"正在刷新"这一件事，不再同时出现一条
+    /// 说"这是当前读数"的额度弧。
+    #[test]
+    fn manual_refresh_paints_no_quota_arc_on_the_ring() {
+        use crate::win32::layout::dip_to_px;
+
+        let now = SystemTime::now();
+        let state = AppState {
+            snapshot: Some(QuotaSnapshot {
+                limit_id: "codex".to_owned(),
+                primary: QuotaWindow {
+                    used_percent: 38.0,
+                    window_duration: Duration::from_hours(5),
+                    resets_at: now + Duration::from_hours(4),
+                },
+                secondary: None,
+                received_at: now,
+            }),
+            ..AppState::default()
+        };
+        let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
+        let radius = dip_to_px(super::RING_RADIUS_DIP, 96);
+        // 3 点方向：剩余 62% 的额度弧一定扫过这里。
+        let sample = |state: &AppState| {
+            let (pixels, side) = ball_pixels(state, false, false);
+            pixel_at(&pixels, side, center + radius, center)
+        };
+
+        let idle = sample(&state);
+        assert!(
+            idle[1] > 0xa0 && idle[1] > idle[0] && idle[1] > idle[2],
+            "有值时这里是绿色的额度弧：{idle:?}"
+        );
+
+        let forced = sample(&AppState {
+            quota_pull: QuotaPull::Forced,
+            ..state.clone()
+        });
+        assert!(
+            forced[1] < 0x60 && forced[1] < idle[1],
+            "刷新中这里应只剩中性轨道：{forced:?}"
+        );
+    }
+
+    /// 0% 不呼吸：它是冻结状态，动效不携带新信息，而且**没有帧**——应用因此
+    /// 可以在卡死期间彻底停表，这正是它停留最久的状态。
+    #[test]
+    fn exhausted_never_pulses_and_never_asks_for_frames() {
+        let start = Instant::now();
+        let mut ring = RingState::new(start);
+
+        for offset in [
+            Duration::ZERO,
+            PULSE_PERIOD / 2,
+            PULSE_PERIOD,
+            Duration::from_hours(6),
+        ] {
+            let now = start + offset;
+            assert!((ring.pulse_factor(now, false) - 1.0).abs() < f32::EPSILON);
+            assert_eq!(ring.frame_interval(now), None);
+        }
     }
 
     /// 离屏 D2D 绘制。这是全仓库唯一依赖真实 GDI/D2D 的测试，需要能创建内存 DC
@@ -1585,6 +2154,385 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel != OPAQUE_BACKGROUND),
             "截图应当含有文字等内容，不能整张都是纯底"
+        );
+    }
+
+    /// 任一额度窗口耗尽的快照：`ball_quota` 读 0，且因为账号不可服务而恒为 Critical。
+    fn exhausted_state() -> AppState {
+        let now = SystemTime::now();
+        AppState {
+            snapshot: Some(QuotaSnapshot {
+                limit_id: "codex".to_owned(),
+                primary: QuotaWindow {
+                    used_percent: 100.0,
+                    window_duration: Duration::from_hours(5),
+                    resets_at: now + Duration::from_hours(4),
+                },
+                secondary: None,
+                received_at: now,
+            }),
+            ..AppState::default()
+        }
+    }
+
+    /// 球上的一帧：可指定指针态与额度状态，返回球大小的离屏像素。
+    ///
+    /// 动效**关闭**，于是指针态直接落在目标值上、像素断言不依赖时间；拉取中的
+    /// 旋转弧属于动效本身，要用 [`animated_ball_pixels`]。
+    fn ball_pixels(state: &AppState, hovered: bool, pressed: bool) -> (Vec<u8>, i32) {
+        use crate::win32::COLLAPSED_DIP;
+        use crate::win32::layout::dip_to_px;
+
+        let side = dip_to_px(COLLAPSED_DIP, 96);
+        let mut renderer = Renderer::new(side, side, 96).expect("创建离屏渲染器");
+        renderer.set_animations_enabled(false);
+        renderer.set_pointer_targets(hovered, pressed);
+        renderer
+            .draw(VisualState::Collapsed, state)
+            .expect("绘制悬浮球");
+        (renderer.copy_pixels(), side)
+    }
+
+    /// 动效开启的一帧（无指针态）：只能靠动画表达的像素断言用它。
+    fn animated_ball_pixels(state: &AppState) -> (Vec<u8>, i32) {
+        use crate::win32::COLLAPSED_DIP;
+        use crate::win32::layout::dip_to_px;
+
+        let side = dip_to_px(COLLAPSED_DIP, 96);
+        let mut renderer = Renderer::new(side, side, 96).expect("创建离屏渲染器");
+        renderer
+            .draw(VisualState::Collapsed, state)
+            .expect("绘制悬浮球");
+        (renderer.copy_pixels(), side)
+    }
+
+    /// 重置列最长的字符串必须真的放得下——超出会被 `DrawText` 的矩形裁掉。
+    ///
+    /// 这里用 DirectWrite 实测宽度，而不是估算：倒计时的括号部分是新加的、
+    /// 最容易溢出的内容，而列宽只有 122 DIP。`format_usd` 的注释里已经为裁剪
+    /// 问题做过一次取舍（≥$100 去小数），这条测试把同类问题钉在宽度上。
+    #[test]
+    fn reset_column_fits_its_longest_strings() {
+        use crate::win32::layout::dip_to_px;
+        use crate::win32::presentation::format_reset_column;
+        use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_METRICS, IDWriteTextLayout};
+
+        let width = dip_to_px(crate::win32::PANEL_WIDTH_DIP, 96);
+        let renderer = Renderer::new(width, dip_to_px(227.0, 96), 96).expect("创建离屏渲染器");
+        let column = width as f32 - super::RESET_COLUMN_RIGHT_PADDING - super::TIME_COLUMN_LEFT;
+        let measure = |text: &str| {
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            // SAFETY: the UTF-16 buffer and format outlive the synchronous layout call.
+            let layout: IDWriteTextLayout = unsafe {
+                renderer.write_factory.CreateTextLayout(
+                    &utf16,
+                    &renderer.body_format,
+                    f32::MAX,
+                    f32::MAX,
+                )
+            }
+            .expect("创建文本布局");
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            // SAFETY: metrics is valid writable storage for this synchronous call.
+            unsafe { layout.GetMetrics(&mut metrics) }.expect("读取文本度量");
+            metrics.width
+        };
+
+        // 候选串由真正的格式化路径生成，而不是写死：阶梯规则一改（比如把
+        // "≥10 天不再写小时"的门槛调大），这里量的就是新输出。
+        let now = SystemTime::now();
+        let window = |remaining: Duration| QuotaWindow {
+            used_percent: 40.0,
+            window_duration: Duration::from_hours(5),
+            resets_at: now + remaining,
+        };
+        let mut candidates = vec![
+            format_reset_column(&window(Duration::from_hours(30)), now, true),
+            // 贴着上限的那一档：9 天 23 小时。
+            format_reset_column(&window(Duration::from_hours(9 * 24 + 23)), now, true),
+            // 月窗口的封顶写法。
+            format_reset_column(&window(Duration::from_hours(31 * 24 + 23)), now, true),
+            format_reset_column(&window(Duration::from_hours(6)), now, true),
+            // 小时档带分钟之后的最宽形态：这是全表最紧的一条。
+            format_reset_column(&window(Duration::from_mins(23 * 60 + 59)), now, true),
+            format_reset_column(&window(Duration::from_mins(6)), now, true),
+            format_reset_column(&window(Duration::ZERO), now, true),
+            // 关掉倒计时时只有本地时间。
+            format_reset_column(&window(Duration::from_hours(24)), now, false),
+        ];
+        // 防御：这几种情形必须真的覆盖到上面那些形态，否则测试会静默失效。
+        assert!(
+            candidates.iter().any(|text| text.contains("(9d23h)")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|text| text.contains("(31d)")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|text| text.contains("(23h59m)")),
+            "小时档带分钟后的宽度是最紧的一条：{candidates:?}"
+        );
+        candidates.dedup();
+
+        for text in &candidates {
+            let measured = measure(text);
+            assert!(
+                measured <= column,
+                "「{text}」实测 {measured:.1} DIP，列宽只有 {column:.1} DIP，会被裁字"
+            );
+        }
+
+        // 左边紧邻的百分比列也不能被挤压：`100%` 是它的最宽值。
+        let percent_column = 140.0 - 96.0;
+        let percent = measure("100%");
+        assert!(
+            percent <= percent_column,
+            "「100%」实测 {percent:.1} DIP，百分比列只有 {percent_column:.1} DIP"
+        );
+
+        // 标签列（18 → 94）同样要守：窗口名和期间行前缀都随长期窗口的时长变化，
+        // `本2周使用` / `本90天超额` 这类是最长的形态。
+        let label_column = 94.0 - 18.0;
+        let mut labels: Vec<String> = ["今日使用", "今日超额", "更新时间"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for hours in [5, 24 * 3, 24 * 7, 24 * 14, 24 * 30, 24 * 90] {
+            let window = QuotaWindow {
+                used_percent: 40.0,
+                window_duration: Duration::from_hours(hours),
+                resets_at: now + Duration::from_hours(1),
+            };
+            // 用渲染器真正会画的那些字符串——不是自己重拼一份。
+            let period = crate::win32::presentation::period_labels(Some(&window), None);
+            labels.push(window.window_label());
+            labels.push(period.usage);
+            labels.push(period.overflow);
+            labels.push(period.estimate);
+        }
+        for text in &labels {
+            let measured = measure(text);
+            assert!(
+                measured <= label_column,
+                "「{text}」实测 {measured:.1} DIP，标签列只有 {label_column:.1} DIP，会被裁字"
+            );
+        }
+    }
+
+    /// 悬停把底色提亮、按下把球缩小：两者都不依赖动画帧，关掉动效也照样指示。
+    #[test]
+    fn pointer_state_brightens_and_shrinks_the_ball() {
+        use crate::win32::layout::dip_to_px;
+
+        let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
+        // 圆内一点（半径 18）：在轨道环内侧、中心数字上方，只有底色。
+        let inner = |hovered_pressed: (bool, bool)| {
+            let (pixels, side) =
+                ball_pixels(&AppState::default(), hovered_pressed.0, hovered_pressed.1);
+            pixel_at(&pixels, side, center, center - 18)
+        };
+        let idle = inner((false, false));
+        let hovered = inner((true, false));
+        assert!(
+            hovered[0] > idle[0] && hovered[1] > idle[1] && hovered[2] > idle[2],
+            "悬停应把底色整体提亮：{idle:?} → {hovered:?}"
+        );
+
+        // 贴着圆边的一点（半径 26~27）：球缩小时它会落到球外。
+        let edge = |pressed: bool| {
+            let (pixels, side) = ball_pixels(&AppState::default(), false, pressed);
+            pixel_at(&pixels, side, center, 1)
+        };
+        let relaxed = edge(false);
+        let pressed = edge(true);
+        assert!(relaxed[3] > 200, "未按下时该点应在球内：{relaxed:?}");
+        assert_eq!(pressed[3], 0, "按下时球应缩到该点之外：{pressed:?}");
+    }
+
+    /// 拉取中的旋转弧画在内圈：不拉取时那个位置是纯底色，拉取时是浅灰弧。
+    ///
+    /// 旋转弧是动效，动效关闭时它连同别的动画一起消失（`set_animations_enabled`
+    /// 会把它关掉），所以这一帧必须开着动效画。
+    #[test]
+    fn spinner_appears_on_the_inner_ring_only_while_pulling() {
+        use crate::win32::layout::dip_to_px;
+
+        let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
+        let radius = dip_to_px(super::SPIN_RADIUS_DIP, 96);
+        let sample = |state: &AppState| {
+            let (pixels, side) = animated_ball_pixels(state);
+            pixel_at(&pixels, side, center, center - radius)
+        };
+
+        // 已经连上、没在拉取：不画。状态要写明——`AppState::default()` 是
+        // 「正在连接」，那是启动阶段，属于"该转"的情形。
+        let idle = sample(&AppState {
+            status: crate::quota::ConnectionStatus::Online,
+            ..AppState::default()
+        });
+        assert!(
+            idle[0] < 0x60 && idle[2] < 0x60,
+            "不拉取时这里是底色：{idle:?}"
+        );
+
+        // 启动阶段（还没读到第一份额度）就该转：那时球上只有 `--`，
+        // 本地日志全量扫描要跑几秒。
+        let starting = sample(&AppState::default());
+        assert!(
+            starting[0] > 0xb0 && starting[1] > 0xb0 && starting[2] > 0xb0,
+            "启动阶段应当已经画出旋转弧：{starting:?}"
+        );
+
+        // 渲染器创建与绘制的间隔只有几百微秒，相位仍在 12 点附近；采样点就在
+        // 弧的起点上（这段弧顺时针扫过 0.28 圈）。
+        let pulling = sample(&AppState {
+            quota_pull: QuotaPull::Forced,
+            ..AppState::default()
+        });
+        assert!(
+            pulling[0] > 0xb0 && pulling[1] > 0xb0 && pulling[2] > 0xb0,
+            "拉取中应当画出一段浅灰旋转弧：{pulling:?}"
+        );
+    }
+
+    /// 弧的两端是圆角：极短的弧看起来是一颗小圆点，而不是一条几乎看不见的细刺。
+    ///
+    /// 采样点选在弧起点**逆时针**方向 1 dip 处：那里只有圆角端头盖得住（3 dip 描边
+    /// 的端头是半径 1.5 dip 的半圆），平口端点就只剩轨道色；再往外 3 dip 处作为对照，
+    /// 证明那颗色点确实来自端头。
+    #[test]
+    fn progress_arc_ends_are_rounded() {
+        use crate::win32::layout::dip_to_px;
+
+        let now = SystemTime::now();
+        // 剩余 3%：弧很短，端的形状决定它能不能被看见。
+        let state = AppState {
+            snapshot: Some(QuotaSnapshot {
+                limit_id: "codex".to_owned(),
+                primary: QuotaWindow {
+                    used_percent: 97.0,
+                    window_duration: Duration::from_hours(5),
+                    resets_at: now + Duration::from_hours(4),
+                },
+                secondary: None,
+                received_at: now,
+            }),
+            ..AppState::default()
+        };
+        let (pixels, side) = ball_pixels(&state, false, false);
+        let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
+        // 弧起点在 12 点：(center, center − RING_RADIUS_DIP)。
+        let ring_y = center - dip_to_px(super::RING_RADIUS_DIP, 96);
+
+        // 缓冲是预乘 BGRA：下标 0 是蓝，2 是红。
+        let cap = pixel_at(&pixels, side, center - 1, ring_y);
+        assert!(
+            cap[2] > 0x80 && cap[2] > cap[0],
+            "弧起点外侧应被圆角端头盖成额度色：{cap:?}"
+        );
+
+        let beyond = pixel_at(&pixels, side, center - 3, ring_y);
+        assert!(
+            beyond[2] < 0x80 && beyond[0] >= beyond[2],
+            "端头之外应还是中性轨道：{beyond:?}"
+        );
+    }
+
+    /// 卡死（0%）与无数据（`--`）都不画弧、都不脉冲，环也必须画得完全一样：
+    /// 这个球的视觉语言只有"弧长 = 余量""整环 = 接近满额"，红色专属给 <20%，
+    /// 给 0% 换一只红色整环会让满额与耗尽共用同一个形状。两者的区分只有中心的
+    /// `0` / `--`，这条测试锁住这个取舍，免得以后又被"优化"回去。
+    #[test]
+    fn exhausted_ball_keeps_the_neutral_track() {
+        use crate::win32::COLLAPSED_DIP;
+        use crate::win32::layout::dip_to_px;
+
+        let side = dip_to_px(COLLAPSED_DIP, 96);
+        let ring_y = side / 2 - dip_to_px(super::RING_RADIUS_DIP, 96);
+        let sample = |state: &AppState| {
+            let mut renderer = Renderer::new(side, side, 96).expect("创建离屏渲染器");
+            renderer
+                .draw(VisualState::Collapsed, state)
+                .expect("绘制悬浮球");
+            pixel_at(&renderer.copy_pixels(), side, side / 2, ring_y)
+        };
+
+        // 缓冲是预乘 BGRA：下标 0 是蓝，2 是红。
+        let blocked = sample(&exhausted_state());
+        assert!(blocked[3] > 0, "卡死的轨道仍要画出来");
+        assert!(
+            blocked[2] < 0x80 && blocked[0] >= blocked[2],
+            "卡死的轨道必须是中性暗色，不能是额度色：{blocked:?}"
+        );
+
+        let unknown = sample(&AppState::default());
+        assert_eq!(blocked, unknown, "0% 与 -- 的环必须一模一样");
+    }
+
+    /// 换配色风格必须真的落到像素上，而且只落在额度色上。
+    ///
+    /// 六个组合（三档状态 × 两套配色）画出来的弧都是不同颜色，说明风格确实从
+    /// 状态走到了那三支笔刷；中性球（没有快照，整只球只有轨道、底和文字）则
+    /// 一个字节都不许变，说明换配色没有顺手把底色文字也换掉。
+    #[test]
+    fn color_style_switch_repaints_only_the_quota_colors() {
+        use crate::win32::COLLAPSED_DIP;
+        use crate::win32::layout::dip_to_px;
+
+        let now = SystemTime::now();
+        let side = dip_to_px(COLLAPSED_DIP, 96);
+        let center = side / 2;
+        // 弧起点在 12 点，三种剩余量下那里都被弧盖住。
+        let ring_y = center - dip_to_px(super::RING_RADIUS_DIP, 96);
+        let arc_pixel = |used_percent: f64, color_style| {
+            let state = AppState {
+                snapshot: Some(QuotaSnapshot {
+                    limit_id: "codex".to_owned(),
+                    primary: QuotaWindow {
+                        used_percent,
+                        window_duration: Duration::from_hours(5),
+                        resets_at: now + Duration::from_hours(4),
+                    },
+                    secondary: None,
+                    received_at: now,
+                }),
+                color_style,
+                ..AppState::default()
+            };
+            pixel_at(&ball_pixels(&state, false, false).0, side, center, ring_y)
+        };
+
+        let mut seen: Vec<[u8; 4]> = Vec::new();
+        for (style, name) in [(ColorStyle::Soft, "柔和"), (ColorStyle::Vivid, "鲜艳")] {
+            // 剩余 90% / 40% / 5%：健康、警告、紧张各一档。
+            for used_percent in [10.0, 60.0, 95.0] {
+                let pixel = arc_pixel(used_percent, style);
+                assert!(
+                    !seen.contains(&pixel),
+                    "{name}配色下已用 {used_percent}% 的弧和其它组合撞色：{pixel:?}（已见 {seen:?}）"
+                );
+                seen.push(pixel);
+            }
+        }
+
+        let neutral = |color_style| {
+            ball_pixels(
+                &AppState {
+                    color_style,
+                    ..AppState::default()
+                },
+                false,
+                false,
+            )
+            .0
+        };
+        let soft = neutral(ColorStyle::Soft);
+        let vivid = neutral(ColorStyle::Vivid);
+        let differing = soft.iter().zip(&vivid).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "没有额度可言的球只有轨道/底色/文字，换配色不该动它一个像素"
         );
     }
 }

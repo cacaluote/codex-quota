@@ -24,20 +24,44 @@ use windows::core::w;
 use super::layout::{ExpansionAlignment, system_animations_enabled};
 use super::notify::{self, Notification, NotificationSwitches, Notifier};
 use super::presence::CodexPresenceWatcher;
+use super::presentation::{display_windows, period_label};
 use super::renderer::Renderer;
 use super::system::{load_app_icon, set_autostart};
 use super::tray::{
-    copy_wide_fixed, handle_tray_message, refresh_interval_for_command, tray_icon_flags,
+    color_style_for_command, copy_wide_fixed, handle_tray_message, refresh_interval_for_command,
+    token_unit_for_command, tray_icon_flags,
 };
 use super::{
     AppWindow, CMD_AUTOSTART, CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW,
-    CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION,
-    TIMER_REDRAW, TIMER_RING, TRAY_ID, WM_APP_COLLAPSE, WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED,
-    WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
+    CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_RESET_COUNTDOWN, CMD_SHOW,
+    CMD_TOPMOST, TIMER_ANIMATION, TIMER_BALL, TIMER_REDRAW, TRAY_ID, WM_APP_COLLAPSE,
+    WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED, WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
+    WM_MOUSELEAVE,
 };
-use crate::config::{self, AppConfigV1};
+use crate::config::{self, AppConfigV1, ColorStyle, UnitStyle};
 use crate::error::AppError;
 use crate::quota::{AppState, CodexWorker};
+
+/// 显示偏好（重置列倒计时、用量单位、配色风格）从配置进状态的**唯一**映射。
+///
+/// 有三条路径要把它们带进状态：启动时造初始状态、跟随模式重启时整体换状态
+/// （[`AppWindow::reset_state`]）、托盘里改设置。各写一份必然漏，而漏掉一处就是
+/// 用户重启跟随模式后设置被打回默认——加新偏好只改这里。
+pub(super) fn apply_display_prefs(state: &mut AppState, config: &AppConfigV1) {
+    state.show_reset_countdown = config.show_reset_countdown;
+    state.token_unit = config.token_unit;
+    state.color_style = config.color_style;
+}
+
+/// 一份只带配置的初始状态。刷新间隔也进状态（过期门控读它），所以一并放这里。
+pub(super) fn state_from_config(config: &AppConfigV1) -> AppState {
+    let mut state = AppState {
+        quota_refresh_interval: config.quota_refresh_interval(),
+        ..AppState::default()
+    };
+    apply_display_prefs(&mut state, config);
+    state
+}
 
 impl AppWindow {
     pub(super) fn new(config: AppConfigV1, state: Arc<Mutex<AppState>>) -> Self {
@@ -50,7 +74,8 @@ impl AppWindow {
             renderer: None,
             outside_click_hook: None,
             animation: None,
-            ring_frame_millis: None,
+            snap: None,
+            ball_frame_millis: None,
             animations_enabled: true,
             expanded: false,
             expansion_alignment: ExpansionAlignment::Start,
@@ -58,10 +83,12 @@ impl AppWindow {
             overlay_active: false,
             codex_present: false,
             presence_generation: 0,
+            hovered: false,
             dragging: false,
             pointer_down: false,
             drag_cursor_origin: Default::default(),
             drag_window_origin: Default::default(),
+            drag_velocity: Default::default(),
             dpi: 96,
             taskbar_created: 0,
             tray_added: false,
@@ -133,11 +160,13 @@ impl AppWindow {
         self.visible = false;
         self.remove_outside_click_hook();
         self.stop_animation_timer();
-        self.stop_ring_frames();
+        self.stop_ball_frames();
         self.animation = None;
+        self.snap = None;
         // 释放资源期间不再观测额度：丢掉上一次快照，避免下次激活时比出假重置。
         self.notifier.reset();
         self.expanded = false;
+        self.hovered = false;
         self.pointer_down = false;
         self.dragging = false;
         // SAFETY: the live window is hidden before its backing bitmap is released.
@@ -155,10 +184,8 @@ impl AppWindow {
 
     fn reset_state(&self) {
         if let Ok(mut state) = self.state.lock() {
-            *state = AppState {
-                quota_refresh_interval: self.config.quota_refresh_interval(),
-                ..AppState::default()
-            };
+            // 整体替换，所以显示偏好必须跟着写回来（见 `state_from_config`）。
+            *state = state_from_config(&self.config);
         }
     }
 
@@ -249,8 +276,11 @@ impl AppWindow {
     fn toggle_visibility(&mut self) -> Result<(), AppError> {
         if self.visible {
             self.finish_animation()?;
+            self.finish_snap()?;
             self.visible = false;
-            self.stop_ring_frames();
+            self.hovered = false;
+            self.pointer_down = false;
+            self.stop_ball_frames();
             self.update_outside_click_hook();
             // SAFETY: hwnd is live.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -299,8 +329,20 @@ impl AppWindow {
     /// 弹一条通知气泡。判定与去重都在 `Notifier` 里，这里只管投递，
     /// 因此调试入口可以复用它而不碰任何判定状态。
     fn show_notification(&self, notification: &Notification) {
-        let (title, body) = notification.balloon_text();
+        let (title, body) = notification.balloon_text(&self.period_prefix());
         self.show_tray_balloon(title, &body);
+    }
+
+    /// 期间前缀（`本周` / `本月`）：与面板的「本周使用」等行同一个来源。
+    ///
+    /// 状态锁拿不到时退回中性的「本期」——也就是这条通知原来的说法，
+    /// 面板此时也是空的，含糊比说错一个周期好。
+    fn period_prefix(&self) -> String {
+        let Ok(state) = self.state.lock() else {
+            return "本期".to_owned();
+        };
+        let (_, long_term) = display_windows(&state, SystemTime::now());
+        period_label(long_term, state.plan_type.as_deref())
     }
 
     /// 投递一条托盘气泡并记日志。系统侧的通知设置（专注助手、通知总开关）同样
@@ -403,7 +445,35 @@ impl AppWindow {
         }
     }
 
+    /// 显示偏好（重置列倒计时、用量单位、配色风格）的单一出口：写回状态、存盘、重绘。
+    ///
+    /// 这三步必须一起做——只改配置的话，渲染器读的是状态，画面不会变。
+    fn publish_display_prefs(&mut self) -> Result<(), AppError> {
+        if let Ok(mut state) = self.state.lock() {
+            // 就地改：这条路径不能整体换状态，那会把额度快照一起清掉。
+            apply_display_prefs(&mut state, &self.config);
+        }
+        self.save_config();
+        self.render()
+    }
+
+    fn set_token_unit(&mut self, unit: UnitStyle) -> Result<(), AppError> {
+        self.config.token_unit = unit;
+        self.publish_display_prefs()
+    }
+
+    fn set_color_style(&mut self, style: ColorStyle) -> Result<(), AppError> {
+        self.config.color_style = style;
+        self.publish_display_prefs()
+    }
+
     fn command(&mut self, command: usize) -> Result<(), AppError> {
+        if let Some(unit) = token_unit_for_command(command) {
+            return self.set_token_unit(unit);
+        }
+        if let Some(style) = color_style_for_command(command) {
+            return self.set_color_style(style);
+        }
         if let Some(interval) = refresh_interval_for_command(command) {
             self.config.set_quota_refresh_interval(interval);
             if let Ok(mut state) = self.state.lock() {
@@ -461,6 +531,11 @@ impl AppWindow {
                 self.save_config();
                 Ok(())
             }
+            CMD_RESET_COUNTDOWN => {
+                self.config.show_reset_countdown = !self.config.show_reset_countdown;
+                self.publish_display_prefs()?;
+                Ok(())
+            }
             CMD_COPY_PANEL => self.copy_panel_snapshot(),
             CMD_FOLLOW_CODEX => self.set_follow_codex(!self.config.follow_codex),
             CMD_EXIT => {
@@ -489,8 +564,8 @@ impl Drop for AppWindow {
             let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_REDRAW) };
             // SAFETY: best-effort cleanup of the fixed animation timer during HWND teardown.
             let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_ANIMATION) };
-            // SAFETY: best-effort cleanup of the fixed ring animation timer during HWND teardown.
-            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_RING) };
+            // SAFETY: best-effort cleanup of the fixed ball animation timer during HWND teardown.
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_BALL) };
             let _ = unsafe { ReleaseCapture() };
         }
         if let Some(mut worker) = self.worker.take() {
@@ -559,18 +634,16 @@ pub(super) unsafe extern "system" fn window_proc(
         WM_APP_COLLAPSE => app.set_expanded(false),
         WM_APP_PRESENCE_CHANGED => app.handle_presence_changed(wparam.0 != 0, lparam.0 as u32),
         WM_COMMAND => app.command(wparam.0 & 0xffff),
-        WM_LBUTTONDOWN => {
-            app.begin_drag();
-            Ok(())
-        }
-        WM_MOUSEMOVE => app.update_drag(),
+        WM_LBUTTONDOWN => app.begin_drag(),
+        WM_MOUSEMOVE => app.handle_mouse_move(),
+        WM_MOUSELEAVE => app.handle_mouse_leave(),
         WM_LBUTTONUP => app.end_drag(),
         WM_NCHITTEST => return app.hit_test(),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_DPICHANGED => handle_window_dpi_changed(app, wparam, lparam),
         WM_DISPLAYCHANGE if app.overlay_active => app
             .finish_animation()
-            .and_then(|()| app.snap_to_edge())
+            .and_then(|()| app.snap_to_edge_now())
             .and_then(|()| app.ensure_topmost("显示器配置变化")),
         WM_SETTINGCHANGE => {
             app.animations_enabled = system_animations_enabled();
@@ -594,8 +667,8 @@ pub(super) unsafe extern "system" fn window_proc(
             app.render_animation_frame(Instant::now())
         }
         WM_TIMER if wparam.0 == TIMER_ANIMATION => Ok(()),
-        WM_TIMER if wparam.0 == TIMER_RING && app.overlay_active => app.render(),
-        WM_TIMER if wparam.0 == TIMER_RING => Ok(()),
+        WM_TIMER if wparam.0 == TIMER_BALL && app.overlay_active => app.render(),
+        WM_TIMER if wparam.0 == TIMER_BALL => Ok(()),
         WM_CLOSE if !app.config.follow_codex => app.toggle_visibility(),
         WM_APP_SHOW | WM_DISPLAYCHANGE | WM_CLOSE => Ok(()),
         WM_DESTROY => {
@@ -633,5 +706,68 @@ fn handle_window_dpi_changed(
     } else {
         app.dpi = dpi.max(96);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::quota::{ConnectionStatus, QuotaSnapshot, QuotaWindow};
+
+    fn config_with_prefs() -> AppConfigV1 {
+        AppConfigV1 {
+            show_reset_countdown: false,
+            token_unit: UnitStyle::En,
+            color_style: ColorStyle::Vivid,
+            ..AppConfigV1::default()
+        }
+    }
+
+    fn state_with_quota() -> AppState {
+        let now = SystemTime::now();
+        AppState {
+            status: ConnectionStatus::Online,
+            today_tokens: Some(1_000),
+            snapshot: Some(QuotaSnapshot {
+                limit_id: "codex".to_owned(),
+                primary: QuotaWindow {
+                    used_percent: 10.0,
+                    window_duration: Duration::from_hours(5),
+                    resets_at: now + Duration::from_hours(4),
+                },
+                secondary: None,
+                received_at: now,
+            }),
+            ..AppState::default()
+        }
+    }
+
+    /// 显示偏好是**就地**写入的：托盘改设置走这条路，顺手把额度快照清掉就等于
+    /// 每次切单位都让面板闪一下 `--`。整体换状态只允许 `reset_state` 那条路径。
+    #[test]
+    fn applying_display_prefs_leaves_the_quota_state_alone() {
+        let mut state = state_with_quota();
+
+        apply_display_prefs(&mut state, &config_with_prefs());
+
+        assert_eq!(state.today_tokens, Some(1_000), "显示偏好不该碰用量");
+        assert!(state.snapshot.is_some(), "显示偏好不该碰额度快照");
+        assert_eq!(state.status, ConnectionStatus::Online);
+        assert!(!state.show_reset_countdown);
+        assert_eq!(state.token_unit, UnitStyle::En);
+        assert_eq!(state.color_style, ColorStyle::Vivid);
+    }
+
+    /// 启动造状态与跟随模式重启换状态都走 `state_from_config`：偏好漏一项，用户
+    /// 的设置就会在这两处之一被打回默认。
+    #[test]
+    fn state_from_config_carries_every_display_pref() {
+        let state = state_from_config(&config_with_prefs());
+
+        assert!(!state.show_reset_countdown);
+        assert_eq!(state.token_unit, UnitStyle::En);
+        assert_eq!(state.color_style, ColorStyle::Vivid);
     }
 }

@@ -17,7 +17,9 @@ use protocol::{
 use serde_json::json;
 use session_usage::SessionUsageTracker;
 
-use super::model::{AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaSnapshot};
+use super::model::{
+    AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaPull, QuotaSnapshot,
+};
 use super::pricing::PriceTable;
 use crate::error::AppError;
 
@@ -172,9 +174,9 @@ fn worker_loop<F>(
     loop {
         if Instant::now() >= next_pull_attempt {
             let pull_delay = pull_delay(forced_pull, state, SystemTime::now());
-            forced_pull = false;
+            let forced = std::mem::take(&mut forced_pull);
             if pull_delay.is_zero() {
-                match pull_rpc_snapshot(state, notify, cancelled) {
+                match pull_rpc_snapshot(state, notify, cancelled, forced) {
                     Ok(()) => {
                         pull_failures = 0;
                         refresh_local_usage(
@@ -329,14 +331,19 @@ fn initialize_session(session: &mut AppServerSession) -> Result<u64, AppError> {
 
 /// Spawns app-server, reads the account-wide snapshot once, then tears the
 /// process down again.
+///
+/// `forced` 区分手动刷新与自动拉取：球上的不确定进度弧对前者的策略不同
+/// （见 `win32::presentation::ball_is_pulling`）。
 fn pull_rpc_snapshot<F>(
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
     cancelled: &Arc<AtomicBool>,
+    forced: bool,
 ) -> Result<(), AppError>
 where
     F: Fn() + Send + Sync + 'static,
 {
+    let _in_flight = PullInFlight::new(state, notify, forced);
     let executable = find_codex_executable()?;
     let mut session = AppServerSession::spawn(&executable, Arc::clone(cancelled))?;
     let mut next_id = initialize_session(&mut session)?;
@@ -346,6 +353,55 @@ where
     }
     session.shutdown();
     result
+}
+
+/// 把 [`AppState::quota_pull`] 标记为在途，并在离开作用域时**一定**回到 Idle。
+///
+/// 用 RAII 而不是在每个返回点手写复位：拉取有六七条提前返回的失败路径，漏掉
+/// 任何一条，球上的旋转弧就会一直转下去——那正是这个动效最不能犯的错。
+struct PullInFlight<'a, F: Fn() + Send + Sync + 'static> {
+    state: &'a Arc<Mutex<AppState>>,
+    notify: &'a Arc<F>,
+}
+
+impl<'a, F> PullInFlight<'a, F>
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    fn new(state: &'a Arc<Mutex<AppState>>, notify: &'a Arc<F>, forced: bool) -> Self {
+        let pull = if forced {
+            QuotaPull::Forced
+        } else {
+            QuotaPull::Automatic
+        };
+        publish_quota_pull(state, pull, notify);
+        Self { state, notify }
+    }
+}
+
+impl<F: Fn() + Send + Sync + 'static> Drop for PullInFlight<'_, F> {
+    fn drop(&mut self) {
+        publish_quota_pull(self.state, QuotaPull::Idle, self.notify);
+    }
+}
+
+/// 只在状态真的变化时写回并通知：拉取开始时若球上什么都没变，就不必多推一次
+/// 重绘。
+fn publish_quota_pull<F>(state: &Arc<Mutex<AppState>>, pull: QuotaPull, notify: &Arc<F>)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let changed = state.lock().is_ok_and(|mut current| {
+        if current.quota_pull == pull {
+            false
+        } else {
+            current.quota_pull = pull;
+            true
+        }
+    });
+    if changed {
+        notify();
+    }
 }
 
 fn snapshot_received_at(state: &Arc<Mutex<AppState>>) -> Option<SystemTime> {

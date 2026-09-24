@@ -51,10 +51,12 @@ impl PanelAnimation {
     }
 }
 
-/// 悬浮球百分环的动画：额度变化时把弧从旧比例推到新比例；球刚出现时
-/// 从 0 扫入到当前比例。与面板动画同样按 `Instant` + 时长采样，便于单测。
+/// 悬浮球的一条补间：把某个 0..1 的值从旧值推到新值，按 `Instant` + 时长采样。
+///
+/// 弧与中心数字在额度变化时补间、球刚出现时从 0 扫入，指针态的悬停提亮与
+/// 按下缩放也复用它——四处都只是"从 a 到 b 的缓出"，没有各自的时间轴。
 #[derive(Clone, Copy, Debug)]
-pub(super) struct RingAnimation {
+pub(super) struct Tween {
     started_at: Instant,
     duration: Duration,
     from: f64,
@@ -62,12 +64,12 @@ pub(super) struct RingAnimation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct RingSample {
+pub(super) struct TweenSample {
     pub(super) fraction: f64,
     pub(super) finished: bool,
 }
 
-impl RingAnimation {
+impl Tween {
     /// 数值变化的补间时长：明显可见但不拖沓，通常远早于下一次刷新到来。
     pub(super) const DURATION: Duration = Duration::from_millis(250);
     /// 球出现时的扫入时长：略长一些，读起来像仪表自检。
@@ -101,6 +103,11 @@ impl RingAnimation {
         Self::with_duration(0.0, to, now, Self::LABEL_SWEEP)
     }
 
+    /// 指针态专用：显式给出时长，因为悬停、按下、回弹三段的节奏不同。
+    pub(super) fn timed(from: f64, to: f64, now: Instant, duration: Duration) -> Self {
+        Self::with_duration(from, to, now, duration)
+    }
+
     fn with_duration(from: f64, to: f64, now: Instant, duration: Duration) -> Self {
         Self {
             started_at: now,
@@ -110,31 +117,222 @@ impl RingAnimation {
         }
     }
 
-    pub(super) fn sample(self, now: Instant) -> RingSample {
+    pub(super) fn sample(self, now: Instant) -> TweenSample {
         let elapsed = now.saturating_duration_since(self.started_at);
         let timeline = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0);
         let progress = f64::from(ease_out_cubic(timeline as f32));
-        RingSample {
+        TweenSample {
             fraction: self.from + (self.to - self.from) * progress,
             finished: elapsed >= self.duration,
         }
     }
 }
 
-/// 低额度脉冲：弧（无弧时为轨道圆）的不透明度在 `PULSE_MIN_OPACITY..=1.0`
-/// 之间正弦起伏，周期 `PULSE_PERIOD`（约 0.7Hz，远低于 WCAG 的 3Hz 闪烁阈值）。
+/// 指针态补间的时长：悬停提亮淡入淡出。
+pub(super) const HOVER_TWEEN: Duration = Duration::from_millis(150);
+/// 按下的缩放时长：按下要立刻有反应。
+pub(super) const PRESS_TWEEN: Duration = Duration::from_millis(80);
+/// 松开的回弹时长：比按下慢一点，手感才不脆。
+pub(super) const RELEASE_TWEEN: Duration = Duration::from_millis(120);
+
+/// 拖拽松手后的边缘吸附：把窗口从松手位置滑到落点。
+///
+/// 与面板动画同样按 `Instant` + 时长采样，便于单测。
+///
+/// 曲线不是单纯的缓出，而是三次 Hermite：**起点速度取松手那一刻手的速度**，
+/// 终点速度为 0。单纯缓出的话第一帧速度是平均速度的 2–3 倍——手还在 1px/ms
+/// 的时候球已经 3px/ms 冲出去了，看起来就是"接手时先顿一下再弹射"。Hermite
+/// 让球从手的速度接着往下减，位置和速度在交接处都连续。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SnapAnimation {
+    started_at: Instant,
+    duration: Duration,
+    from: POINT,
+    to: POINT,
+    /// 松手时的光标速度（px/ms），已按"只保留朝落点的分量、且不越过落点"夹住。
+    velocity: (f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SnapSample {
+    pub(super) destination: POINT,
+    pub(super) finished: bool,
+}
+
+impl SnapAnimation {
+    /// 滑动的时长随距离变化：固定 140ms 在两种情况下都不对——只差几个像素时
+    /// 拖得让人等，横跨半个屏幕时又是"啪"一下跳过去。按距离给时长，短距离依旧
+    /// 干脆，长距离有足够帧数把"滑过去"演出来。
+    const MIN_DURATION: Duration = Duration::from_millis(100);
+    const MAX_DURATION: Duration = Duration::from_millis(350);
+    /// 每像素追加的时长，单位 ms/px。
+    const MS_PER_PIXEL: f32 = 0.30;
+
+    pub(super) fn new(from: POINT, to: POINT, velocity: (f32, f32), now: Instant) -> Self {
+        let duration = duration_for(from, to);
+        Self {
+            started_at: now,
+            duration,
+            from,
+            to,
+            velocity: clamp_to_target(from, to, duration, velocity),
+        }
+    }
+
+    /// 起点与落点相同（松手时本来就在边上）就没有可滑的距离，直接算完成——
+    /// 否则会白跑一帧。
+    pub(super) fn is_noop(self) -> bool {
+        self.from == self.to
+    }
+
+    /// 最终落点。中途被打断（用户又按下、DPI 变化）时用它直接落位。
+    pub(super) fn destination(self) -> POINT {
+        self.to
+    }
+
+    pub(super) fn sample(self, now: Instant) -> SnapSample {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let span = self.duration.as_millis() as f32;
+        let timeline = ((elapsed.as_secs_f32() * 1000.0) / span).clamp(0.0, 1.0);
+        SnapSample {
+            destination: POINT {
+                x: hermite(
+                    self.from.x as f32,
+                    self.to.x as f32,
+                    self.velocity.0,
+                    span,
+                    timeline,
+                )
+                .round() as i32,
+                y: hermite(
+                    self.from.y as f32,
+                    self.to.y as f32,
+                    self.velocity.1,
+                    span,
+                    timeline,
+                )
+                .round() as i32,
+            },
+            finished: elapsed >= self.duration,
+        }
+    }
+}
+
+/// 三次 Hermite：起点 `p0`、终点 `p1`、起点速度 `v0`（px/ms）、终点速度 0，
+/// 跨度 `span`（ms）。
+///
+/// `h10` 在 t=0 处的导数是 1，所以起点速度正好是 `v0`——这就是"速度连续"的来源。
+/// 终点速度取 0 对应缓出（滑到边缘停住），于是 `h11` 项恒为 0，不用算。
+fn hermite(p0: f32, p1: f32, v0: f32, span: f32, t: f32) -> f32 {
+    let squared = t * t;
+    let cubed = squared * t;
+    let h00 = 2.0 * cubed - 3.0 * squared + 1.0;
+    let h10 = cubed - 2.0 * squared + t;
+    let h01 = -2.0 * cubed + 3.0 * squared;
+    h00 * p0 + h01 * p1 + h10 * span * v0
+}
+
+/// 只保留指向落点的那部分速度，并夹在"不会越过落点"的范围内。
+///
+/// Hermite 从 `p0` 到 `p1`、终点速度为 0 时，起点速度一旦超过 `3·(p1−p0)/T`
+/// 就会冲过落点再退回来——对吸附来说那意味着球滑出屏幕边缘。背向落点的速度
+/// 直接丢掉：那是"松手时手正好在回甩"，让它先倒退再前进只会看起来在犹豫。
+fn clamp_to_target(from: POINT, to: POINT, duration: Duration, velocity: (f32, f32)) -> (f32, f32) {
+    let span = duration.as_millis() as f32;
+    let limit = |delta: f32, speed: f32| {
+        if delta.abs() < f32::EPSILON {
+            return 0.0;
+        }
+        let cap = 3.0 * delta / span;
+        if delta > 0.0 {
+            speed.clamp(0.0, cap)
+        } else {
+            speed.clamp(cap, 0.0)
+        }
+    };
+    (
+        limit((to.x - from.x) as f32, velocity.0),
+        limit((to.y - from.y) as f32, velocity.1),
+    )
+}
+
+/// 吸附滑动的时长：`MIN_DURATION` 起，每像素加 `MS_PER_PIXEL`，封顶 `MAX_DURATION`。
+///
+/// 900px 的横跨（屏幕中央拖到边）约 350ms / 22 帧，40px 的微调约 112ms / 7 帧。
+fn duration_for(from: POINT, to: POINT) -> Duration {
+    let dx = f64::from(to.x - from.x);
+    let dy = f64::from(to.y - from.y);
+    let distance = (dx * dx + dy * dy).sqrt() as f32;
+    // 毫秒取整再构造：`from_secs_f32` 会把 0.35 变成 349999994ns，和 `MAX_DURATION`
+    // 不相等，封顶也就比较不出来。
+    let millis =
+        SnapAnimation::MIN_DURATION.as_millis() as f32 + distance * SnapAnimation::MS_PER_PIXEL;
+    let capped = millis
+        .round()
+        .min(SnapAnimation::MAX_DURATION.as_millis() as f32);
+    Duration::from_millis(capped as u64)
+}
+
+/// 低额度脉冲：还有余额的弧的不透明度在 `PULSE_MIN_OPACITY..=1.0` 之间正弦
+/// 起伏，周期 `PULSE_PERIOD`（约 0.7Hz，远低于 WCAG 的 3Hz 闪烁阈值）。
+///
+/// 只作用于**仍有余额**的低额度；已耗尽与不可知都不画弧，也就不脉冲。
 pub(super) const PULSE_PERIOD: Duration = Duration::from_millis(1400);
 pub(super) const PULSE_MIN_OPACITY: f32 = 0.35;
+/// 不确定进度弧转一圈的周期，以及它扫过的比例。
+pub(super) const SPIN_PERIOD: Duration = Duration::from_millis(1600);
+pub(super) const SPIN_SWEEP: f64 = 0.28;
 /// 补间期间的帧间隔：与面板动画同帧率。
-pub(super) const RING_TWEEN_FRAME_MILLIS: u32 = 16;
-/// 仅脉冲时的帧间隔：缓慢的明暗变化不需要 60fps。
+///
+/// **必须小于系统时钟节拍**。`SetTimer` 的到期时间被量化到节拍上（默认
+/// 15.625ms，可用 `GetSystemTimeAdjustment` 读到），而且是从**触发时刻**起算
+/// 下一次到期：请求 16ms 会因为 15.6ms 那一拍差一点点而顺延到第二拍，实际
+/// 变成 31.2ms / 32fps——比请求值慢一倍，且这不是抖动而是稳定地慢。请求
+/// 10ms 则每一拍都到期：在 64Hz 节拍上得到 15.6ms（64fps），在更细的节拍上
+/// 只会更快。所有动效都有界（最长 700ms 的扫入），多出来的帧很便宜。
+pub(super) const RING_TWEEN_FRAME_MILLIS: u32 = 10;
+/// 仅脉冲时的帧间隔：缓慢的明暗变化不需要 60fps（109ms 一拍也够）。
 pub(super) const RING_PULSE_FRAME_MILLIS: u32 = 100;
+/// 仅旋转时的帧间隔。
+///
+/// 匀速旋转对帧间隔最敏感：相位按 `Instant` 算，帧间隔一不均匀就变成角速度
+/// 忽快忽慢。同样取 10ms 让它每拍都触发（详见 [`RING_TWEEN_FRAME_MILLIS`]）。
+pub(super) const RING_SPIN_FRAME_MILLIS: u32 = 10;
+
+/// 把上面那条约束钉成编译期检查：改大它的人会在 `cargo check` 时被拦下。
+///
+/// 上界取 15ms 而不是"随便一个小于 16 的值"：节拍是 15.625ms，只有 ≤15 才能
+/// 保证每一拍都到期；16 会稳定地退化成两拍。
+///
+/// `expect` 而不是 `assert!`：常量断言会被 `clippy::assertions_on_constants` 判成
+/// "恒定的断言"（`clippy::all` 在本仓库是 deny），而这个检查正是要拦"恒定的值"。
+#[expect(
+    clippy::manual_assert,
+    reason = "常量断言会被 assertions_on_constants 拒绝，这里的检查对象就是常量本身"
+)]
+const _: () = if RING_TWEEN_FRAME_MILLIS > 15 || RING_SPIN_FRAME_MILLIS > 15 {
+    panic!("补间帧间隔必须 ≤15ms（系统节拍 15.625ms），否则每两拍才触发一次，帧率直接减半");
+};
 
 pub(super) fn pulse_opacity(elapsed: Duration) -> f32 {
     let period = PULSE_PERIOD.as_secs_f32();
     let phase = elapsed.as_secs_f32() % period;
     let wave = 0.5 + 0.5 * (std::f32::consts::TAU * phase / period).cos();
     PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * wave
+}
+
+/// 当前相位，并顺带把 `epoch` 前进整数个周期。
+///
+/// 直接算 `now - epoch` 的话，长时间运行后差值会到 10^6 秒量级，转成 f32
+/// 只剩约 0.1 秒分辨率，周期只有一两秒的动效就会变粗糙。锚定到"当前相位"
+/// 后精度恒定，且 epoch 只前进整数个周期，相位本身不变。
+pub(super) fn phase_at(epoch: &mut Instant, now: Instant, period: Duration) -> Duration {
+    let elapsed = now.saturating_duration_since(*epoch);
+    // `Duration` 没实现取模，按纳秒取余；余数必然小于一个周期。
+    let phase = Duration::from_nanos((elapsed.as_nanos() % period.as_nanos()) as u64);
+    // phase ≤ elapsed = now − epoch，减法不会下溢；退路只是保留原锚点。
+    *epoch = now.checked_sub(phase).unwrap_or(*epoch);
+    phase
 }
 
 pub(super) struct MonitorDetails {
@@ -610,19 +808,19 @@ mod tests {
     #[test]
     fn ring_tween_starts_at_the_old_value_and_settles_on_the_new_one() {
         let start = Instant::now();
-        let animation = RingAnimation::new(0.42, 0.08, start);
+        let animation = Tween::new(0.42, 0.08, start);
 
         let first = animation.sample(start);
         assert!((first.fraction - 0.42).abs() < f64::EPSILON && !first.finished);
 
-        let middle = animation.sample(start + RingAnimation::DURATION / 2);
+        let middle = animation.sample(start + Tween::DURATION / 2);
         assert!(
             middle.fraction < 0.42 && middle.fraction > 0.08,
             "补间中点必须落在两端之间：{}",
             middle.fraction
         );
 
-        let settled = animation.sample(start + RingAnimation::DURATION);
+        let settled = animation.sample(start + Tween::DURATION);
         assert!((settled.fraction - 0.08).abs() < f64::EPSILON && settled.finished);
 
         // 超时后停在终点，不会越过目标。
@@ -633,19 +831,15 @@ mod tests {
     #[test]
     fn ring_sweep_fills_from_zero_over_the_longer_sweep_duration() {
         let start = Instant::now();
-        let sweep = RingAnimation::sweep(0.65, start);
+        let sweep = Tween::sweep(0.65, start);
 
         assert!(sweep.sample(start).fraction.abs() < f64::EPSILON);
-        assert!(
-            !sweep
-                .sample(start + RingAnimation::SWEEP_DURATION / 2)
-                .finished
-        );
+        assert!(!sweep.sample(start + Tween::SWEEP_DURATION / 2).finished);
 
-        let settled = sweep.sample(start + RingAnimation::SWEEP_DURATION);
+        let settled = sweep.sample(start + Tween::SWEEP_DURATION);
         assert!((settled.fraction - 0.65).abs() < f64::EPSILON && settled.finished);
         // 扫入比数值补间长，扫入时长下不应提前结束。
-        assert!(!sweep.sample(start + RingAnimation::DURATION).finished);
+        assert!(!sweep.sample(start + Tween::DURATION).finished);
     }
 
     #[test]
@@ -654,18 +848,16 @@ mod tests {
 
         // 不变式：数字必须比同场景的弧先落定，否则出现"环已静止、数字还在滚"。
         // black_box 让断言不再是常量表达式，绕过 clippy::assertions_on_constants。
-        assert!(black_box(RingAnimation::LABEL_TWEEN) < black_box(RingAnimation::DURATION));
-        assert!(black_box(RingAnimation::LABEL_SWEEP) < black_box(RingAnimation::SWEEP_DURATION));
+        assert!(black_box(Tween::LABEL_TWEEN) < black_box(Tween::DURATION));
+        assert!(black_box(Tween::LABEL_SWEEP) < black_box(Tween::SWEEP_DURATION));
     }
 
     #[test]
     fn ring_tween_eases_out_so_it_is_past_halfway_at_midpoint() {
         let start = Instant::now();
-        let animation = RingAnimation::new(0.0, 1.0, start);
+        let animation = Tween::new(0.0, 1.0, start);
 
-        let middle = animation
-            .sample(start + RingAnimation::DURATION / 2)
-            .fraction;
+        let middle = animation.sample(start + Tween::DURATION / 2).fraction;
 
         assert!(middle > 0.5, "缓出曲线中点应已过半：{middle}");
     }
@@ -676,6 +868,163 @@ mod tests {
         assert!((ease_out_cubic(1.0) - 1.0).abs() < f32::EPSILON);
         assert!(ease_out_cubic(-1.0).abs() < f32::EPSILON);
         assert!((ease_out_cubic(2.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn snap_animation_slides_from_the_release_point_to_the_edge() {
+        let start = Instant::now();
+        let from = POINT { x: 400, y: 220 };
+        let to = POINT { x: 0, y: 200 };
+        // 松手时手是静止的：曲线退化成两端速度都为 0 的平滑过渡。
+        let animation = SnapAnimation::new(from, to, (0.0, 0.0), start);
+
+        let begin = animation.sample(start);
+        assert_eq!(begin.destination, from);
+        assert!(!begin.finished);
+
+        // 始终落在两端之间。
+        let middle = animation.sample(start + animation.duration / 2);
+        assert_eq!(middle.destination.x, 200, "静止松手时中点是严格半程");
+        assert!(middle.destination.x > to.x && middle.destination.y > to.y);
+
+        let end = animation.sample(start + animation.duration);
+        assert_eq!(end.destination, to);
+        assert!(end.finished);
+
+        // 超时采样也必须停在落点上，不能滑过头。
+        let late = animation.sample(start + animation.duration * 4);
+        assert_eq!(late.destination, to);
+        assert!(late.finished);
+    }
+
+    /// 吸附必须从"手的速度"接着滑：第一个 16ms 帧走过的距离应当约等于
+    /// `v0 × 16ms`，而不是缓出曲线自己定的一条速度。
+    #[test]
+    fn snap_starts_at_the_release_speed() {
+        let start = Instant::now();
+        let from = POINT { x: 900, y: 400 };
+        let to = POINT { x: 0, y: 400 };
+        // 手以 1.5px/ms 朝边缘移动（约 1500px/s，日常拖动速度）。
+        let moving = SnapAnimation::new(from, to, (-1.5, 0.0), start);
+        let still = SnapAnimation::new(from, to, (0.0, 0.0), start);
+
+        let step = |animation: SnapAnimation| {
+            let sample = animation.sample(start + Duration::from_millis(16));
+            (from.x - sample.destination.x) as f32
+        };
+        let expected = 1.5 * 16.0;
+        assert!(
+            (step(moving) - expected).abs() <= 3.0,
+            "第一个 16ms 帧应约走 {expected}px，实际 {}px",
+            step(moving)
+        );
+        assert!(
+            step(moving) > step(still) * 2.0,
+            "带着手速起步应当明显快于静止松手（{}px vs {}px）",
+            step(moving),
+            step(still)
+        );
+    }
+
+    /// 背向落点的手速不能让球先倒着走，超大的手速不能让球冲过边缘。
+    ///
+    /// 两个方向都要覆盖：背向的靠"只保留朝落点的分量"挡，朝落点但过快的靠
+    /// `3·(p1−p0)/T` 这个上界挡——少测一边就会漏掉一条。
+    #[test]
+    fn snap_never_overshoots_the_edge() {
+        let start = Instant::now();
+        let from = POINT { x: 900, y: 400 };
+        let to = POINT { x: 0, y: 400 };
+
+        for velocity in [
+            (-1.5, 0.0),   // 正常的朝落点速度
+            (-20.0, 0.0),  // 快到足以冲过落点
+            (-500.0, 0.0), // 离谱地快
+            (8.0, 0.0),    // 背向落点
+            (200.0, 0.0),  // 背向且离谱
+            (0.0, 40.0),   // 纵向手速：横向滑行时它没有用武之地
+        ] {
+            let animation = SnapAnimation::new(from, to, velocity, start);
+            for step in 0..=40 {
+                let sample = animation.sample(start + animation.duration * step / 40);
+                assert!(
+                    sample.destination.x >= to.x && sample.destination.x <= from.x,
+                    "速度 {velocity:?} 下 x 越界：{:?}",
+                    sample.destination
+                );
+                assert_eq!(
+                    sample.destination.y, from.y,
+                    "横向速度不该影响 y（速度已按方向分量夹住）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snap_animation_reports_a_noop_when_it_is_already_at_the_edge() {
+        let start = Instant::now();
+        let point = POINT { x: 32, y: 64 };
+
+        assert!(SnapAnimation::new(point, point, (0.0, 0.0), start).is_noop());
+        assert!(
+            !SnapAnimation::new(point, POINT { x: 33, y: 64 }, (0.0, 0.0), start).is_noop(),
+            "一个像素的差也要滑，否则松手后看起来是瞬移"
+        );
+    }
+
+    #[test]
+    fn snap_duration_grows_with_distance_and_stops_at_a_cap() {
+        let origin = POINT { x: 0, y: 0 };
+        let near = duration_for(origin, POINT { x: 40, y: 0 });
+        let middle = duration_for(origin, POINT { x: 400, y: 0 });
+        let far = duration_for(origin, POINT { x: 900, y: 0 });
+        let diagonal = duration_for(origin, POINT { x: 900, y: 900 });
+
+        assert!(near < middle && middle < far, "距离越远滑得越久");
+        assert!(near >= SnapAnimation::MIN_DURATION, "再近也不低于下限");
+        assert_eq!(far, SnapAnimation::MAX_DURATION, "横跨半个屏幕也不超过上限");
+        assert_eq!(diagonal, SnapAnimation::MAX_DURATION, "对角距离同样封顶");
+        // 40px 的微调仍然干脆：约 112ms。
+        assert!(near < Duration::from_millis(130), "{near:?}");
+    }
+
+    /// 回归：静止松手的长距离滑动，头一帧不能吃掉太多路程。
+    ///
+    /// 固定 140ms + 三次缓出时，900px 的滑动在第一个 16ms 帧里就走掉三成（约
+    /// 270px），看起来是"跳"而不是"滑"——这正是"吸附不流畅"的来源之一。
+    #[test]
+    fn long_snap_moves_less_than_a_tenth_in_its_first_frame() {
+        let start = Instant::now();
+        let from = POINT { x: 900, y: 400 };
+        let to = POINT { x: 0, y: 400 };
+        let animation = SnapAnimation::new(from, to, (0.0, 0.0), start);
+
+        let first = animation.sample(start + Duration::from_millis(16));
+        let travelled = (from.x - first.destination.x) as f32 / (from.x - to.x) as f32;
+        assert!(
+            travelled < 0.03,
+            "第一个 16ms 帧只该走一小段，实际走了 {:.1}%",
+            travelled * 100.0
+        );
+        assert!(!first.finished, "16ms 远没滑完");
+    }
+
+    #[test]
+    fn phase_at_keeps_its_precision_after_a_million_periods() {
+        let start = Instant::now();
+        let mut epoch = start;
+        // 约 18 天之后（1e6 个 1.6 秒周期）：不重新锚定的话 f32 秒数在这个
+        // 量级只剩约 0.1 秒分辨率，旋转会一格一格地跳。
+        let late = start + SPIN_PERIOD * 1_000_000 + SPIN_PERIOD / 4;
+
+        let phase = phase_at(&mut epoch, late, SPIN_PERIOD);
+
+        assert!(
+            phase.abs_diff(SPIN_PERIOD / 4) < Duration::from_micros(1),
+            "长时间运行后相位漂移：{phase:?}"
+        );
+        // epoch 只前进整数个周期：它必须仍然落在 now 之前一个周期之内。
+        assert!(late.saturating_duration_since(epoch) < SPIN_PERIOD);
     }
 
     #[test]

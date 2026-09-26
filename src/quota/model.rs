@@ -152,6 +152,10 @@ pub struct AppState {
     pub plan_type: Option<String>,
     pub today_tokens: Option<u64>,
     pub current_period_tokens: Option<u64>,
+    /// 今日套餐内输入 token 的缓存命中率，单位为 0.1%（0–1000）。
+    pub today_cache_hit_percent_tenths: Option<u16>,
+    /// 本期套餐内输入 token 的缓存命中率，单位为 0.1%。
+    pub current_period_cache_hit_percent_tenths: Option<u16>,
     pub last_error: Option<String>,
     pub quota_refresh_interval: Duration,
     /// 今日已用 token 的 API 牌价等价价值（套餐内，分桶计价；不可靠/无价格表为 None）。
@@ -175,6 +179,8 @@ pub struct AppState {
     /// 重置时间列是否附带紧凑倒计时（配置 → 渲染的载体，与
     /// [`AppState::quota_refresh_interval`] 同样的做法）。
     pub show_reset_countdown: bool,
+    /// 套餐内使用行是否显示输入缓存命中率（配置 → 渲染）。
+    pub show_cache_hit_rate: bool,
     /// Token 用量的单位风格。
     pub token_unit: UnitStyle,
     /// 额度状态配色的风格（配置 → 渲染的载体，与 [`AppState::token_unit`] 同样的做法）。
@@ -190,6 +196,8 @@ impl Default for AppState {
             plan_type: None,
             today_tokens: None,
             current_period_tokens: None,
+            today_cache_hit_percent_tenths: None,
+            current_period_cache_hit_percent_tenths: None,
             last_error: None,
             quota_refresh_interval: Duration::from_mins(5),
             today_cost: None,
@@ -204,6 +212,7 @@ impl Default for AppState {
             // 默认与 `AppConfigV1::default()` 一致；真正的来源是配置，这两项只是
             // 在没有配置时的兜底（例如测试与截图路径）。
             show_reset_countdown: true,
+            show_cache_hit_rate: true,
             token_unit: UnitStyle::Zh,
             color_style: ColorStyle::Soft,
         }

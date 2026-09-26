@@ -13,11 +13,11 @@ use windows::core::PCWSTR;
 
 use super::presentation::format_token_usage;
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_COLOR_STYLE_SOFT, CMD_COLOR_STYLE_VIVID, CMD_COPY_PANEL,
-    CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT,
-    CMD_REFRESH, CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN, CMD_REFRESH_5_MIN, CMD_REFRESH_10_MIN,
-    CMD_REFRESH_30_MIN, CMD_RESET_COUNTDOWN, CMD_SHOW, CMD_TOKEN_UNIT_EN, CMD_TOKEN_UNIT_ZH,
-    CMD_TOPMOST, TRAY_REOPEN_GUARD, WM_APP_EXPAND,
+    AppWindow, CMD_AUTOSTART, CMD_CACHE_HIT_RATE, CMD_COLOR_STYLE_SOFT, CMD_COLOR_STYLE_VIVID,
+    CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET,
+    CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_REFRESH_1_MIN, CMD_REFRESH_2_MIN, CMD_REFRESH_5_MIN,
+    CMD_REFRESH_10_MIN, CMD_REFRESH_30_MIN, CMD_RESET_COUNTDOWN, CMD_SHOW, CMD_TOKEN_UNIT_EN,
+    CMD_TOKEN_UNIT_ZH, CMD_TOPMOST, TRAY_REOPEN_GUARD, WM_APP_EXPAND,
 };
 #[cfg(debug_assertions)]
 use super::{CMD_TEST_NOTIFY_BALANCE, CMD_TEST_NOTIFY_RESET};
@@ -45,6 +45,7 @@ struct TrayMenuState {
     notify_on_reset: bool,
     notify_on_overflow: bool,
     show_reset_countdown: bool,
+    show_cache_hit_rate: bool,
     token_unit: UnitStyle,
     color_style: ColorStyle,
     quota_refresh_interval_secs: u64,
@@ -113,6 +114,7 @@ pub(super) unsafe fn handle_tray_message(
                 notify_on_reset: (*app_ptr).config.notify_on_reset,
                 notify_on_overflow: (*app_ptr).config.notify_on_overflow,
                 show_reset_countdown: (*app_ptr).config.show_reset_countdown,
+                show_cache_hit_rate: (*app_ptr).config.show_cache_hit_rate,
                 token_unit: (*app_ptr).config.token_unit,
                 color_style: (*app_ptr).config.color_style,
                 quota_refresh_interval_secs: (*app_ptr).config.quota_refresh_interval().as_secs(),
@@ -317,6 +319,7 @@ fn append_settings_entries(menu: HMENU, state: TrayMenuState) -> Result<(), AppE
     let follow_codex = wide("跟随 Codex");
     let panel_persistent = wide("面板常驻");
     let reset_countdown = wide("重置倒计时");
+    let cache_hit_rate = wide("缓存命中率");
     append_menu_command(menu, CMD_TOPMOST, &topmost, state.always_on_top, true)?;
     append_menu_command(
         menu,
@@ -344,6 +347,13 @@ fn append_settings_entries(menu: HMENU, state: TrayMenuState) -> Result<(), AppE
         CMD_RESET_COUNTDOWN,
         &reset_countdown,
         state.show_reset_countdown,
+        true,
+    )?;
+    append_menu_command(
+        menu,
+        CMD_CACHE_HIT_RATE,
+        &cache_hit_rate,
+        state.show_cache_hit_rate,
         true,
     )?;
     Ok(())
@@ -517,7 +527,9 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use windows::Win32::UI::Shell::{NIF_GUID, NIN_BALLOONTIMEOUT};
-    use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, WM_LBUTTONUP, WM_RBUTTONUP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMenuItemCount, GetMenuState, MF_BYCOMMAND, WM_LBUTTONUP, WM_RBUTTONUP,
+    };
 
     use super::*;
 
@@ -551,10 +563,30 @@ mod tests {
         // SAFETY: 子菜单是刚建好的活句柄，只查询项数。
         let count = unsafe { GetMenuItemCount(Some(settings.0)) };
         assert_eq!(
-            count, 5,
-            "「设置」里应当是 5 个复选框开关：始终置顶、开机启动、跟随 Codex、\
-             面板常驻、重置倒计时"
+            count, 6,
+            "「设置」里应当是 6 个复选框开关：始终置顶、开机启动、跟随 Codex、\
+             面板常驻、重置倒计时、缓存命中率"
         );
+    }
+
+    #[test]
+    fn cache_hit_rate_settings_check_follows_saved_preference() {
+        let command = u32::try_from(CMD_CACHE_HIT_RATE).expect("命令 ID 可表示为 u32");
+        for show_cache_hit_rate in [true, false] {
+            let settings = PopupMenu::create().expect("创建子菜单");
+            append_settings_entries(
+                settings.0,
+                TrayMenuState {
+                    show_cache_hit_rate,
+                    ..TrayMenuState::default()
+                },
+            )
+            .expect("追加设置项");
+            // SAFETY: 查询刚建好的菜单，不修改或释放句柄。
+            let flags = unsafe { GetMenuState(settings.0, command, MF_BYCOMMAND) };
+            assert_ne!(flags, u32::MAX, "菜单必须包含缓存命中率命令");
+            assert_eq!(flags & MF_CHECKED.0 != 0, show_cache_hit_rate);
+        }
     }
 
     /// 单选组子菜单的项数也是结构的一部分：刷新 5 档、通知 2 项、单位 2 种、

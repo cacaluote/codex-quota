@@ -9,8 +9,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+pub(super) use aggregate::ModelVolumes;
 use aggregate::{
-    ModelVolumes, WindowAggregate, aggregate_period, aggregate_today, cache_has_tokens_in_period,
+    WindowAggregate, aggregate_period, aggregate_today, cache_has_tokens_in_period,
     cache_has_tokens_on_date,
 };
 use files::{
@@ -2035,7 +2036,7 @@ mod tests {
         use crate::quota::AppState;
         use crate::quota::pricing::PriceTable;
 
-        use super::super::{LocalUsageStatus, refresh_local_usage};
+        use super::super::{LocalPipeline, LocalUsageStatus, PricePipeline, refresh_local_usage};
 
         let context = TestContext::new("cold-start-period");
         let file = context.rollout(PARENT_ID);
@@ -2058,16 +2059,13 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
-        let mut tracker = context.tracker();
-        let mut local_usage = LocalUsageStatus::default();
+        let mut local = LocalPipeline {
+            tracker: context.tracker(),
+            status: LocalUsageStatus::default(),
+        };
+        let mut prices = PricePipeline::new(PriceTable::default());
 
-        refresh_local_usage(
-            &mut tracker,
-            &mut local_usage,
-            &PriceTable::default(),
-            &state,
-            &notify,
-        );
+        refresh_local_usage(&mut local, &mut prices, &state, &notify);
 
         let current = state.lock().unwrap();
         assert!(current.snapshot.is_some());
@@ -2081,7 +2079,7 @@ mod tests {
         use crate::quota::AppState;
         use crate::quota::pricing::PriceTable;
 
-        use super::super::{LocalUsageStatus, refresh_local_usage};
+        use super::super::{LocalPipeline, LocalUsageStatus, PricePipeline, refresh_local_usage};
 
         let context = TestContext::new("empty-fresh-window");
         let file = context.rollout(PARENT_ID);
@@ -2121,14 +2119,18 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
-        let mut tracker = context.tracker();
-        let mut local_usage = LocalUsageStatus::default();
-        let prices = PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-        )
-        .unwrap();
+        let mut local = LocalPipeline {
+            tracker: context.tracker(),
+            status: LocalUsageStatus::default(),
+        };
+        let mut prices = PricePipeline::new(
+            PriceTable::from_models_dev(
+                r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
+            )
+            .unwrap(),
+        );
 
-        refresh_local_usage(&mut tracker, &mut local_usage, &prices, &state, &notify);
+        refresh_local_usage(&mut local, &mut prices, &state, &notify);
 
         let current = state.lock().unwrap();
         assert_eq!(current.current_period_tokens, Some(0));

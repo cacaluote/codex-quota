@@ -94,6 +94,9 @@ pub struct AppConfigV1 {
     /// `serde(default = ...)` 会覆盖结构体级的 `#[serde(default)]`。
     #[serde(default = "default_true")]
     pub show_reset_countdown: bool,
+    /// 是否在套餐内使用行的 Token 数后显示输入缓存命中率。
+    #[serde(default = "default_true")]
+    pub show_cache_hit_rate: bool,
     /// Token 用量的单位风格。
     pub token_unit: UnitStyle,
     /// 额度状态配色的风格。
@@ -119,6 +122,7 @@ impl Default for AppConfigV1 {
             notify_on_reset: true,
             notify_on_overflow: true,
             show_reset_countdown: true,
+            show_cache_hit_rate: true,
             token_unit: UnitStyle::Zh,
             color_style: ColorStyle::Soft,
             quota_refresh_interval_secs: DEFAULT_QUOTA_REFRESH_INTERVAL_SECS,
@@ -352,6 +356,7 @@ mod tests {
             config.show_reset_countdown,
             "缺失该键时必须落到 true：它默认是开的"
         );
+        assert!(config.show_cache_hit_rate, "旧配置也应默认显示缓存命中率");
         assert_eq!(config.token_unit, UnitStyle::Zh, "单位风格默认中文");
         assert_eq!(
             config.color_style,
@@ -365,6 +370,7 @@ mod tests {
     fn display_settings_round_trip_through_json() {
         let mut config = AppConfigV1 {
             show_reset_countdown: false,
+            show_cache_hit_rate: false,
             token_unit: UnitStyle::En,
             color_style: ColorStyle::Vivid,
             ..AppConfigV1::default()
@@ -372,10 +378,12 @@ mod tests {
         config.normalize();
         let text = serde_json::to_string(&config).expect("序列化");
         assert!(text.contains("\"show_reset_countdown\":false"), "{text}");
+        assert!(text.contains("\"show_cache_hit_rate\":false"), "{text}");
         assert!(text.contains("\"token_unit\":\"en\""), "{text}");
         assert!(text.contains("\"color_style\":\"vivid\""), "{text}");
         let parsed = serde_json::from_str::<AppConfigV1>(&text).expect("反序列化");
         assert!(!parsed.show_reset_countdown);
+        assert!(!parsed.show_cache_hit_rate);
         assert_eq!(parsed.token_unit, UnitStyle::En);
         assert_eq!(parsed.color_style, ColorStyle::Vivid);
     }

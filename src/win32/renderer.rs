@@ -47,9 +47,9 @@ use super::layout::{
 use super::presentation::{
     FIRST_ROW_TOP_DIP, PlanColor, ROW_STEP_DIP, ball_is_pulling, ball_quota,
     display_period_total_token_estimate, display_period_total_value, display_windows,
-    format_local_timestamp, format_reset_column, format_token_usage, format_usd, panel_title,
-    period_labels, period_overflow_visible, plan_type_color, plan_type_label, quota_window_label,
-    today_overflow_visible,
+    format_local_timestamp, format_reset_column, format_token_usage, format_usage_with_cache_hit,
+    format_usd, panel_title, period_labels, period_overflow_visible, plan_type_color,
+    plan_type_label, quota_window_label, today_overflow_visible,
 };
 use crate::config::{ColorStyle, UnitStyle};
 use crate::error::AppError;
@@ -1011,6 +1011,11 @@ impl Renderer {
         self.draw_token_usage_row(
             "今日使用",
             state.today_tokens,
+            if state.show_cache_hit_rate {
+                state.today_cache_hit_percent_tenths
+            } else {
+                None
+            },
             Some(state.today_cost),
             top,
             width,
@@ -1022,6 +1027,7 @@ impl Renderer {
             self.draw_token_usage_row(
                 "今日超额",
                 state.today_overflow_tokens,
+                None,
                 Some(state.today_overflow_cost),
                 top,
                 width,
@@ -1033,6 +1039,11 @@ impl Renderer {
         self.draw_token_usage_row(
             &period.usage,
             state.current_period_tokens,
+            if state.show_cache_hit_rate {
+                state.current_period_cache_hit_percent_tenths
+            } else {
+                None
+            },
             Some(state.current_period_cost),
             top,
             width,
@@ -1044,6 +1055,7 @@ impl Renderer {
             self.draw_token_usage_row(
                 &period.overflow,
                 state.current_period_overflow_tokens,
+                None,
                 Some(state.current_period_overflow_cost),
                 top,
                 width,
@@ -1171,6 +1183,7 @@ impl Renderer {
         &self,
         label: &str,
         tokens: Option<u64>,
+        cache_hit_percent_tenths: Option<u16>,
         cost: Option<Option<f64>>,
         top: f32,
         width: f32,
@@ -1214,7 +1227,7 @@ impl Renderer {
             );
         }
         self.draw_text_with_opacity(
-            &format_token_usage(tokens, unit),
+            &format_usage_with_cache_hit(tokens, cache_hit_percent_tenths, unit),
             &self.body_format,
             if tokens.is_some() {
                 &self.brushes.secondary_text
@@ -2290,6 +2303,23 @@ mod tests {
             percent <= percent_column,
             "「100%」实测 {percent:.1} DIP，百分比列只有 {percent_column:.1} DIP"
         );
+
+        // 使用行复用右侧 token 列，追加缓存命中率后也必须留在 122 DIP 内。
+        let usage_column = width as f32 - 18.0 - super::TIME_COLUMN_LEFT;
+        for tokens in [9_999, 99_999_999, 120_000_000, 99_990_000_000] {
+            for unit in [crate::config::UnitStyle::Zh, crate::config::UnitStyle::En] {
+                let value = crate::win32::presentation::format_usage_with_cache_hit(
+                    Some(tokens),
+                    Some(1000),
+                    unit,
+                );
+                let measured = measure(&value);
+                assert!(
+                    measured <= usage_column,
+                    "「{value}」实测 {measured:.1} DIP，使用行右列只有 {usage_column:.1} DIP"
+                );
+            }
+        }
 
         // 标签列（18 → 94）同样要守：窗口名和期间行前缀都随长期窗口的时长变化，
         // `本2周使用` / `本90天超额` 这类是最长的形态。

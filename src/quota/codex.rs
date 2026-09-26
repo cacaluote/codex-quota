@@ -2,6 +2,7 @@ mod app_server;
 mod protocol;
 mod session_usage;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -15,7 +16,7 @@ use protocol::{
     local_calendar_date, local_calendar_date_at, parse_account_result, parse_rate_limits_result,
 };
 use serde_json::json;
-use session_usage::SessionUsageTracker;
+use session_usage::{ModelVolumes, SessionUsageTracker};
 
 use super::model::{
     AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaPull, QuotaSnapshot,
@@ -30,6 +31,15 @@ const LOCAL_LOOP_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 const WATCHER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const PRICE_REFRESH_START_DELAY: Duration = Duration::from_secs(30);
 const PRICE_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
+const PRICE_FAILURE_SLOW_AFTER: Duration = Duration::from_hours(6);
+const PRICE_FAILURE_SLOW_INTERVAL: Duration = Duration::from_hours(6);
+/// 缺价触发的补拉之间至少隔这么久：新模型发布当天 models.dev 往往还没上价，
+/// 没有冷却就会每轮本地刷新都发一次请求。日调度仍在兜底。
+const PRICE_GAP_MIN_INTERVAL: Duration = Duration::from_hours(1);
+/// 缺价模型的补拉窗口：从首次见到它起这么久内允许按 `PRICE_GAP_MIN_INTERVAL`
+/// 反复补拉（最长 6 小时），之后停手等日调度。models.dev 可能永远不会上价的
+/// 模型名（本地变体后缀之类）不该让程序每小时发请求直到永远。
+const PRICE_GAP_RETRY_WINDOW: Duration = Duration::from_hours(6);
 const BACKOFF_SECONDS: [u64; 5] = [1, 2, 5, 10, 30];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,22 +164,18 @@ fn worker_loop<F>(
 ) where
     F: Fn() + Send + Sync + 'static,
 {
-    let mut usage_tracker = SessionUsageTracker::new();
-    let mut local_usage = LocalUsageStatus::default();
+    let mut local = LocalPipeline::new();
+    let mut prices = PricePipeline::load();
     let mut pull_failures = 0_usize;
     let mut next_pull_attempt = Instant::now();
     // 手动刷新标记：置位后那一次拉取跳过"快照还新鲜"的判断。
     let mut forced_pull = false;
     let mut next_watcher_retry = Instant::now() + WATCHER_RETRY_INTERVAL;
     let mut local_refresh_at: Option<Instant> = None;
-    let mut prices = PriceTable::load();
-    let mut price_refresh_failures = 0_usize;
-    let mut next_price_refresh =
-        Instant::now() + price_refresh_delay(prices.fetched_at(), SystemTime::now());
 
     update_status(state, ConnectionStatus::Connecting, None, notify);
-    usage_tracker.require_full_scan();
-    refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
+    local.tracker.require_full_scan();
+    refresh_local_usage(&mut local, &mut prices, state, notify);
 
     loop {
         if Instant::now() >= next_pull_attempt {
@@ -179,13 +185,7 @@ fn worker_loop<F>(
                 match pull_rpc_snapshot(state, notify, cancelled, forced) {
                     Ok(()) => {
                         pull_failures = 0;
-                        refresh_local_usage(
-                            &mut usage_tracker,
-                            &mut local_usage,
-                            &prices,
-                            state,
-                            notify,
-                        );
+                        refresh_local_usage(&mut local, &mut prices, state, notify);
                     }
                     Err(AppError::Cancelled) => break,
                     Err(error) => {
@@ -213,24 +213,10 @@ fn worker_loop<F>(
             }
         }
 
-        if Instant::now() >= next_price_refresh {
-            match prices.refresh() {
-                Ok(()) => {
-                    price_refresh_failures = 0;
-                    // 价格表更新后重算已发布的成本。
-                    local_refresh_at = Some(Instant::now() + LOCAL_USAGE_DEBOUNCE);
-                }
-                Err(error) => {
-                    price_refresh_failures = price_refresh_failures.saturating_add(1);
-                    crate::logging::log(&format!("models.dev 价格刷新失败：{error}"));
-                }
-            }
-            next_price_refresh =
-                Instant::now() + price_refresh_attempt_delay(&mut price_refresh_failures);
-        }
+        prices.refresh_if_due(&mut local_refresh_at);
 
         poll_local_changes(
-            &mut usage_tracker,
+            &mut local.tracker,
             &mut next_watcher_retry,
             &mut local_refresh_at,
         );
@@ -244,24 +230,21 @@ fn worker_loop<F>(
             Ok(WorkerCommand::Refresh) => {
                 // 手动刷新：这次不等快照变旧，直接向服务端要一次（见 pull_delay）。
                 forced_pull = true;
-                usage_tracker.require_full_scan();
-                refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
+                local.tracker.require_full_scan();
+                refresh_local_usage(&mut local, &mut prices, state, notify);
                 next_pull_attempt = Instant::now();
             }
             Ok(WorkerCommand::RefreshIntervalChanged) => {
                 next_pull_attempt = Instant::now();
             }
-            Ok(WorkerCommand::RefreshPrices) => {
-                price_refresh_failures = 0;
-                next_price_refresh = Instant::now();
-            }
+            Ok(WorkerCommand::RefreshPrices) => prices.schedule_now(),
             Err(RecvTimeoutError::Timeout) => {}
         }
 
         let due_refresh = local_refresh_at.is_some_and(|deadline| Instant::now() >= deadline);
-        let date_changed = local_usage.date != local_calendar_date();
+        let date_changed = local.status.date != local_calendar_date();
         if due_refresh || date_changed {
-            refresh_local_usage(&mut usage_tracker, &mut local_usage, &prices, state, notify);
+            refresh_local_usage(&mut local, &mut prices, state, notify);
             local_refresh_at = None;
         }
     }
@@ -283,14 +266,197 @@ fn price_refresh_delay(fetched_at: Option<u64>, now: SystemTime) -> Duration {
         .max(PRICE_REFRESH_START_DELAY)
 }
 
-/// 五次重试耗尽后暂停一天，并为下一轮重置计数。
-fn price_refresh_attempt_delay(failures: &mut usize) -> Duration {
-    const RETRY_SECONDS: [u64; 5] = [30, 60, 120, 300, 300];
-    if *failures == 0 || *failures > RETRY_SECONDS.len() {
-        *failures = 0;
-        return PRICE_REFRESH_INTERVAL;
+/// 网络失败先快速退避，再每小时尝试；持续失败满六小时后改为每六小时。
+/// 成功后的每日刷新由调用方单独安排，失败计数不再兼作调度状态。
+fn price_refresh_failure_delay(failures: usize, failed_for: Duration) -> Duration {
+    const EARLY_DELAYS: [Duration; 6] = [
+        Duration::from_secs(30),
+        Duration::from_mins(1),
+        Duration::from_mins(2),
+        Duration::from_mins(5),
+        Duration::from_mins(15),
+        Duration::from_mins(30),
+    ];
+    if failed_for >= PRICE_FAILURE_SLOW_AFTER {
+        return PRICE_FAILURE_SLOW_INTERVAL;
     }
-    Duration::from_secs(RETRY_SECONDS[*failures - 1])
+    EARLY_DELAYS
+        .get(failures.saturating_sub(1))
+        .copied()
+        .unwrap_or(Duration::from_hours(1))
+}
+
+/// 本机用量刷新这条管线的状态：会话日志解析器 + 按日/周期的显示口径。
+///
+/// 与 [`PricePipeline`] 一起把主循环四个刷新点的参数收到两三个：六个参数摊在
+/// 各分支里，三条时基（额度快照、价格表、本地日志）会淹在参数列表里。
+struct LocalPipeline {
+    tracker: SessionUsageTracker,
+    status: LocalUsageStatus,
+}
+
+impl LocalPipeline {
+    fn new() -> Self {
+        Self {
+            tracker: SessionUsageTracker::new(),
+            status: LocalUsageStatus::default(),
+        }
+    }
+}
+
+/// 价格表这条管线的状态：表本身、缺口观测、以及拉取调度（连续失败计数、
+/// 首次失败时刻、下一次拉取时刻、上一次真正发起的时刻）。
+struct PricePipeline {
+    table: PriceTable,
+    gaps: PriceGaps,
+    failures: usize,
+    first_failure: Option<Instant>,
+    next_refresh: Instant,
+    /// None 表示本次运行还没拉过：缺价触发的补拉因此不必等冷却。缓存还新鲜
+    /// （下一次日调度也许在 23 小时之后）却已经在用新模型，正是最该立刻补一次
+    /// 的场景。
+    last_attempt: Option<Instant>,
+}
+
+impl PricePipeline {
+    fn new(table: PriceTable) -> Self {
+        Self {
+            table,
+            gaps: PriceGaps::default(),
+            failures: 0,
+            first_failure: None,
+            next_refresh: Instant::now() + PRICE_REFRESH_START_DELAY,
+            last_attempt: None,
+        }
+    }
+
+    /// 读回 app-data 里上次成功拉取的价格表，并按缓存年龄排好第一次拉取。
+    fn load() -> Self {
+        let table = PriceTable::load();
+        let delay = price_refresh_delay(table.fetched_at(), SystemTime::now());
+        Self {
+            next_refresh: Instant::now() + delay,
+            ..Self::new(table)
+        }
+    }
+
+    /// 主循环里的价格表这一步：日调度到点就拉；没到点但本机在用价格表里没有
+    /// 的模型、冷却已过、也没处在失败退避里，就把下一次拉取提前到现在。
+    ///
+    /// 缺价补拉只改 `next_refresh`、不当场拉，是为了让拉取只有一条路径——失败
+    /// 退避与"成功后重算已发布成本"都留在那一支里。
+    fn refresh_if_due(&mut self, local_refresh_at: &mut Option<Instant>) {
+        if Instant::now() >= self.next_refresh {
+            self.last_attempt = Some(Instant::now());
+            match self.table.refresh() {
+                Ok(()) => {
+                    self.failures = 0;
+                    self.first_failure = None;
+                    self.next_refresh = Instant::now() + PRICE_REFRESH_INTERVAL;
+                    // 价格表更新后重算已发布的成本。
+                    *local_refresh_at = Some(Instant::now() + LOCAL_USAGE_DEBOUNCE);
+                }
+                Err(error) => {
+                    self.failures = self.failures.saturating_add(1);
+                    let now = Instant::now();
+                    let first = *self.first_failure.get_or_insert(now);
+                    self.next_refresh = now
+                        + price_refresh_failure_delay(
+                            self.failures,
+                            now.saturating_duration_since(first),
+                        );
+                    crate::logging::log(&format!("models.dev 价格刷新失败：{error}"));
+                }
+            }
+            return;
+        }
+        if self.gaps.wants_pull
+            // 失败退避有自己的时钟；缺价补拉不能在它到点之前插队。
+            && self.failures == 0
+            && self
+                .last_attempt
+                .is_none_or(|last| Instant::now() >= last + PRICE_GAP_MIN_INTERVAL)
+        {
+            self.gaps.wants_pull = false;
+            self.next_refresh = Instant::now();
+        }
+    }
+
+    /// 托盘"立即刷新"用：立刻尝试，但保留连续失败时长与自动退避阶段。
+    fn schedule_now(&mut self) {
+        self.next_refresh = Instant::now();
+    }
+}
+
+/// 一个缺价模型的等待状态。
+struct PendingGap {
+    /// 首次观测到"有用量但没价"的时刻，补拉窗口从这里起算。
+    first_seen: Instant,
+    /// 超过补拉窗口后置位：不再为它提前补拉，只等日调度。
+    gave_up: bool,
+}
+
+/// 价格表缺口的观测状态，worker 线程局部、随主循环存活。
+///
+/// 一份状态服务三件事：按模型去重的"缺价"日志、价格表补齐后的闭环日志，
+/// 以及"要不要提前补拉一次"的触发与停手判定。日志按模型去重（而不是每轮
+/// 本地刷新各报一次），所以它既不会刷屏，也不会因为补拉冷却而漏报。
+#[derive(Default)]
+struct PriceGaps {
+    /// 已经报过缺价、当前仍缺价的模型名（补价后移出，于是再次缺价会重报）。
+    reported: HashSet<String>,
+    /// 报过缺价、还在等价格表补齐的模型名 → 等待状态。
+    pending: HashMap<String, PendingGap>,
+    /// 还有"未停手"的缺口：主循环据此提前拉一次价格表（冷却见
+    /// `PRICE_GAP_MIN_INTERVAL`）。
+    wants_pull: bool,
+}
+
+impl PriceGaps {
+    /// 用一次本地刷新的观测结果更新状态，返回本次要写进日志的行。
+    ///
+    /// 返回文本而不是直接写日志：日志是进程级单例，只有把"该说什么"和
+    /// "写到哪"分开，测试才能断言前者。
+    ///
+    /// `unpriced` 是本次刷新观测到的缺价模型名，可能同时来自今日与本期两个
+    /// 窗口（于是有重复）；去重与"报过没有"都在这里判定。结算与观测分开：
+    /// 先拿当前价格表结清所有还在等的模型——包括本次窗口里已经没有用量的
+    /// 那些——否则一个用完就不再出现的模型会让程序一直以为缺口还在。
+    fn observe(&mut self, unpriced: &[&str], prices: &PriceTable, now: Instant) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut tracked: Vec<String> = self.pending.keys().cloned().collect();
+        // `HashMap` 迭代顺序不定，排序只为让日志行序稳定（测试断言得动）。
+        tracked.sort_unstable();
+        for model in tracked {
+            if prices.lookup(Some(&model)).is_some() {
+                self.pending.remove(&model);
+                self.reported.remove(&model);
+                lines.push(format!("价格表已补齐：{model}"));
+                continue;
+            }
+            if let Some(gap) = self.pending.get_mut(&model)
+                && !gap.gave_up
+                && now.saturating_duration_since(gap.first_seen) >= PRICE_GAP_RETRY_WINDOW
+            {
+                gap.gave_up = true;
+                lines.push(format!("价格表仍缺模型：{model}（暂停补拉，等每日刷新）"));
+            }
+        }
+        for name in unpriced {
+            // `insert` 返回 false 说明这个名字已经报过——日志只留一条开头。
+            if self.reported.insert((*name).to_owned()) {
+                lines.push(format!("价格表缺模型：{name}"));
+            }
+            self.pending
+                .entry((*name).to_owned())
+                .or_insert(PendingGap {
+                    first_seen: now,
+                    gave_up: false,
+                });
+        }
+        self.wants_pull = self.pending.values().any(|gap| !gap.gave_up);
+        lines
+    }
 }
 
 fn poll_local_changes(
@@ -568,9 +734,8 @@ where
 }
 
 fn refresh_local_usage<F>(
-    tracker: &mut SessionUsageTracker,
-    status: &mut LocalUsageStatus,
-    prices: &PriceTable,
+    local: &mut LocalPipeline,
+    prices: &mut PricePipeline,
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
 ) where
@@ -578,34 +743,43 @@ fn refresh_local_usage<F>(
 {
     let today = local_calendar_date();
     let mut identity_changed = false;
-    if status.date != today {
-        status.date.clone_from(&today);
-        status.last_error = None;
-        if let Ok(mut current) = state.lock()
-            && (current.today_tokens.take().is_some()
-                || current.today_overflow_tokens.take().is_some()
-                || current.today_overflow_cost.take().is_some())
-        {
-            identity_changed = true;
+    if local.status.date != today {
+        local.status.date.clone_from(&today);
+        local.status.last_error = None;
+        if let Ok(mut current) = state.lock() {
+            // `||` 会短路，必须把各字段都清掉后再判断是否需要通知。
+            let cleared = [
+                current.today_tokens.take().is_some(),
+                current.today_cache_hit_percent_tenths.take().is_some(),
+                current.today_overflow_tokens.take().is_some(),
+                current.today_overflow_cost.take().is_some(),
+            ];
+            identity_changed |= cleared.into_iter().any(|was_present| was_present);
         }
     }
     let period_boundary = current_period_boundary(state);
-    if status.synchronize_period_boundary(period_boundary)
+    if local.status.synchronize_period_boundary(period_boundary)
         && let Ok(mut current) = state.lock()
-        && (current.current_period_tokens.take().is_some()
-            || current.current_period_overflow_tokens.take().is_some()
-            || current.current_period_overflow_cost.take().is_some())
     {
-        identity_changed = true;
+        let cleared = [
+            current.current_period_tokens.take().is_some(),
+            current
+                .current_period_cache_hit_percent_tenths
+                .take()
+                .is_some(),
+            current.current_period_overflow_tokens.take().is_some(),
+            current.current_period_overflow_cost.take().is_some(),
+        ];
+        identity_changed |= cleared.into_iter().any(|was_present| was_present);
     }
     if identity_changed {
         notify();
     }
 
     let refresh_started = Instant::now();
-    match tracker.refresh(status.period_boundary.as_ref()) {
+    match local.tracker.refresh(local.status.period_boundary.as_ref()) {
         Ok((snapshot, diagnostics)) => {
-            status.last_error = None;
+            local.status.last_error = None;
             publish_local_quota(
                 state,
                 snapshot.quota.clone(),
@@ -621,9 +795,9 @@ fn refresh_local_usage<F>(
             // once with it so the period usage is not stuck until the next
             // external trigger.
             let boundary_now = current_period_boundary(state);
-            if status.synchronize_period_boundary(boundary_now)
+            if local.status.synchronize_period_boundary(boundary_now)
                 && let Ok((snapshot, diagnostics)) =
-                    tracker.refresh(status.period_boundary.as_ref())
+                    local.tracker.refresh(local.status.period_boundary.as_ref())
             {
                 publish_local_usage_snapshot(state, &snapshot, prices, notify);
                 if should_log_local_usage_refresh(&diagnostics) {
@@ -633,6 +807,7 @@ fn refresh_local_usage<F>(
         }
         Err(error) => {
             publish_local_token_usage(state, None, None, notify);
+            publish_local_cache_hit_percent_tenths(state, None, None, notify);
             publish_local_cost(state, None, None, None, notify);
             publish_local_overflow(state, OverflowUsage::default(), notify);
             let message = error.to_string();
@@ -640,7 +815,7 @@ fn refresh_local_usage<F>(
                 "Codex 本地用量刷新失败：总计 {}，错误 {message}",
                 format_elapsed(refresh_started.elapsed())
             ));
-            status.last_error = Some(message);
+            local.status.last_error = Some(message);
         }
     }
 }
@@ -650,16 +825,46 @@ fn refresh_local_usage<F>(
 fn publish_local_usage_snapshot<F>(
     state: &Arc<Mutex<AppState>>,
     snapshot: &session_usage::LocalUsageSnapshot,
-    prices: &PriceTable,
+    prices: &mut PricePipeline,
     notify: &Arc<F>,
 ) where
     F: Fn() + Send + Sync + 'static,
 {
-    let today_cost = snapshot.today_volume.as_ref().and_then(|v| v.cost(prices));
+    let today_cost = snapshot
+        .today_volume
+        .as_ref()
+        .and_then(|v| v.cost(&prices.table));
     let period_cost = snapshot
         .period_volume
         .as_ref()
-        .and_then(|volumes| volumes.cost(prices));
+        .and_then(|volumes| volumes.cost(&prices.table));
+    let today_cache_hit_percent_tenths = snapshot
+        .today_volume
+        .as_ref()
+        .and_then(ModelVolumes::cache_hit_percent_tenths);
+    let period_cache_hit_percent_tenths = snapshot
+        .period_volume
+        .as_ref()
+        .and_then(ModelVolumes::cache_hit_percent_tenths);
+    // 成本静默少算的唯一出口：把"有用量但价格表里没有"的模型交给缺口状态机
+    // （按模型名去重、并决定要不要提前补拉一次）。放在发布显示值之前，日志的
+    // 时序才与"这一份快照"对应。
+    let mut unpriced: Vec<&str> = Vec::new();
+    for volumes in [
+        snapshot.today_volume.as_ref(),
+        snapshot.period_volume.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        unpriced.extend(volumes.unpriced_models(&prices.table));
+    }
+    for line in prices
+        .gaps
+        .observe(&unpriced, &prices.table, Instant::now())
+    {
+        crate::logging::log(&line);
+    }
     publish_local_cost(
         state,
         today_cost,
@@ -691,6 +896,12 @@ fn publish_local_usage_snapshot<F>(
         snapshot
             .current_period_reliable
             .then_some(snapshot.current_period_tokens),
+        notify,
+    );
+    publish_local_cache_hit_percent_tenths(
+        state,
+        today_cache_hit_percent_tenths,
+        period_cache_hit_percent_tenths,
         notify,
     );
 }
@@ -919,6 +1130,28 @@ fn publish_local_token_usage<F>(
             changed = true;
         }
     }
+    if changed {
+        notify();
+    }
+}
+
+fn publish_local_cache_hit_percent_tenths<F>(
+    state: &Arc<Mutex<AppState>>,
+    today: Option<u16>,
+    current_period: Option<u16>,
+    notify: &Arc<F>,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    let changed = state.lock().is_ok_and(|mut current| {
+        let mut changed = false;
+        changed |= assign(&mut current.today_cache_hit_percent_tenths, today);
+        changed |= assign(
+            &mut current.current_period_cache_hit_percent_tenths,
+            current_period,
+        );
+        changed
+    });
     if changed {
         notify();
     }
@@ -1298,48 +1531,69 @@ mod tests {
     }
 
     #[test]
-    fn price_refresh_retries_failures_and_resumes_daily_schedule_after_success() {
-        let delays: Vec<_> = [0, 1, 2, 3, 4, 5, 6, usize::MAX, 0]
-            .into_iter()
-            .map(|mut failures| price_refresh_attempt_delay(&mut failures))
+    fn price_refresh_failure_delay_grows_then_stays_hourly() {
+        let delays: Vec<_> = (1..=8)
+            .map(|failures| price_refresh_failure_delay(failures, Duration::from_hours(1)))
             .collect();
         assert_eq!(
             delays,
             [
-                PRICE_REFRESH_INTERVAL,
                 Duration::from_secs(30),
                 Duration::from_mins(1),
                 Duration::from_mins(2),
                 Duration::from_mins(5),
-                Duration::from_mins(5),
-                PRICE_REFRESH_INTERVAL,
-                PRICE_REFRESH_INTERVAL,
-                PRICE_REFRESH_INTERVAL,
+                Duration::from_mins(15),
+                Duration::from_mins(30),
+                Duration::from_hours(1),
+                Duration::from_hours(1),
             ]
         );
     }
 
     #[test]
-    fn price_refresh_starts_a_new_retry_round_after_exhaustion() {
-        let mut failures = 0;
-        let delays: Vec<_> = (0..7)
-            .map(|_| {
-                failures += 1;
-                price_refresh_attempt_delay(&mut failures)
-            })
-            .collect();
+    fn price_refresh_failure_delay_slows_after_six_hours() {
         assert_eq!(
-            delays,
-            [
-                Duration::from_secs(30),
-                Duration::from_mins(1),
-                Duration::from_mins(2),
-                Duration::from_mins(5),
-                Duration::from_mins(5),
-                PRICE_REFRESH_INTERVAL,
-                Duration::from_secs(30),
-            ]
+            price_refresh_failure_delay(
+                99,
+                PRICE_FAILURE_SLOW_AFTER.saturating_sub(Duration::from_secs(1)),
+            ),
+            Duration::from_hours(1)
         );
+        assert_eq!(
+            price_refresh_failure_delay(99, PRICE_FAILURE_SLOW_AFTER),
+            PRICE_FAILURE_SLOW_INTERVAL
+        );
+    }
+
+    #[test]
+    fn manual_price_refresh_keeps_the_failure_backoff_stage() {
+        let mut prices = PricePipeline::new(PriceTable::default());
+        let first_failure = Instant::now();
+        prices.failures = 9;
+        prices.first_failure = Some(first_failure);
+        prices.next_refresh = Instant::now() + PRICE_FAILURE_SLOW_INTERVAL;
+
+        prices.schedule_now();
+
+        assert!(prices.next_refresh <= Instant::now());
+        assert_eq!(prices.failures, 9);
+        assert_eq!(prices.first_failure, Some(first_failure));
+    }
+
+    #[test]
+    fn missing_model_does_not_interrupt_a_failed_price_refresh_backoff() {
+        let mut prices = PricePipeline::new(PriceTable::default());
+        let now = Instant::now();
+        let scheduled = now + PRICE_FAILURE_SLOW_INTERVAL;
+        prices.failures = 9;
+        prices.first_failure = Some(now);
+        prices.next_refresh = scheduled;
+        prices.gaps.wants_pull = true;
+
+        prices.refresh_if_due(&mut None);
+
+        assert_eq!(prices.next_refresh, scheduled);
+        assert!(prices.gaps.wants_pull);
     }
 
     #[test]
@@ -1371,6 +1625,83 @@ mod tests {
         assert_eq!(
             price_refresh_delay(Some(stale_fetched_at), now),
             PRICE_REFRESH_START_DELAY
+        );
+    }
+
+    /// 缺价日志按模型名去重：一轮本地扫描每几秒就可能重跑一次，逐轮上报会把
+    /// 日志刷满，也就没人看得见"到底缺哪个模型"。
+    #[test]
+    fn price_gaps_report_each_missing_model_once_and_keep_pulling() {
+        let mut gaps = PriceGaps::default();
+        let now = Instant::now();
+        let prices = PriceTable::default();
+
+        assert_eq!(
+            gaps.observe(&["gpt-new"], &prices, now),
+            vec!["价格表缺模型：gpt-new"]
+        );
+        assert!(gaps.wants_pull, "有缺口就该安排一次提前补拉");
+
+        assert!(
+            gaps.observe(&["gpt-new"], &prices, now + Duration::from_mins(1))
+                .is_empty()
+        );
+        assert!(gaps.wants_pull, "缺口还在，补拉意图应保持");
+    }
+
+    /// "少算了"必须有闭合的另一半：价格表补齐时回写一条，并且缺口关上之后
+    /// 不再安排补拉——否则模型用完不再出现，程序会以为缺口永远在。
+    #[test]
+    fn price_gaps_close_the_log_once_the_model_is_priced() {
+        let mut gaps = PriceGaps::default();
+        let now = Instant::now();
+
+        gaps.observe(&["gpt-new"], &PriceTable::default(), now);
+        let prices = PriceTable::from_models_dev(
+            r#"{"openai":{"models":{"gpt-new":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
+        )
+        .expect("应解析出价格表");
+
+        // 本窗口已经不再出现这个模型，闭环仍要报出来。
+        assert_eq!(
+            gaps.observe(&[], &prices, now + Duration::from_secs(90)),
+            vec!["价格表已补齐：gpt-new"]
+        );
+        assert!(!gaps.wants_pull, "缺口关闭后不该再补拉");
+        // 同一个模型再次缺价时重新开一轮（不是一次报过就永远沉默）。
+        assert_eq!(
+            gaps.observe(
+                &["gpt-new"],
+                &PriceTable::default(),
+                now + Duration::from_mins(2)
+            ),
+            vec!["价格表缺模型：gpt-new"]
+        );
+    }
+
+    /// 永远不进价格表的模型名（本地变体后缀之类）不能让它每小时发请求到永远：
+    /// 补拉窗口耗尽后停手，只留一条日志说明改由日调度兜底。
+    #[test]
+    fn price_gaps_stop_pulling_after_the_retry_window() {
+        let mut gaps = PriceGaps::default();
+        let now = Instant::now();
+        let prices = PriceTable::default();
+
+        gaps.observe(&["gpt-never"], &prices, now);
+        let just_inside_window = PRICE_GAP_RETRY_WINDOW.saturating_sub(Duration::from_secs(1));
+        let inside_window = gaps.observe(&["gpt-never"], &prices, now + just_inside_window);
+        assert!(inside_window.is_empty());
+        assert!(gaps.wants_pull, "窗口内继续补拉");
+
+        assert_eq!(
+            gaps.observe(&["gpt-never"], &prices, now + PRICE_GAP_RETRY_WINDOW),
+            vec!["价格表仍缺模型：gpt-never（暂停补拉，等每日刷新）"]
+        );
+        assert!(!gaps.wants_pull, "停手之后不再提前补拉");
+        // 停手只报一次。
+        assert!(
+            gaps.observe(&["gpt-never"], &prices, now + PRICE_GAP_RETRY_WINDOW * 2)
+                .is_empty()
         );
     }
 

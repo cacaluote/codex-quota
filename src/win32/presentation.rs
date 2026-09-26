@@ -287,6 +287,22 @@ pub(super) fn format_token_usage(tokens: Option<u64>, unit: UnitStyle) -> String
     tokens.map_or_else(|| "--".to_owned(), |value| format_token_count(value, unit))
 }
 
+/// 套餐内使用行在 token 数后紧跟输入缓存命中率；无输入或不可靠时仅显示 token 数。
+pub(super) fn format_usage_with_cache_hit(
+    tokens: Option<u64>,
+    hit_percent_tenths: Option<u16>,
+    unit: UnitStyle,
+) -> String {
+    let usage = format_token_usage(tokens, unit);
+    match (tokens, hit_percent_tenths) {
+        (Some(_), Some(tenths)) => {
+            let tenths = tenths.min(1000);
+            format!("{usage} · {}.{}%", tenths / 10, tenths % 10)
+        }
+        _ => usage,
+    }
+}
+
 /// 重置时间列的文本：本地时间，按需在其后附带紧凑倒计时。
 ///
 /// 倒计时是**绘制那一刻**的值——面板静止时 30 秒才重绘一次，所以它按分钟跳，
@@ -503,6 +519,30 @@ mod tests {
         assert_eq!(format_token_usage(Some(42_803_000), UnitStyle::En), "42.8M");
         assert_eq!(format_token_usage(None, UnitStyle::Zh), "--");
         assert_eq!(format_token_usage(None, UnitStyle::En), "--");
+    }
+
+    #[test]
+    fn cache_hit_rate_follows_the_usage_count_when_available() {
+        assert_eq!(
+            format_usage_with_cache_hit(Some(120_000_000), Some(981), UnitStyle::Zh),
+            "1.2亿 · 98.1%"
+        );
+        assert_eq!(
+            format_usage_with_cache_hit(Some(120_000_000), Some(981), UnitStyle::En),
+            "120M · 98.1%"
+        );
+        assert_eq!(
+            format_usage_with_cache_hit(Some(120_000_000), Some(1000), UnitStyle::Zh),
+            "1.2亿 · 100.0%"
+        );
+        assert_eq!(
+            format_usage_with_cache_hit(Some(0), None, UnitStyle::Zh),
+            "0"
+        );
+        assert_eq!(
+            format_usage_with_cache_hit(None, Some(981), UnitStyle::Zh),
+            "--"
+        );
     }
 
     #[test]

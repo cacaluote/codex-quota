@@ -290,21 +290,22 @@ struct JobHandle(HANDLE);
 impl JobHandle {
     fn new_and_assign(process: RawHandle) -> Result<Self, AppError> {
         // SAFETY: A null security descriptor and name create a private job owned by this process.
-        let job = unsafe { CreateJobObjectW(None, None)? };
+        // Wrap the handle immediately so every later `?` closes it on failure.
+        let job = Self(unsafe { CreateJobObjectW(None, None)? });
         let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: `information` has the exact layout required by the selected information class.
         unsafe {
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 (&raw const information).cast::<c_void>(),
                 u32::try_from(std::mem::size_of_val(&information))
                     .map_err(|_| AppError::Windows("Job Object 结构大小溢出".to_owned()))?,
             )?;
-            AssignProcessToJobObject(job, HANDLE(process))?;
+            AssignProcessToJobObject(job.0, HANDLE(process))?;
         }
-        Ok(Self(job))
+        Ok(job)
     }
 }
 

@@ -101,6 +101,7 @@ const CMD_TOKEN_UNIT_ZH: usize = 1018;
 const CMD_TOKEN_UNIT_EN: usize = 1019;
 const CMD_COLOR_STYLE_SOFT: usize = 1020;
 const CMD_COLOR_STYLE_VIVID: usize = 1021;
+const CMD_CACHE_HIT_RATE: usize = 1022;
 const COLLAPSED_DIP: f32 = 56.0;
 const PANEL_WIDTH_DIP: f32 = 288.0;
 // 面板高度是动态的：随超额行可见性在 227/254/281 dip 间收缩，

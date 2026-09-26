@@ -5,6 +5,23 @@ use super::parser::{event_is_on_date, ts_is_on_date};
 use crate::quota::pricing::PriceTable;
 
 impl ModelVolumes {
+    /// 套餐内输入 token 的缓存命中率，以百分比的十分之一为单位（0–1000）。
+    /// 没有输入时分母为零，返回 None；output 不参与分母。
+    pub(in crate::quota::codex) fn cache_hit_percent_tenths(&self) -> Option<u16> {
+        let (cached, uncached) = self.0.iter().fold((0_u128, 0_u128), |totals, (_, volume)| {
+            (
+                totals.0.saturating_add(u128::from(volume.cached_input)),
+                totals.1.saturating_add(u128::from(volume.uncached_input)),
+            )
+        });
+        let input = cached.saturating_add(uncached);
+        if input == 0 {
+            return None;
+        }
+        let rounded = cached.saturating_mul(1000).saturating_add(input / 2) / input;
+        u16::try_from(rounded.min(1000)).ok()
+    }
+
     /// 按 models.dev 牌价把分桶用量换算成美元。空价格表返回 None
     /// （无法计价）；表内查不到的模型按 0 贡献（宁可少算不虚算）。
     // 真实 token 计数远低于 2^53，u64→f64 的精度损失在这里不可能出现。
@@ -27,6 +44,35 @@ impl ModelVolumes {
                 // 显式以 +0.0 折叠。
                 .fold(0.0, |sum, value| sum + value),
         )
+    }
+
+    /// 本窗口**确有用量**、但价格表里查不到价格的模型名（去重、字典序）。
+    ///
+    /// 这是"价值静默少算"唯一的可观测出口：`cost` 用 `filter_map` 把这类模型
+    /// 整桶丢掉，只要表非空，金额照样是个 `Some`，看数字看不出漏了谁。
+    ///
+    /// 三条刻意不报的情形：**空表**——那是整列 `--` 的已知状态（且已有拉取失败
+    /// 的日志），逐个模型再报一遍只会刷屏；**`None` 桶**——那是"事件之前没有
+    /// `turn_context`"的模型未知，与"新模型还没进价格表"是两回事；**零用量的
+    /// 桶**——它对金额没有贡献，报出来是假警报。
+    pub(in crate::quota::codex) fn unpriced_models(&self, table: &PriceTable) -> Vec<&str> {
+        if table.is_empty() {
+            return Vec::new();
+        }
+        let mut names: Vec<&str> = self
+            .0
+            .iter()
+            .filter(|(model, volume)| {
+                (volume.uncached_input != 0 || volume.cached_input != 0 || volume.output != 0)
+                    && model
+                        .as_deref()
+                        .is_some_and(|model| table.lookup(Some(model)).is_none())
+            })
+            .filter_map(|(model, _)| model.as_deref())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 }
 
@@ -479,6 +525,52 @@ mod tests {
     use crate::quota::pricing::PriceTable;
 
     #[test]
+    fn cache_hit_percent_tenths_uses_only_input_tokens() {
+        let volumes = ModelVolumes(vec![
+            (
+                Some("model-a".to_owned()),
+                TokenVolume {
+                    uncached_input: 2,
+                    cached_input: 98,
+                    output: 900,
+                },
+            ),
+            (
+                None,
+                TokenVolume {
+                    uncached_input: 0,
+                    cached_input: 98,
+                    output: 0,
+                },
+            ),
+        ]);
+        assert_eq!(volumes.cache_hit_percent_tenths(), Some(990));
+        assert_eq!(
+            ModelVolumes(vec![(
+                None,
+                TokenVolume {
+                    uncached_input: 19,
+                    cached_input: 981,
+                    output: 900,
+                },
+            )])
+            .cache_hit_percent_tenths(),
+            Some(981)
+        );
+        assert_eq!(
+            ModelVolumes(vec![(
+                None,
+                TokenVolume {
+                    output: 100,
+                    ..TokenVolume::default()
+                },
+            )])
+            .cache_hit_percent_tenths(),
+            None
+        );
+    }
+
+    #[test]
     fn cost_weights_cached_input_and_output_separately() {
         let table = PriceTable::from_models_dev(
             r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
@@ -497,6 +589,39 @@ mod tests {
         let cost = volumes.cost(&table).unwrap();
         assert!((cost - 9.6).abs() < 1e-9);
         assert_eq!(volumes.cost(&PriceTable::default()), None);
+    }
+
+    #[test]
+    fn unpriced_models_reports_only_buckets_with_usage_and_no_price() {
+        let table = PriceTable::from_models_dev(
+            r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
+        )
+        .expect("应解析出价格表");
+        let bucket = |model: Option<&str>, tokens: u64| {
+            (
+                model.map(str::to_owned),
+                TokenVolume {
+                    uncached_input: tokens,
+                    cached_input: 0,
+                    output: 0,
+                },
+            )
+        };
+        let volumes = ModelVolumes(vec![
+            bucket(Some("m"), 1_000),
+            // 调用方会把今日与本期两个桶拼成一个列表，同一个名字会出现两次。
+            bucket(Some("gpt-new"), 500),
+            bucket(Some("gpt-new"), 250),
+            // 零用量的桶对金额没有贡献，不是缺价缺口。
+            bucket(Some("gpt-unused"), 0),
+            // 模型未知（事件前没有 turn_context）与新模型没价是两回事。
+            bucket(None, 700),
+        ]);
+
+        // 名字去重与字典序一起钉住：`gpt-new` 出现两次也只报一次。
+        assert_eq!(volumes.unpriced_models(&table), vec!["gpt-new"]);
+        // 空表是"整列 --"的已知状态，不逐模型上报。
+        assert!(volumes.unpriced_models(&PriceTable::default()).is_empty());
     }
 
     #[test]

@@ -32,9 +32,9 @@ use super::tray::{
     token_unit_for_command, tray_icon_flags,
 };
 use super::{
-    AppWindow, CMD_AUTOSTART, CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX, CMD_NOTIFY_OVERFLOW,
-    CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_RESET_COUNTDOWN, CMD_SHOW,
-    CMD_TOPMOST, TIMER_ANIMATION, TIMER_BALL, TIMER_REDRAW, TRAY_ID, WM_APP_COLLAPSE,
+    AppWindow, CMD_AUTOSTART, CMD_CACHE_HIT_RATE, CMD_COPY_PANEL, CMD_EXIT, CMD_FOLLOW_CODEX,
+    CMD_NOTIFY_OVERFLOW, CMD_NOTIFY_RESET, CMD_PANEL_PERSISTENT, CMD_REFRESH, CMD_RESET_COUNTDOWN,
+    CMD_SHOW, CMD_TOPMOST, TIMER_ANIMATION, TIMER_BALL, TIMER_REDRAW, TRAY_ID, WM_APP_COLLAPSE,
     WM_APP_EXPAND, WM_APP_PRESENCE_CHANGED, WM_APP_SHOW, WM_APP_TRAY, WM_APP_UPDATED,
     WM_MOUSELEAVE,
 };
@@ -42,13 +42,14 @@ use crate::config::{self, AppConfigV1, ColorStyle, UnitStyle};
 use crate::error::AppError;
 use crate::quota::{AppState, CodexWorker};
 
-/// 显示偏好（重置列倒计时、用量单位、配色风格）从配置进状态的**唯一**映射。
+/// 显示偏好（倒计时、缓存命中率、用量单位、配色风格）从配置进状态的**唯一**映射。
 ///
 /// 有三条路径要把它们带进状态：启动时造初始状态、跟随模式重启时整体换状态
 /// （[`AppWindow::reset_state`]）、托盘里改设置。各写一份必然漏，而漏掉一处就是
 /// 用户重启跟随模式后设置被打回默认——加新偏好只改这里。
 pub(super) fn apply_display_prefs(state: &mut AppState, config: &AppConfigV1) {
     state.show_reset_countdown = config.show_reset_countdown;
+    state.show_cache_hit_rate = config.show_cache_hit_rate;
     state.token_unit = config.token_unit;
     state.color_style = config.color_style;
 }
@@ -445,7 +446,7 @@ impl AppWindow {
         }
     }
 
-    /// 显示偏好（重置列倒计时、用量单位、配色风格）的单一出口：写回状态、存盘、重绘。
+    /// 显示偏好（倒计时、缓存命中率、用量单位、配色风格）的单一出口：写回状态、存盘、重绘。
     ///
     /// 这三步必须一起做——只改配置的话，渲染器读的是状态，画面不会变。
     fn publish_display_prefs(&mut self) -> Result<(), AppError> {
@@ -533,6 +534,11 @@ impl AppWindow {
             }
             CMD_RESET_COUNTDOWN => {
                 self.config.show_reset_countdown = !self.config.show_reset_countdown;
+                self.publish_display_prefs()?;
+                Ok(())
+            }
+            CMD_CACHE_HIT_RATE => {
+                self.config.show_cache_hit_rate = !self.config.show_cache_hit_rate;
                 self.publish_display_prefs()?;
                 Ok(())
             }
@@ -719,6 +725,7 @@ mod tests {
     fn config_with_prefs() -> AppConfigV1 {
         AppConfigV1 {
             show_reset_countdown: false,
+            show_cache_hit_rate: false,
             token_unit: UnitStyle::En,
             color_style: ColorStyle::Vivid,
             ..AppConfigV1::default()
@@ -730,6 +737,7 @@ mod tests {
         AppState {
             status: ConnectionStatus::Online,
             today_tokens: Some(1_000),
+            today_cache_hit_percent_tenths: Some(981),
             snapshot: Some(QuotaSnapshot {
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
@@ -753,9 +761,15 @@ mod tests {
         apply_display_prefs(&mut state, &config_with_prefs());
 
         assert_eq!(state.today_tokens, Some(1_000), "显示偏好不该碰用量");
+        assert_eq!(
+            state.today_cache_hit_percent_tenths,
+            Some(981),
+            "关闭显示后，原始命中率应保留，以便重新勾选时立刻恢复"
+        );
         assert!(state.snapshot.is_some(), "显示偏好不该碰额度快照");
         assert_eq!(state.status, ConnectionStatus::Online);
         assert!(!state.show_reset_countdown);
+        assert!(!state.show_cache_hit_rate);
         assert_eq!(state.token_unit, UnitStyle::En);
         assert_eq!(state.color_style, ColorStyle::Vivid);
     }
@@ -767,6 +781,7 @@ mod tests {
         let state = state_from_config(&config_with_prefs());
 
         assert!(!state.show_reset_countdown);
+        assert!(!state.show_cache_hit_rate);
         assert_eq!(state.token_unit, UnitStyle::En);
         assert_eq!(state.color_style, ColorStyle::Vivid);
     }

@@ -645,7 +645,7 @@ mod tests {
     use super::super::test_support::*;
 
     #[test]
-    fn refresh_sums_exact_last_usage_from_cross_day_file() {
+    fn cross_day_last_usage_counted() {
         let context = TestContext::new("exact-last");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_deduplicates_repeated_snapshot_from_same_source() {
+    fn same_source_snapshots_deduplicated() {
         let context = TestContext::new("same-source-repeat");
         let file = context.rollout(PARENT_ID);
         let repeated = token_count(&context.at(1), 100, Some(100), Some("codex"));
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_ignores_last_usage_when_cumulative_total_does_not_advance() {
+    fn unchanged_source_total_ignores_last_usage() {
         let context = TestContext::new("stale-last");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_ignores_partial_recovery_below_source_high_water() {
+    fn partial_source_recovery_ignored() {
         let context = TestContext::new("partial-recovery");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_counts_last_usage_after_source_total_passes_high_water() {
+    fn recovered_source_counts_last_usage() {
         let context = TestContext::new("pass-high-water");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_keeps_last_usage_when_other_source_has_lower_cumulative_total() {
+    fn lower_other_source_preserves_last_usage() {
         let context = TestContext::new("interleaved-lower-total");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_uses_cumulative_delta_when_last_usage_is_missing() {
+    fn missing_last_usage_uses_delta() {
         let context = TestContext::new("cumulative");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_retries_unterminated_last_line_after_append() {
+    fn unterminated_line_retried_after_append() {
         use std::io::Write;
 
         let context = TestContext::new("partial-line");
@@ -903,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_preserves_identical_usage_in_full_and_incremental_scans() {
+    fn model_switch_scan_modes_agree() {
         let prices = crate::quota::pricing::PriceTable::from_models_dev(
             r#"{"openai":{"models":{"model-a":{"cost":{"input":1,"cache_read":0.1,"output":2}},"model-b":{"cost":{"input":10,"cache_read":1,"output":20}}}}}"#,
         )
@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_splits_buckets_by_model_across_switches() {
+    fn model_switch_splits_usage_buckets() {
         let context = TestContext::new("model-buckets");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -989,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_leaves_pre_turn_context_events_unattributed() {
+    fn pre_context_usage_remains_unattributed() {
         let context = TestContext::new("unattributed-model");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_cumulative_buckets_track_high_water_per_bucket() {
+    fn usage_buckets_track_high_water() {
         let context = TestContext::new("cumulative-buckets");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -1052,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_token_line_makes_openai_file_unreliable() {
+    fn malformed_token_invalidates_file() {
         let context = TestContext::new("malformed");
         let file = context.rollout(PARENT_ID);
         assert!(

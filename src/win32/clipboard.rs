@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn dibv5_header_describes_a_top_down_32bit_srgb_bitmap() {
+    fn dibv5_header_format() {
         let bytes = dibv5_bytes(&snapshot(3, 2, vec![0; 24])).unwrap();
 
         assert_eq!(bytes.len(), HEADER_LEN + 24);
@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn dib_header_describes_a_top_down_32bit_bitmap() {
+    fn dib_header_format() {
         let bytes = dib_bytes(&snapshot(3, 2, vec![0; 24])).unwrap();
         assert_eq!(bytes.len(), DIB_HEADER_LEN + 24);
         assert_eq!(header_u32(&bytes, 0), 40, "biSize");
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn dib_header_is_followed_by_pixels_without_flipping_rows() {
+    fn dib_preserves_pixel_order() {
         let pixels = vec![
             1, 2, 3, 0, 4, 5, 6, 255, // 顶行
             7, 8, 9, 0, 10, 11, 12, 255, // 底行
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn straight_alpha_stays_monotonic_and_never_overflows_a_channel() {
+    fn straight_alpha_monotonicity_and_bounds() {
         for alpha in 1..=255u8 {
             let mut previous = 0u8;
             for channel in 0..=alpha {
@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_whose_buffer_does_not_match_their_size_are_rejected() {
+    fn snapshot_rejects_invalid_buffer_size() {
         // 尺寸与缓冲不一致时宁可不写剪贴板，否则接收方会按错长度读全局内存。
         assert!(pixel_bytes(2, 2) == Some(16));
         assert_ne!(pixel_bytes(2, 2), Some(12));
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_png_writes_a_png_with_matching_dimensions() {
+    fn png_preserves_image_dimensions() {
         use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
         // WIC 需要 COM；S_FALSE（已初始化）也是成功。
@@ -819,7 +819,7 @@ mod tests {
     /// `cargo test real_clipboard -- --ignored`
     #[test]
     #[ignore = "会覆盖剪贴板内容"]
-    fn real_clipboard_round_trip_keeps_the_dib_readable_and_converts_to_cf_dib() {
+    fn real_clipboard_dib_roundtrip() {
         use crate::win32::AppState;
         use crate::win32::PANEL_WIDTH_DIP;
         use crate::win32::layout::dip_to_px;

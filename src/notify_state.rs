@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_state_file_without_the_version_field_is_still_read() {
+    fn missing_state_version_accepted() {
         let path = unique_path("legacy");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, r#"{ "notified_overflow_period": 42 }"#).unwrap();

@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn current_period_includes_start_instant_and_excludes_earlier_usage() {
+    fn period_start_boundary() {
         let context = TestContext::new("period-boundary");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_start_day_log_shows_zero_period_usage() {
+    fn missing_start_log_zero_usage() {
         // 窗口起点已知且本机窗口内没有任何会话文件：本期与今日一致地
         // 显示可靠的 0（本机口径），而不是 --。
         let context = TestContext::new("missing-period-boundary");
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn token_without_timestamp_makes_current_period_unreliable() {
+    fn untimed_token_invalidates_period() {
         let context = TestContext::new("period-missing-timestamp");
         let file = context.rollout(PARENT_ID);
         let mut event = token_count(&context.at(1), 100, Some(100), Some("codex"));
@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn current_period_keeps_previous_local_day_after_midnight() {
+    fn period_spans_local_midnight() {
         let context = TestContext::new("period-cross-midnight");
         let file = context.rollout(PARENT_ID);
         let boundary_timestamp = context.at(-172_800);
@@ -1293,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_refresh_reuses_aggregation_and_skips_cache_write() {
+    fn unchanged_refresh_reuses_cache() {
         let context = TestContext::new("unchanged-no-op");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_incremental_reads_old_partition_file_after_append() {
+    fn watcher_reads_old_partition_append() {
         let context = TestContext::new("watcher-old-partition-append");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1364,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_incremental_skips_all_work_without_changes() {
+    fn idle_watcher_skips_refresh_work() {
         let context = TestContext::new("watcher-no-change");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_retry_recovers_incremental_monitor_and_requires_full_scan() {
+    fn watcher_recovery_requires_full_scan() {
         let context = TestContext::new("watcher-retry");
         let mut tracker = context.tracker();
         tracker.change_monitor = ChangeMonitor::Retry;
@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_incremental_loads_unselected_fork_parent_from_full_index() {
+    fn watcher_loads_unselected_fork_parent() {
         let context = TestContext::new("watcher-fork-parent-index");
         let parent = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_period_scope_reaggregates_without_rewriting_unchanged_cache() {
+    fn scope_change_preserves_file_cache() {
         let context = TestContext::new("scope-only-change");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_does_not_carry_today_value_across_date_switch() {
+    fn date_change_resets_today_usage() {
         let context = TestContext::new("date-switch");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1547,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_error_marks_otherwise_empty_snapshot_unreliable() {
+    fn discovery_error_invalidates_empty_snapshot() {
         let scan = ScanContext {
             candidate_by_path: HashMap::new(),
             rollout_index: HashMap::new(),
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_exposes_latest_rate_limit_snapshot_with_plan_type() {
+    fn latest_quota_includes_plan() {
         let context = TestContext::new("rate-limit-snapshot");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1647,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_snapshot_ignores_non_codex_limit() {
+    fn quota_ignores_other_limits() {
         let context = TestContext::new("rate-limit-other-source");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1679,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_snapshot_survives_without_today_selection() {
+    fn quota_survives_empty_today_selection() {
         let context = TestContext::new("rate-limit-no-today-selection");
         let file = context.rollout(PARENT_ID);
         write_jsonl(
@@ -1740,7 +1740,6 @@ mod tests {
             "codex_home": path_key(&context.root),
             "date": "2000-01-01",
             "latest_rate_limits": null,
-            "lifetime": null,
             "files": []
         });
         assert!(
@@ -1821,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_file_snapshot_does_not_survive_cache_reload() {
+    fn deleted_snapshot_stays_deleted_after_reload() {
         let context = TestContext::new("deleted-file-reload");
         let parent = context.rollout(PARENT_ID);
         let child = context.rollout(CHILD_ID);
@@ -2030,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn local_refresh_computes_period_usage_on_cold_start() {
+    fn cold_start_computes_period_usage() {
         use std::sync::{Arc, Mutex};
 
         use crate::quota::AppState;
@@ -2073,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn local_refresh_shows_zero_period_usage_for_empty_fresh_window() {
+    fn fresh_empty_period_zero_usage() {
         use std::sync::{Arc, Mutex};
 
         use crate::quota::AppState;
@@ -2140,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_counts_today_events_in_file_last_modified_yesterday() {
+    fn today_events_in_old_file_counted() {
         // 跨天文件：事件时间戳（今天 00:08）可能领先文件 mtime（昨天
         // 23:56，事件戳来自服务端时间）。今天的 mtime 精确规则不命中，
         // 昨天的 or-after 规则必须兜住，否则今天的用量被漏计。
@@ -2172,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_splits_overflow_usage_from_plan_usage() {
+    fn overflow_usage_split_from_plan() {
         // 服务端把窗口进度封顶在 100：进度冻结期间的事件是余额消耗（实测
         // balance 同步递减），进度从 100 回落说明窗口已重置、回到套餐内。
         // 把进度从 99 顶到 100 的跨界请求按套餐内计（误差以一个请求为界）。
@@ -2254,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_counts_first_capped_event_of_file_as_overflow() {
+    fn first_capped_event_counts_as_overflow() {
         // 文件从溢出中段开始写入（resume 场景）：首事件没有前值，以自身
         // 报告触顶为准。
         let context = TestContext::new("overflow-file-start");
@@ -2300,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn credits_debits_merge_parallel_observations_and_ignore_grants() {
+    fn parallel_debits_merge_without_grants() {
         // 余额是账户级的：并行会话对同一笔扣费的重复观测合并排序后同值
         // 相邻（A 在 t4 观测到的 90 与 B 在 t3 观测到的 90 相邻，差为 0），
         // 不会重复计入；赠送带来的正跳变不计入消耗。
@@ -2482,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn in_window_debits_survive_updates_and_cache_reload() {
+    fn in_window_debits_survive_reload() {
         let context = TestContext::new("cold-balance-anchors");
         let old = context.rollout(PARENT_ID);
         let fresh = context.rollout(CHILD_ID);
@@ -2553,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_days_do_not_attribute_a_cross_window_debit() {
+    fn inactive_days_ignore_cross_window_debits() {
         // 数日前余额到今日首次观测之间的下降不归入今日。
         let context = TestContext::new("balance-baseline");
         let old = context.rollout(PARENT_ID);

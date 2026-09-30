@@ -550,14 +550,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_root_selection_ignores_same_package_children_in_any_order() {
+    fn app_roots_exclude_package_children() {
         let roots = app_root_pids(&[(102, 101), (100, 50), (101, 100)]);
 
         assert_eq!(roots, HashSet::from([100]));
     }
 
     #[test]
-    fn app_root_selection_preserves_independent_package_roots() {
+    fn independent_app_roots_preserved() {
         let roots = app_root_pids(&[(100, 50), (101, 100), (200, 60)]);
 
         assert_eq!(roots, HashSet::from([100, 200]));
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_owned_app_server_is_not_an_external_cli_candidate() {
+    fn owned_server_excluded_from_presence() {
         assert!(!is_external_cli_candidate("codex.exe", 42, 42));
     }
 
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn grace_period_wins_over_configured_check_interval_when_equal() {
+    fn grace_period_wins_interval_tie() {
         assert_eq!(
             minimum_timeout(Some(EXIT_GRACE_PERIOD), None, Duration::from_secs(2)),
             EXIT_GRACE_PERIOD

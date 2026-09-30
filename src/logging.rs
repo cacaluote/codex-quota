@@ -92,7 +92,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_time_is_formatted_as_readable_local_timestamp() {
+    fn local_timestamp_formatting() {
         let time = SYSTEMTIME {
             wYear: 2026,
             wMonth: 7,

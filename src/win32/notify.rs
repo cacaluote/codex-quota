@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn a_five_hour_rollover_does_not_notify_while_the_weekly_window_is_exhausted() {
+    fn five_hour_rollover_respects_weekly_exhaustion() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rollover_that_restores_capacity_still_notifies() {
+    fn restored_capacity_triggers_notification() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_weekly_rollover_does_not_notify_while_the_five_hour_window_is_exhausted() {
+    fn weekly_rollover_respects_short_exhaustion() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_both_windows_in_one_frame_notifies_for_both() {
+    fn simultaneous_rollovers_notify_both() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_window_account_still_notifies_on_a_rollover() {
+    fn single_window_rollover_notifies() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_blocking_window_does_not_suppress_the_reset() {
+    fn expired_blocker_allows_reset_notification() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn account_switch_without_a_boundary_jump_does_not_notify() {
+    fn account_switch_without_reset_stays_silent() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_window_length_is_not_a_rollover() {
+    fn duration_change_is_not_reset() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_blind_gap_is_not_backfilled() {
+    fn blind_gap_suppresses_backfill() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_interval_longer_than_the_floor_still_observes() {
+    fn long_refresh_interval_observes_reset() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn unreliable_overflow_data_neither_notifies_nor_consumes_the_period() {
+    fn unreliable_overflow_preserves_notification_state() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_switch_consumes_the_event_without_notifying() {
+    fn disabled_overflow_consumes_event() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_reset_switch_suppresses_the_reset_notification() {
+    fn disabled_reset_stays_silent() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_period_key_prevents_a_repeat_after_a_cache_rebuild() {
+    fn persisted_period_prevents_duplicate_notification() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState {
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_long_window_the_overflow_notification_stays_off() {
+    fn overflow_notification_requires_long_window() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_observation_gap_disarms_the_overflow_baseline() {
+    fn observation_gap_disarms_overflow() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_observation_gap_keeps_a_published_stale_snapshot_from_backfilling() {
+    fn gap_with_stale_snapshot_suppresses_backfill() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_zero_reading_cannot_rearm_the_overflow_baseline() {
+    fn stale_zero_cannot_rearm_overflow() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_reading_invalidates_the_overflow_baseline() {
+    fn stale_reading_disarms_overflow() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn resetting_the_notifier_drops_the_previous_snapshot() {
+    fn notifier_reset_drops_snapshot() {
         let start = base();
         let mut notifier = Notifier::default();
         let mut state = NotifyState::default();
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn balloon_text_carries_the_window_and_the_amount() {
+    fn balloon_includes_window_and_amount() {
         let five_hour = Notification::Reset {
             window: "5h".to_owned(),
             remaining_percent: 99.4,
@@ -1415,7 +1415,7 @@ mod tests {
 
     /// 余额正文里的期间前缀跟着长期窗口走，和面板同一套词。
     #[test]
-    fn overflow_balloon_uses_the_panel_period_wording() {
+    fn overflow_balloon_matches_panel_period() {
         let overflow = Notification::Overflow { credits: 1.0 };
         assert_eq!(
             overflow.balloon_text("本周").1,
@@ -1434,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn credits_drop_the_ledger_decimals_but_keep_cents() {
+    fn credits_formatting_precision() {
         assert_eq!(format_credits(310.0), "310");
         assert_eq!(format_credits(310.249_999_999_999_94), "310.25");
         assert_eq!(format_credits(0.5), "0.50");
@@ -1452,7 +1452,7 @@ mod tests {
     /// 测试入口只映射两条命令，别的命令一律不放行（避免误触发投递）。
     #[cfg(debug_assertions)]
     #[test]
-    fn only_the_two_test_commands_map_to_test_notifications() {
+    fn notification_test_command_mapping() {
         assert_eq!(
             test_notification_for_command(super::super::CMD_TEST_NOTIFY_RESET),
             Some(Notification::Reset {
@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn a_windowless_period_key_is_none_and_a_weekly_one_is_the_reset_time() {
+    fn period_key_tracks_long_reset() {
         let start = base();
         // 只有 5h 一个窗口时没有"本期"，周期键为 None。
         let only = window(50.0, FIVE_HOURS, start + FIVE_HOURS);

@@ -109,7 +109,7 @@ mod tests {
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn old_session_jsonl_is_tracked_regardless_of_partition_date() {
+    fn old_session_partition_tracked() {
         let root = Path::new("C:\\Users\\test\\.codex");
         let path = root
             .join("sessions")
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_reports_append_to_existing_old_partition_file() {
+    fn watcher_reports_old_partition_append() {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "codex-quota-watcher-{}-{sequence}",

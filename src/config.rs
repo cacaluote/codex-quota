@@ -304,66 +304,52 @@ mod tests {
         assert_eq!(result.ok(), Some(config));
     }
 
+    // 缺失新字段时补默认值；旧配置显式保存的设置必须保留。
     #[test]
-    fn legacy_config_enables_outside_click_collapse_by_default() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "placement": {
-                    "monitor_device": "",
-                    "edge": "right",
-                    "offset_dip": 96.0
+    fn legacy_config_defaults() {
+        // 固定旧配置的用户可见默认值，避免测试预期随 Default 实现一起变化。
+        let defaults = AppConfigV1 {
+            follow_codex: false,
+            collapse_on_outside_click: true,
+            notify_on_reset: true,
+            notify_on_overflow: true,
+            show_reset_countdown: true,
+            show_cache_hit_rate: true,
+            token_unit: UnitStyle::Zh,
+            color_style: ColorStyle::Soft,
+            quota_refresh_interval_secs: 300,
+            follow_codex_check_interval_secs: 2,
+            ..AppConfigV1::default()
+        };
+        for (case, text, expected) in [
+            ("minimal", r#"{ "version": 1 }"#, defaults.clone()),
+            (
+                "original_fields",
+                r#"{
+                    "version": 1,
+                    "placement": { "monitor_device": "", "edge": "right", "offset_dip": 96.0 },
+                    "always_on_top": true,
+                    "start_with_windows": false
+                }"#,
+                defaults.clone(),
+            ),
+            (
+                "window_settings",
+                r#"{ "version": 1, "always_on_top": true, "start_with_windows": false }"#,
+                defaults.clone(),
+            ),
+            (
+                "follow_enabled",
+                r#"{ "version": 1, "follow_codex": true }"#,
+                AppConfigV1 {
+                    follow_codex: true,
+                    ..defaults
                 },
-                "always_on_top": true,
-                "start_with_windows": false
-            }"#,
-        );
-        assert_eq!(
-            config.ok().map(|value| value.collapse_on_outside_click),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn legacy_config_disables_follow_codex_by_default() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "placement": {
-                    "monitor_device": "",
-                    "edge": "right",
-                    "offset_dip": 96.0
-                },
-                "always_on_top": true,
-                "start_with_windows": false
-            }"#,
-        );
-        assert_eq!(config.ok().map(|value| value.follow_codex), Some(false));
-    }
-
-    #[test]
-    fn legacy_config_enables_the_reset_countdown_and_chinese_units() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "always_on_top": true,
-                "start_with_windows": false
-            }"#,
-        );
-
-        let config = config.expect("旧配置应当仍能解析");
-        assert!(
-            config.show_reset_countdown,
-            "缺失该键时必须落到 true：它默认是开的"
-        );
-        assert!(config.show_cache_hit_rate, "旧配置也应默认显示缓存命中率");
-        assert_eq!(config.token_unit, UnitStyle::Zh, "单位风格默认中文");
-        assert_eq!(
-            config.color_style,
-            ColorStyle::Soft,
-            "配色默认柔和：老用户的观感不能因为加了这套风格就变"
-        );
-        assert_eq!(config, AppConfigV1::default());
+            ),
+        ] {
+            let config = serde_json::from_str::<AppConfigV1>(text).expect(case);
+            assert_eq!(config, expected, "{case}");
+        }
     }
 
     #[test]
@@ -389,69 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_enables_both_notifications_by_default() {
+    fn unknown_config_fields_ignored() {
         let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "always_on_top": true,
-                "start_with_windows": false
-            }"#,
-        );
-
-        assert_eq!(
-            config
-                .ok()
-                .map(|value| (value.notify_on_reset, value.notify_on_overflow)),
-            Some((true, true))
-        );
-    }
-
-    #[test]
-    fn legacy_config_uses_five_minute_refresh_interval() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "placement": {
-                    "monitor_device": "",
-                    "edge": "right",
-                    "offset_dip": 96.0
-                },
-                "always_on_top": true,
-                "start_with_windows": false
-            }"#,
-        );
-        assert_eq!(
-            config.ok().map(|value| value.quota_refresh_interval()),
-            Some(Duration::from_mins(5))
-        );
-    }
-
-    #[test]
-    fn legacy_config_uses_two_second_follow_codex_check_interval() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "follow_codex": true
-            }"#,
-        );
-        assert_eq!(
-            config.ok().map(|value| value.follow_codex_check_interval()),
-            Some(Duration::from_secs(2))
-        );
-    }
-
-    #[test]
-    fn legacy_config_ignores_removed_quota_source_field() {
-        let config = serde_json::from_str::<AppConfigV1>(
-            r#"{
-                "version": 1,
-                "always_on_top": true,
-                "start_with_windows": false,
-                "quota_source": "local"
-            }"#,
-        );
-
-        assert!(config.is_ok());
+            r#"{ "version": 1, "unknown_setting": { "enabled": true } }"#,
+        )
+        .expect("未知字段不应影响有效设置");
+        assert_eq!(config, AppConfigV1::default());
     }
 
     #[test]
@@ -478,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_refresh_interval_is_clamped_to_supported_range() {
+    fn loaded_refresh_interval_clamped() {
         let directory = unique_test_dir("refresh-clamp");
         let path = directory.join("config.json");
         let _ = fs::remove_dir_all(&directory);
@@ -502,14 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn refresh_interval_setter_clamps_values_above_one_hour() {
+    fn refresh_interval_setter_clamps_maximum() {
         let mut config = AppConfigV1::default();
         config.set_quota_refresh_interval(Duration::from_hours(2));
         assert_eq!(config.quota_refresh_interval(), Duration::from_hours(1));
     }
 
     #[test]
-    fn loaded_follow_codex_check_interval_is_clamped_to_one_second() {
+    fn loaded_follow_interval_clamped() {
         let directory = unique_test_dir("follow-check-clamp");
         let path = directory.join("config.json");
         let _ = fs::remove_dir_all(&directory);
@@ -533,14 +462,14 @@ mod tests {
     }
 
     #[test]
-    fn follow_codex_check_interval_setter_clamps_values_above_one_minute() {
+    fn follow_interval_setter_clamps_maximum() {
         let mut config = AppConfigV1::default();
         config.set_follow_codex_check_interval(Duration::from_mins(2));
         assert_eq!(config.follow_codex_check_interval(), Duration::from_mins(1));
     }
 
     #[test]
-    fn malformed_config_is_preserved_and_defaults_are_returned() {
+    fn malformed_config_preserved_with_defaults() {
         let directory = unique_test_dir("malformed");
         let path = directory.join("config.json");
         let _ = fs::remove_dir_all(&directory);

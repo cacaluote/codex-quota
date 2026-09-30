@@ -755,7 +755,7 @@ mod tests {
     /// 显示偏好是**就地**写入的：托盘改设置走这条路，顺手把额度快照清掉就等于
     /// 每次切单位都让面板闪一下 `--`。整体换状态只允许 `reset_state` 那条路径。
     #[test]
-    fn applying_display_prefs_leaves_the_quota_state_alone() {
+    fn display_prefs_preserve_quota() {
         let mut state = state_with_quota();
 
         apply_display_prefs(&mut state, &config_with_prefs());
@@ -777,7 +777,7 @@ mod tests {
     /// 启动造状态与跟随模式重启换状态都走 `state_from_config`：偏好漏一项，用户
     /// 的设置就会在这两处之一被打回默认。
     #[test]
-    fn state_from_config_carries_every_display_pref() {
+    fn config_populates_display_prefs() {
         let state = state_from_config(&config_with_prefs());
 
         assert!(!state.show_reset_countdown);

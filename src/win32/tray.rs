@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_rate_settings_check_follows_saved_preference() {
+    fn cache_hit_menu_follows_config() {
         let command = u32::try_from(CMD_CACHE_HIT_RATE).expect("命令 ID 可表示为 u32");
         for show_cache_hit_rate in [true, false] {
             let settings = PopupMenu::create().expect("创建子菜单");
@@ -592,7 +592,7 @@ mod tests {
     /// 单选组子菜单的项数也是结构的一部分：刷新 5 档、通知 2 项、单位 2 种、
     /// 配色 2 套。
     #[test]
-    fn radio_group_submenus_keep_their_choice_counts() {
+    fn radio_menu_choice_counts() {
         for (build, expected, what) in [
             (
                 &(|menu: HMENU| append_refresh_interval_entries(menu, TrayMenuState::default()))
@@ -640,7 +640,7 @@ mod tests {
 
     /// 中/西文写反只在用户切换的那一刻才暴露，所以映射单独测。
     #[test]
-    fn tray_token_unit_commands_map_to_expected_styles() {
+    fn token_unit_command_mapping() {
         assert_eq!(
             token_unit_for_command(CMD_TOKEN_UNIT_ZH),
             Some(UnitStyle::Zh)
@@ -655,7 +655,7 @@ mod tests {
 
     /// 两套配色写反是那种只在用户点下去的那一刻才暴露的错。
     #[test]
-    fn tray_color_style_commands_map_to_expected_styles() {
+    fn color_style_command_mapping() {
         assert_eq!(
             color_style_for_command(CMD_COLOR_STYLE_SOFT),
             Some(ColorStyle::Soft)
@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn tray_refresh_commands_map_to_expected_intervals() {
+    fn refresh_interval_command_mapping() {
         assert_eq!(
             refresh_interval_for_command(CMD_REFRESH_1_MIN),
             Some(Duration::from_mins(1))
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn two_minute_tray_command_maps_to_two_minute_interval() {
+    fn two_minute_command_mapping() {
         assert_eq!(
             refresh_interval_for_command(CMD_REFRESH_2_MIN),
             Some(Duration::from_mins(2))
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn version_four_tray_icon_requests_standard_tooltip() {
+    fn v4_tray_tooltip_enabled() {
         assert!(tray_icon_flags().contains(NIF_SHOWTIP));
     }
 
@@ -722,17 +722,17 @@ mod tests {
     }
 
     #[test]
-    fn portable_tray_icon_does_not_use_path_bound_guid() {
+    fn portable_tray_omits_guid() {
         assert!(!tray_icon_flags().contains(NIF_GUID));
     }
 
     #[test]
-    fn immediate_refresh_is_disabled_without_active_overlay_resources() {
+    fn inactive_overlay_disables_refresh() {
         assert!(!refresh_command_is_enabled(TrayMenuState::default()));
     }
 
     #[test]
-    fn screenshot_is_disabled_while_following_codex_without_codex() {
+    fn inactive_overlay_disables_screenshot() {
         // 跟随模式且 Codex 未运行：面板资源已释放，没有可截的画面。
         assert!(!screenshot_command_is_enabled(TrayMenuState::default()));
         assert!(!screenshot_command_is_enabled(TrayMenuState {
@@ -743,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_stays_enabled_while_the_ball_is_hidden_or_collapsed() {
+    fn hidden_overlay_allows_screenshot() {
         // 隐藏或收起都不释放面板资源，截图仍然可用。
         assert!(screenshot_command_is_enabled(TrayMenuState {
             overlay_active: true,
@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_tray_context_ignores_legacy_right_button_event() {
+    fn v4_tray_ignores_legacy_click() {
         assert!(!is_tray_context_event(WM_RBUTTONUP, true));
     }
 
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_tray_callback_after_menu_close_is_suppressed() {
+    fn menu_close_suppresses_reopen() {
         let closed = Instant::now();
         assert!(should_suppress_tray_reopen(
             closed,

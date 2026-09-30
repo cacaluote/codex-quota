@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::config::{ColorStyle, UnitStyle};
 
-/// 菜单未配置/状态锁损坏时的兜底刷新间隔。
+/// 未加载配置时的默认额度刷新间隔。
 pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,7 +199,7 @@ impl Default for AppState {
             today_cache_hit_percent_tenths: None,
             current_period_cache_hit_percent_tenths: None,
             last_error: None,
-            quota_refresh_interval: Duration::from_mins(5),
+            quota_refresh_interval: DEFAULT_REFRESH_INTERVAL,
             today_cost: None,
             current_period_cost: None,
             period_total_value_estimate: None,
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_percent_clamps_values_above_one_hundred() {
+    fn remaining_percent_clamps_excess_usage() {
         assert!(window(130.0).remaining_percent().abs() < f64::EPSILON);
     }
 
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn color_is_warning_at_twenty_percent_remaining() {
+    fn twenty_percent_warning_boundary() {
         assert_eq!(window(80.0).color(), QuotaColor::Warning);
     }
 
@@ -337,26 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn stale_threshold_is_twice_the_configured_refresh_interval() {
-        let state = AppState {
-            quota_refresh_interval: Duration::from_mins(30),
-            ..AppState::default()
-        };
-        assert_eq!(state.stale_after(), Duration::from_hours(1));
+    fn stale_threshold_tracks_interval() {
+        for minutes in [1, 2, 5, 10, 30] {
+            let state = AppState {
+                quota_refresh_interval: Duration::from_mins(minutes),
+                ..AppState::default()
+            };
+            assert_eq!(
+                state.stale_after(),
+                Duration::from_mins(minutes * 2),
+                "{minutes}m"
+            );
+        }
     }
 
     #[test]
-    fn stale_threshold_is_twice_the_interval_even_below_the_old_floor() {
-        let state = AppState {
-            quota_refresh_interval: Duration::from_mins(1),
-            ..AppState::default()
-        };
-
-        assert_eq!(state.stale_after(), Duration::from_mins(2));
-    }
-
-    #[test]
-    fn snapshot_stays_fresh_until_the_stale_threshold() {
+    fn snapshot_freshness_boundary() {
         // 2N 门控：间隔 1 分钟时，年龄 1 分钟 < 2 分钟，仍未过期。
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = AppState {
@@ -374,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_windows_are_filtered_from_active_windows() {
+    fn active_windows_exclude_expired() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
         let snapshot = QuotaSnapshot {
             limit_id: "codex".to_owned(),
@@ -418,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_active_window_blocks_the_account() {
+    fn exhausted_window_blocks_account() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
         // 5h 还有 55%：卡住账号的是打满的周窗口，不是短窗口。
         let snapshot = two_window_snapshot(45.0, 100.0, now + Duration::from_hours(72), now);
@@ -427,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_quota_in_both_windows_is_not_blocked() {
+    fn available_windows_allow_requests() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
         let snapshot = two_window_snapshot(10.0, 90.0, now + Duration::from_hours(72), now);
 
@@ -435,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_window_past_its_reset_time_does_not_block() {
+    fn expired_window_cannot_block() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
         // 周窗口的重置时间已过：它已被服务端换掉，百分比不可知，不能据此
         // 认定账号被卡住。

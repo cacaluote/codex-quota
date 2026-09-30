@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_rpc_keeps_only_request_id_and_method() {
+    fn outbound_rpc_metadata() {
         let event = outbound_rpc(&json!({
             "id": 7,
             "method": "account/read",
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn response_is_not_classified_as_server_notification() {
+    fn response_excluded_from_notifications() {
         let method = server_notification_method(
             r#"{"id":7,"method":"account/updated","result":{"ok":true}}"#,
         );

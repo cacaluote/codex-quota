@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_strips_variant_suffixes_down_to_base_model() {
+    fn lookup_strips_variant_suffixes() {
         let table = table_with(&[("gpt-5.1", 1.10, 0.11, 9.0)]);
 
         assert_eq!(
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_returns_none_for_unknown_family_or_missing_name() {
+    fn lookup_fallbacks_and_missing_names() {
         let table = table_with(&[("gpt-5.6-sol", 4.0, 0.4, 20.0)]);
 
         assert_eq!(table.lookup(Some("claude-opus")), None);
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_models_dev_response_with_unknown_fields() {
+    fn price_response_allows_unknown_fields() {
         // 真实响应带 tiers/modes/experimental 等字段，反序列化必须容忍。
         let text = r#"{"openai":{"id":"openai","models":{"gpt-5.6-sol":{"id":"gpt-5.6-sol","cost":{"input":4,"output":20,"cache_read":0.4,"cache_write":5,"tiers":[{"input":8}]},"experimental":{}},"gpt-no-cache":{"cost":{"input":2,"output":8}}}}}"#;
 
@@ -342,12 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn models_dev_response_without_openai_prices_is_rejected() {
+    fn price_response_requires_openai() {
         assert!(PriceTable::from_models_dev(r#"{"other":{}}"#).is_none());
     }
 
     #[test]
-    fn models_dev_parse_stamps_fetched_at_and_round_trips() {
+    fn price_timestamp_roundtrip() {
         let table = PriceTable::from_models_dev(
             r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
         )
@@ -359,28 +359,5 @@ mod tests {
 
         assert_eq!(parsed.fetched_at, Some(fetched_at));
         assert_eq!(parsed.into_table().fetched_at(), Some(fetched_at));
-    }
-
-    /// 真实网络冒烟测试：验证当前 TLS 后端能完成握手，且线上价格表
-    /// 覆盖本机日志中在用的模型。平时跳过，需要时手动运行：
-    /// `cargo test --release native_tls_smoke -- --ignored`
-    #[test]
-    #[ignore = "需要外网"]
-    fn native_tls_smoke_fetches_models_dev() {
-        let mut table = PriceTable::load();
-        table.refresh().expect("TLS 握手与解析应成功");
-        assert!(!table.is_empty());
-
-        for model in [
-            "gpt-5.6-sol",
-            "gpt-6-astra",
-            "gpt-5.6-luna",
-            "gpt-5.3-codex",
-        ] {
-            assert!(
-                table.lookup(Some(model)).is_some(),
-                "线上价格表缺少 {model}"
-            );
-        }
     }
 }

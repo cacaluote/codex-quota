@@ -500,7 +500,7 @@ fn matching_replay_prefix(child: &[TokenEvent], parent: &[TokenSignature]) -> us
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cross_window_balance_drop_is_not_charged_to_the_new_window() {
+    fn cross_window_balance_drop_ignored() {
         // 截图中的 $0.15：旧期 1965.567661，新期首次 1961.782981。
         let observations = [(0, 1_965.567_661), (10, 1_961.782_981), (20, 1_961.782_981)];
         let in_period = |timestamp: Option<i64>| timestamp.is_some_and(|time| time >= 5);
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn first_observation_at_window_start_can_anchor_a_later_debit() {
+    fn window_start_observation_anchors_debit() {
         let observations = [(9, 110.0), (10, 100.0), (11, 99.0)];
         let includes = |timestamp: Option<i64>| timestamp.is_some_and(|time| time >= 10);
         assert!((super::credits_debits(&observations, &includes) - 1.0).abs() < 1e-9);
@@ -525,7 +525,7 @@ mod tests {
     use crate::quota::pricing::PriceTable;
 
     #[test]
-    fn cache_hit_percent_tenths_uses_only_input_tokens() {
+    fn cache_hit_rate_uses_input() {
         let volumes = ModelVolumes(vec![
             (
                 Some("model-a".to_owned()),
@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn cost_weights_cached_input_and_output_separately() {
+    fn cost_weights_token_categories() {
         let table = PriceTable::from_models_dev(
             r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
         )
@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn unpriced_models_reports_only_buckets_with_usage_and_no_price() {
+    fn unpriced_model_detection() {
         let table = PriceTable::from_models_dev(
             r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
         )
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_counts_active_and_archived_copy_once() {
+    fn active_and_archived_copy_deduplicated() {
         let context = TestContext::new("archived-copy");
         let values = [
             session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_marks_inconsistent_active_and_archived_copies_unreliable() {
+    fn inconsistent_archive_copies_invalidated() {
         let context = TestContext::new("archived-conflict");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_sums_sequential_resume_rollouts_of_same_thread() {
+    fn sequential_resume_usage_accumulated() {
         let context = TestContext::new("resume-continuation");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_defers_overlapping_same_thread_files_without_prefix() {
+    fn overlapping_thread_files_deferred() {
         let context = TestContext::new("resume-overlap");
         write_jsonl(
             &context.rollout(PARENT_ID),
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_marks_missing_provider_with_today_usage_unreliable() {
+    fn missing_provider_invalidates_today_usage() {
         let context = TestContext::new("missing-provider");
         write_jsonl(
             &context.rollout(PARENT_ID),

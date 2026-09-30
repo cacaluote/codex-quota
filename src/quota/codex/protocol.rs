@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_prefers_codex_bucket_from_multi_bucket_response() {
+    fn parser_prefers_codex_bucket() {
         let result = json!({
             "rateLimits": {
                 "limitId": "legacy",
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn account_parser_accepts_account_without_plan_type() {
+    fn account_without_plan_accepted() {
         let result = json!({
             "account": { "type": "apiKey" },
             "requiresOpenAIAuth": true

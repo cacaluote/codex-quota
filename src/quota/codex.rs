@@ -40,7 +40,55 @@ const PRICE_GAP_MIN_INTERVAL: Duration = Duration::from_hours(1);
 /// 反复补拉（最长 6 小时），之后停手等日调度。models.dev 可能永远不会上价的
 /// 模型名（本地变体后缀之类）不该让程序每小时发请求直到永远。
 const PRICE_GAP_RETRY_WINDOW: Duration = Duration::from_hours(6);
-const BACKOFF_SECONDS: [u64; 5] = [1, 2, 5, 10, 30];
+const PULL_RETRY_SECONDS: [u64; 3] = [1, 2, 5];
+
+/// 重试冷却与数据到期时间分开；额外密集重试三次后按配置间隔继续。
+struct PullSchedule {
+    retry_not_before: Instant,
+    retry_count: usize,
+}
+
+impl PullSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            retry_not_before: now,
+            retry_count: 0,
+        }
+    }
+
+    fn delay(
+        &self,
+        forced: bool,
+        state: &Arc<Mutex<AppState>>,
+        wall_now: SystemTime,
+        now: Instant,
+    ) -> Duration {
+        pull_delay(forced, state, wall_now)
+            .max(self.retry_not_before.saturating_duration_since(now))
+    }
+
+    fn after_attempt(&mut self, needs_retry: bool, refresh_interval: Duration, now: Instant) {
+        let delay = if needs_retry {
+            // 旧窗口的成功响应也消耗重试次数；低频阶段不再开启密集重试。
+            let delay = PULL_RETRY_SECONDS
+                .get(self.retry_count)
+                .map_or(refresh_interval, |&seconds| Duration::from_secs(seconds));
+            self.retry_count = self
+                .retry_count
+                .saturating_add(1)
+                .min(PULL_RETRY_SECONDS.len());
+            delay
+        } else {
+            self.retry_count = 0;
+            Duration::ZERO
+        };
+        self.retry_not_before = now + delay;
+    }
+
+    fn request_now(&mut self, now: Instant) {
+        self.retry_not_before = now;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerCommand {
@@ -166,8 +214,7 @@ fn worker_loop<F>(
 {
     let mut local = LocalPipeline::new();
     let mut prices = PricePipeline::load();
-    let mut pull_failures = 0_usize;
-    let mut next_pull_attempt = Instant::now();
+    let mut pull_schedule = PullSchedule::new(Instant::now());
     // 手动刷新标记：置位后那一次拉取跳过"快照还新鲜"的判断。
     let mut forced_pull = false;
     let mut next_watcher_retry = Instant::now() + WATCHER_RETRY_INTERVAL;
@@ -178,39 +225,42 @@ fn worker_loop<F>(
     refresh_local_usage(&mut local, &mut prices, state, notify);
 
     loop {
-        if Instant::now() >= next_pull_attempt {
-            let pull_delay = pull_delay(forced_pull, state, SystemTime::now());
+        // 每轮按当前快照重新算到期时间，避免沿用重置前安排的常规刷新时间。
+        if pull_schedule
+            .delay(forced_pull, state, SystemTime::now(), Instant::now())
+            .is_zero()
+        {
             let forced = std::mem::take(&mut forced_pull);
-            if pull_delay.is_zero() {
-                match pull_rpc_snapshot(state, notify, cancelled, forced) {
-                    Ok(()) => {
-                        pull_failures = 0;
-                        refresh_local_usage(&mut local, &mut prices, state, notify);
-                    }
-                    Err(AppError::Cancelled) => break,
-                    Err(error) => {
-                        pull_failures = pull_failures.saturating_add(1);
-                        let message = error.to_string();
-                        crate::logging::log(&format!("按需读取 Codex 额度失败：{message}"));
-                        // With a local snapshot the display stays valid and
-                        // Online; only surface the failure when there is
-                        // nothing to show at all.
-                        if snapshot_received_at(state).is_none() {
-                            update_status(
-                                state,
-                                ConnectionStatus::Error {
-                                    message: message.clone(),
-                                },
-                                Some(message),
-                                notify,
-                            );
-                        }
-                    }
+            let needs_retry = match pull_rpc_snapshot(state, notify, cancelled, forced) {
+                Ok(()) => {
+                    refresh_local_usage(&mut local, &mut prices, state, notify);
+                    // RPC 成功也可能仍返回旧窗口；同样退避，直到窗口真正更新。
+                    local_pull_delay(state, SystemTime::now()).is_zero()
                 }
-                next_pull_attempt = Instant::now() + reconnect_backoff(pull_failures);
-            } else {
-                next_pull_attempt = Instant::now() + pull_delay;
-            }
+                Err(AppError::Cancelled) => break,
+                Err(error) => {
+                    let message = error.to_string();
+                    crate::logging::log(&format!("按需读取 Codex 额度失败：{message}"));
+                    // With a local snapshot the display stays valid and
+                    // Online; only surface the failure when there is
+                    // nothing to show at all.
+                    if snapshot_received_at(state).is_none() {
+                        update_status(
+                            state,
+                            ConnectionStatus::Error {
+                                message: message.clone(),
+                            },
+                            Some(message),
+                            notify,
+                        );
+                    }
+                    true
+                }
+            };
+            let refresh_interval = state.lock().map_or(DEFAULT_REFRESH_INTERVAL, |current| {
+                current.quota_refresh_interval
+            });
+            pull_schedule.after_attempt(needs_retry, refresh_interval, Instant::now());
         }
 
         prices.refresh_if_due(&mut local_refresh_at);
@@ -224,7 +274,8 @@ fn worker_loop<F>(
         let due = local_refresh_at.unwrap_or(now + LOCAL_LOOP_WAKE_INTERVAL);
         let wait = due
             .saturating_duration_since(now)
-            .min(LOCAL_LOOP_WAKE_INTERVAL);
+            .min(LOCAL_LOOP_WAKE_INTERVAL)
+            .min(pull_schedule.delay(forced_pull, state, SystemTime::now(), now));
         match command_rx.recv_timeout(wait) {
             Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerCommand::Refresh) => {
@@ -232,10 +283,10 @@ fn worker_loop<F>(
                 forced_pull = true;
                 local.tracker.require_full_scan();
                 refresh_local_usage(&mut local, &mut prices, state, notify);
-                next_pull_attempt = Instant::now();
+                pull_schedule.request_now(Instant::now());
             }
             Ok(WorkerCommand::RefreshIntervalChanged) => {
-                next_pull_attempt = Instant::now();
+                pull_schedule.request_now(Instant::now());
             }
             Ok(WorkerCommand::RefreshPrices) => prices.schedule_now(),
             Err(RecvTimeoutError::Timeout) => {}
@@ -579,16 +630,8 @@ fn snapshot_received_at(state: &Arc<Mutex<AppState>>) -> Option<SystemTime> {
     })
 }
 
-/// 空闲对表周期 = 刷新间隔 N：快照年龄（最后一次新鲜度事件起算）达到 N
-/// 就拉一次 RPC。显示门控另在 2N（`AppState::stale_after`），中间的余量
-/// 供拉取耗时使用，正常不会闪 `--`。
-fn local_pull_threshold(state: &Arc<Mutex<AppState>>) -> Duration {
-    state.lock().map_or(DEFAULT_REFRESH_INTERVAL, |current| {
-        current.quota_refresh_interval
-    })
-}
-
-/// 这次该等多久再拉：手动刷新（`forced`）立即拉，否则按快照新鲜度决定。
+/// 这次该等多久再拉：手动刷新（`forced`）立即拉，否则取快照新鲜度与
+/// 最近窗口重置时间中较早的一个。显示门控仍在 2N，给常规拉取留出余量。
 ///
 /// 托盘菜单的"立即刷新"必须真的向服务端要一次——否则一个叫立即刷新的按钮
 /// 只重扫本地日志，用户会以为程序卡住了。
@@ -600,23 +643,23 @@ fn pull_delay(forced: bool, state: &Arc<Mutex<AppState>>, now: SystemTime) -> Du
 }
 
 fn local_pull_delay(state: &Arc<Mutex<AppState>>, now: SystemTime) -> Duration {
-    let threshold = local_pull_threshold(state);
-    let Some(snapshot) = state
-        .lock()
-        .ok()
-        .and_then(|current| current.snapshot.clone())
-    else {
+    let Ok(current) = state.lock() else {
         return Duration::ZERO;
     };
-    // A snapshot whose windows have been reset server-side cannot describe
-    // the current windows; refresh it regardless of its age.
-    if snapshot.has_expired_window(now) {
+    let Some(snapshot) = current.snapshot.as_ref() else {
         return Duration::ZERO;
-    }
-    let Ok(age) = now.duration_since(snapshot.received_at) else {
-        return threshold;
     };
-    threshold.saturating_sub(age)
+    let threshold = current.quota_refresh_interval;
+    let freshness_delay = now
+        .duration_since(snapshot.received_at)
+        .map_or(threshold, |age| threshold.saturating_sub(age));
+    let next_reset = snapshot
+        .secondary
+        .as_ref()
+        .map_or(snapshot.primary.resets_at, |secondary| {
+            snapshot.primary.resets_at.min(secondary.resets_at)
+        });
+    freshness_delay.min(next_reset.duration_since(now).unwrap_or_default())
 }
 
 fn publish_local_quota<F>(
@@ -1178,10 +1221,6 @@ fn next_request_id(next: &mut u64) -> u64 {
     value
 }
 
-fn reconnect_backoff(failure_count: usize) -> Duration {
-    Duration::from_secs(BACKOFF_SECONDS[failure_count.min(BACKOFF_SECONDS.len() - 1)])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn period_boundary_survives_when_snapshot_is_fresh() {
+    fn fresh_snapshot_preserves_period_boundary() {
         let state = Arc::new(Mutex::new(AppState {
             snapshot: Some(quota_snapshot(SystemTime::now())),
             ..AppState::default()
@@ -1213,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn period_boundary_hides_while_snapshot_is_stale() {
+    fn stale_snapshot_hides_period_boundary() {
         // 外部重置等场景下，过期快照描述的窗口可能已被替换；从它推导
         // 边界会把上一期的用量当成本期闪现，必须等按需 pull 纠正。
         let state = Arc::new(Mutex::new(AppState {
@@ -1225,19 +1264,21 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_pull_threshold_equals_the_refresh_interval() {
-        for minutes in [1_u64, 5, 30] {
+    fn regular_pull_tracks_interval() {
+        for minutes in [1_u64, 2, 5, 10, 30] {
             let state = Arc::new(Mutex::new(AppState {
                 quota_refresh_interval: Duration::from_mins(minutes),
                 ..AppState::default()
             }));
 
-            assert_eq!(local_pull_threshold(&state), Duration::from_mins(minutes));
+            let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+            state.lock().unwrap().snapshot = Some(quota_snapshot(now));
+            assert_eq!(local_pull_delay(&state, now), Duration::from_mins(minutes));
         }
     }
 
     #[test]
-    fn on_demand_pull_delay_uses_only_remaining_snapshot_freshness() {
+    fn regular_pull_uses_remaining_freshness() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = Arc::new(Mutex::new(AppState {
             snapshot: Some(quota_snapshot(now - Duration::from_mins(2))),
@@ -1249,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_refresh_pulls_even_while_the_snapshot_is_still_fresh() {
+    fn manual_pull_bypasses_freshness() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = Arc::new(Mutex::new(AppState {
             snapshot: Some(quota_snapshot(now - Duration::from_mins(1))),
@@ -1264,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_window_makes_on_demand_pull_due() {
+    fn expired_window_triggers_pull() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let mut expired = quota_snapshot(now - Duration::from_mins(1));
         expired.primary.resets_at = now - Duration::from_mins(10);
@@ -1275,6 +1316,259 @@ mod tests {
         }));
 
         assert_eq!(local_pull_delay(&state, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn reset_preempts_regular_refresh() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(16);
+        let now = Instant::now();
+        let mut snapshot = quota_snapshot(wall_now);
+        snapshot.primary.resets_at = wall_now + Duration::from_mins(1);
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+        let schedule = PullSchedule::new(now);
+
+        assert_eq!(
+            schedule.delay(false, &state, wall_now, now),
+            Duration::from_mins(1)
+        );
+        let elapsed = Duration::from_mins(1);
+        assert_eq!(
+            schedule.delay(false, &state, wall_now + elapsed, now + elapsed),
+            Duration::ZERO,
+            "窗口到期时快照仍未满两分钟，也必须立即拉取"
+        );
+    }
+
+    #[test]
+    fn earliest_window_reset_triggers_pull() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let mut snapshot = quota_snapshot(now);
+        snapshot.primary.resets_at = now + Duration::from_mins(1);
+        snapshot.secondary = Some(QuotaWindow {
+            used_percent: 50.0,
+            window_duration: Duration::from_hours(5),
+            resets_at: now + Duration::from_secs(30),
+        });
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+
+        assert_eq!(local_pull_delay(&state, now), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn local_snapshot_advances_pull_schedule() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(wall_now)),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+        let schedule = PullSchedule::new(now);
+        assert_eq!(
+            schedule.delay(false, &state, wall_now, now),
+            Duration::from_mins(2)
+        );
+
+        let elapsed = Duration::from_secs(10);
+        let mut new_snapshot = quota_snapshot(wall_now + elapsed);
+        new_snapshot.primary.resets_at = wall_now + Duration::from_secs(20);
+        publish_local_quota(&state, Some(new_snapshot), None, &Arc::new(|| {}));
+
+        assert_eq!(
+            schedule.delay(false, &state, wall_now + elapsed, now + elapsed),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn clock_jump_triggers_expired_pull() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let mut snapshot = quota_snapshot(wall_now);
+        snapshot.primary.resets_at = wall_now + Duration::from_mins(1);
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+        let schedule = PullSchedule::new(now);
+
+        assert_eq!(
+            schedule.delay(
+                false,
+                &state,
+                wall_now + Duration::from_mins(1),
+                now + Duration::from_secs(5)
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn expired_window_retry_backoff() {
+        // 服务端仍返回已到期窗口时退避重试；取得新窗口后恢复常规刷新。
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let mut snapshot = quota_snapshot(wall_now);
+        snapshot.primary.resets_at = wall_now;
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+        let mut schedule = PullSchedule::new(now);
+        let mut elapsed = Duration::ZERO;
+
+        for seconds in [1, 2, 5, 120, 120] {
+            // 模拟 RPC 成功返回一份收到时间很新、但窗口仍未更新的快照。
+            state.lock().unwrap().snapshot.as_mut().unwrap().received_at = wall_now + elapsed;
+            schedule.after_attempt(
+                local_pull_delay(&state, wall_now + elapsed).is_zero(),
+                Duration::from_mins(2),
+                now + elapsed,
+            );
+            let delay = Duration::from_secs(seconds);
+            assert_eq!(
+                schedule.delay(false, &state, wall_now + elapsed, now + elapsed),
+                delay
+            );
+            elapsed += delay;
+        }
+
+        state.lock().unwrap().snapshot = Some(quota_snapshot(wall_now + elapsed));
+        schedule.after_attempt(false, Duration::from_mins(2), now + elapsed);
+        assert_eq!(schedule.retry_count, 0);
+        assert_eq!(
+            schedule.delay(false, &state, wall_now + elapsed, now + elapsed),
+            Duration::from_mins(2),
+            "取得新窗口后恢复两分钟常规刷新"
+        );
+
+        // 下次窗口到期会重新获得三次密集重试机会。
+        schedule.after_attempt(true, Duration::from_mins(2), now + elapsed);
+        assert_eq!(
+            schedule.retry_not_before,
+            now + elapsed + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn rapid_retries_are_limited() {
+        let now = Instant::now();
+        for minutes in [1, 2, 5, 10, 30] {
+            let interval = Duration::from_mins(minutes);
+            let mut schedule = PullSchedule::new(now);
+            let mut attempted_at = now;
+            // 首次失败后额外重试三次，之后持续按配置间隔尝试。
+            for expected in [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                interval,
+                interval,
+                interval,
+            ] {
+                schedule.after_attempt(true, interval, attempted_at);
+                assert_eq!(
+                    schedule.retry_not_before,
+                    attempted_at + expected,
+                    "{minutes}m: expected {expected:?}"
+                );
+                attempted_at += expected;
+            }
+        }
+    }
+
+    #[test]
+    fn interval_change_preserves_retry_count() {
+        let now = Instant::now();
+        let mut schedule = PullSchedule::new(now);
+        schedule.after_attempt(true, Duration::from_mins(5), now);
+
+        // 调整设置不重置密集重试次数，即使两次请求之间已经过去很久。
+        let attempted_at = now + Duration::from_mins(3);
+        schedule.request_now(attempted_at);
+        schedule.after_attempt(true, Duration::from_mins(2), attempted_at);
+        assert_eq!(
+            schedule.retry_not_before,
+            attempted_at + Duration::from_secs(2)
+        );
+        schedule.after_attempt(true, Duration::from_mins(5), attempted_at);
+        assert_eq!(
+            schedule.retry_not_before,
+            attempted_at + Duration::from_secs(5)
+        );
+        // 密集重试用完后，低频阶段采用当前设置的间隔。
+        for minutes in [2, 5] {
+            let interval = Duration::from_mins(minutes);
+            schedule.request_now(attempted_at);
+            schedule.after_attempt(true, interval, attempted_at);
+            assert_eq!(schedule.retry_not_before, attempted_at + interval);
+        }
+    }
+
+    #[test]
+    fn expired_window_respects_request_backoff() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let mut snapshot = quota_snapshot(wall_now);
+        snapshot.primary.resets_at = wall_now;
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(snapshot),
+            ..AppState::default()
+        }));
+        let mut schedule = PullSchedule::new(now);
+        for seconds in [1, 2, 5, 300] {
+            schedule.after_attempt(true, Duration::from_mins(5), now);
+            assert_eq!(
+                schedule.delay(
+                    false,
+                    &state,
+                    wall_now + Duration::from_secs(1),
+                    now + Duration::from_secs(1)
+                ),
+                Duration::from_secs(seconds - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn a_manual_refresh_interrupts_retry_waiting() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(wall_now)),
+            ..AppState::default()
+        }));
+        let mut schedule = PullSchedule::new(now);
+        let interval = Duration::from_mins(5);
+        schedule.after_attempt(true, interval, now);
+        schedule.request_now(now);
+
+        assert_eq!(schedule.delay(true, &state, wall_now, now), Duration::ZERO);
+
+        for _ in 0..2 {
+            schedule.after_attempt(true, interval, now);
+        }
+        // 低频阶段的等待也能手动打断；失败后继续低频，避免重新密集重试。
+        let later = now + interval;
+        schedule.after_attempt(true, interval, later);
+        assert_eq!(schedule.retry_not_before, later + interval);
+        schedule.request_now(later);
+        assert_eq!(
+            schedule.delay(true, &state, wall_now + interval, later),
+            Duration::ZERO
+        );
+        schedule.after_attempt(true, interval, later);
+        assert_eq!(schedule.retry_not_before, later + interval);
     }
 
     #[test]
@@ -1334,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_local_quota_keeps_existing_snapshot_and_plan() {
+    fn missing_local_quota_preserves_state() {
         let now = SystemTime::now();
         let state = Arc::new(Mutex::new(AppState {
             snapshot: Some(quota_snapshot(now)),
@@ -1351,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn local_quota_without_plan_keeps_existing_plan() {
+    fn local_quota_preserves_existing_plan() {
         let now = SystemTime::now();
         let state = Arc::new(Mutex::new(AppState {
             plan_type: Some("pro".to_owned()),
@@ -1365,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn local_quota_publish_transitions_error_status_to_online() {
+    fn local_quota_restores_online_status() {
         let now = SystemTime::now();
         let state = Arc::new(Mutex::new(AppState {
             status: ConnectionStatus::Error {
@@ -1391,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_local_overflow_keeps_credits_and_derives_dollars() {
+    fn overflow_credits_convert_to_dollars() {
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
 
@@ -1416,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn published_credits_and_dollars_stay_in_sync() {
+    fn overflow_values_stay_in_sync() {
         // 单位换错过两次（阈值从美元换成 credits 时调用方没跟着改），所以把
         // 数据契约钉住：发布后两个口径必须始终是 1 : 0.04。
         let state = Arc::new(Mutex::new(AppState::default()));
@@ -1442,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_local_overflow_none_marks_unreliable_windows() {
+    fn missing_overflow_marks_windows_unreliable() {
         let state = Arc::new(Mutex::new(AppState {
             today_overflow_tokens: Some(200),
             today_overflow_credits: Some(20.0),
@@ -1478,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn period_value_estimate_divides_by_weekly_used_percent() {
+    fn period_estimate_scales_usage() {
         let mut snapshot = quota_snapshot(SystemTime::now());
         snapshot.primary.used_percent = 10.0;
         let state = Arc::new(Mutex::new(AppState {
@@ -1492,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn period_value_estimate_hides_below_one_percent_used() {
+    fn period_estimate_requires_minimum_usage() {
         let mut snapshot = quota_snapshot(SystemTime::now());
         snapshot.primary.used_percent = 0.5;
         let state = Arc::new(Mutex::new(AppState {
@@ -1504,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn period_value_estimate_hides_zero_local_cost() {
+    fn period_estimate_requires_local_cost() {
         // 本机无用量（cost=0）但服务端已有消耗时，0÷x% 的估算没有意义。
         let mut snapshot = quota_snapshot(SystemTime::now());
         snapshot.primary.used_percent = 10.0;
@@ -1531,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn price_refresh_failure_delay_grows_then_stays_hourly() {
+    fn price_failure_backoff_caps_hourly() {
         let delays: Vec<_> = (1..=8)
             .map(|failures| price_refresh_failure_delay(failures, Duration::from_hours(1)))
             .collect();
@@ -1551,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn price_refresh_failure_delay_slows_after_six_hours() {
+    fn prolonged_price_failure_slows_retry() {
         assert_eq!(
             price_refresh_failure_delay(
                 99,
@@ -1566,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_price_refresh_keeps_the_failure_backoff_stage() {
+    fn manual_price_refresh_preserves_backoff() {
         let mut prices = PricePipeline::new(PriceTable::default());
         let first_failure = Instant::now();
         prices.failures = 9;
@@ -1581,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_model_does_not_interrupt_a_failed_price_refresh_backoff() {
+    fn missing_price_respects_failure_backoff() {
         let mut prices = PricePipeline::new(PriceTable::default());
         let now = Instant::now();
         let scheduled = now + PRICE_FAILURE_SLOW_INTERVAL;
@@ -1597,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn price_refresh_delay_waits_out_remaining_interval_for_fresh_cache() {
+    fn fresh_prices_delay_initial_refresh() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let fetched_at = (now - Duration::from_hours(1))
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1614,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn price_refresh_delay_falls_back_to_start_delay_for_missing_or_stale_cache() {
+    fn unavailable_prices_use_start_delay() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let stale_fetched_at = (now - Duration::from_hours(25))
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1631,7 +1925,7 @@ mod tests {
     /// 缺价日志按模型名去重：一轮本地扫描每几秒就可能重跑一次，逐轮上报会把
     /// 日志刷满，也就没人看得见"到底缺哪个模型"。
     #[test]
-    fn price_gaps_report_each_missing_model_once_and_keep_pulling() {
+    fn price_gap_logging_deduplicated() {
         let mut gaps = PriceGaps::default();
         let now = Instant::now();
         let prices = PriceTable::default();
@@ -1652,7 +1946,7 @@ mod tests {
     /// "少算了"必须有闭合的另一半：价格表补齐时回写一条，并且缺口关上之后
     /// 不再安排补拉——否则模型用完不再出现，程序会以为缺口永远在。
     #[test]
-    fn price_gaps_close_the_log_once_the_model_is_priced() {
+    fn resolved_price_gap_closes_log() {
         let mut gaps = PriceGaps::default();
         let now = Instant::now();
 
@@ -1682,7 +1976,7 @@ mod tests {
     /// 永远不进价格表的模型名（本地变体后缀之类）不能让它每小时发请求到永远：
     /// 补拉窗口耗尽后停手，只留一条日志说明改由日调度兜底。
     #[test]
-    fn price_gaps_stop_pulling_after_the_retry_window() {
+    fn price_gap_retry_window_expires() {
         let mut gaps = PriceGaps::default();
         let now = Instant::now();
         let prices = PriceTable::default();
@@ -1706,117 +2000,104 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_caps_at_thirty_seconds() {
-        assert_eq!(reconnect_backoff(0), Duration::from_secs(1));
-        assert_eq!(reconnect_backoff(99), Duration::from_secs(30));
-    }
-
-    #[test]
     fn elapsed_duration_is_formatted_in_milliseconds() {
         assert_eq!(format_elapsed(Duration::from_nanos(1_234_567)), "1.235 ms");
     }
 
     #[test]
-    fn full_scan_diagnostics_use_explicit_log_label() {
-        assert_eq!(
-            refresh_mode_description(&session_usage::RefreshDiagnostics::default()),
-            "扫描"
-        );
-    }
-
-    #[test]
-    fn watcher_incremental_diagnostics_use_explicit_log_label() {
-        assert_eq!(
-            refresh_mode_description(&session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
+    fn refresh_mode_labels() {
+        for (mode, expected) in [
+            (session_usage::RefreshMode::FullScan, "扫描"),
+            (session_usage::RefreshMode::WatcherIncremental, "监听"),
+        ] {
+            let diagnostics = session_usage::RefreshDiagnostics {
+                mode,
                 ..session_usage::RefreshDiagnostics::default()
-            }),
-            "监听"
-        );
+            };
+            assert_eq!(refresh_mode_description(&diagnostics), expected, "{mode:?}");
+        }
     }
 
     #[test]
-    fn watcher_incremental_no_op_is_not_logged() {
-        assert!(!should_log_local_usage_refresh(
-            &session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
-                files_scanned: 1,
-                aggregation_skipped: true,
-                cache_write_skipped: true,
-                ..session_usage::RefreshDiagnostics::default()
-            }
-        ));
-    }
+    fn refresh_logging_policy() {
+        use session_usage::{RefreshDiagnostics, RefreshMode};
 
-    #[test]
-    fn watcher_incremental_without_new_token_events_is_not_logged() {
-        assert!(!should_log_local_usage_refresh(
-            &session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
-                files_scanned: 1,
-                files_read: 1,
-                ..session_usage::RefreshDiagnostics::default()
-            }
-        ));
-    }
-
-    #[test]
-    fn watcher_incremental_with_new_token_events_is_logged() {
-        assert!(should_log_local_usage_refresh(
-            &session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
-                token_events_added: 1,
-                ..session_usage::RefreshDiagnostics::default()
-            }
-        ));
-    }
-
-    #[test]
-    fn watcher_incremental_with_errors_is_logged() {
-        assert!(should_log_local_usage_refresh(
-            &session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
-                discovery_errors: 1,
-                ..session_usage::RefreshDiagnostics::default()
-            }
-        ));
-    }
-
-    #[test]
-    fn watcher_incremental_with_cache_write_failure_is_logged() {
-        assert!(should_log_local_usage_refresh(
-            &session_usage::RefreshDiagnostics {
-                mode: session_usage::RefreshMode::WatcherIncremental,
-                cache_write_failed: true,
-                ..session_usage::RefreshDiagnostics::default()
-            }
-        ));
-    }
-
-    #[test]
-    fn full_scan_is_always_logged() {
-        let diagnostics = session_usage::RefreshDiagnostics {
-            aggregation_skipped: true,
-            cache_write_skipped: true,
-            ..session_usage::RefreshDiagnostics::default()
+        let incremental = RefreshDiagnostics {
+            mode: RefreshMode::WatcherIncremental,
+            ..RefreshDiagnostics::default()
         };
-
-        assert!(should_log_local_usage_refresh(&diagnostics));
+        for (case, diagnostics, expected) in [
+            (
+                "no_changes",
+                RefreshDiagnostics {
+                    files_scanned: 1,
+                    aggregation_skipped: true,
+                    cache_write_skipped: true,
+                    ..incremental
+                },
+                false,
+            ),
+            (
+                "no_new_tokens",
+                RefreshDiagnostics {
+                    files_scanned: 1,
+                    files_read: 1,
+                    ..incremental
+                },
+                false,
+            ),
+            (
+                "new_tokens",
+                RefreshDiagnostics {
+                    token_events_added: 1,
+                    ..incremental
+                },
+                true,
+            ),
+            (
+                "discovery_error",
+                RefreshDiagnostics {
+                    discovery_errors: 1,
+                    ..incremental
+                },
+                true,
+            ),
+            (
+                "cache_write_error",
+                RefreshDiagnostics {
+                    cache_write_failed: true,
+                    ..incremental
+                },
+                true,
+            ),
+            (
+                "deferred_file",
+                RefreshDiagnostics {
+                    deferred_files: 1,
+                    ..incremental
+                },
+                true,
+            ),
+            (
+                "full_scan",
+                RefreshDiagnostics {
+                    aggregation_skipped: true,
+                    cache_write_skipped: true,
+                    ..RefreshDiagnostics::default()
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(
+                should_log_local_usage_refresh(&diagnostics),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn watcher_incremental_with_deferred_files_is_logged() {
-        let deferred = session_usage::RefreshDiagnostics {
-            mode: session_usage::RefreshMode::WatcherIncremental,
-            deferred_files: 1,
-            ..session_usage::RefreshDiagnostics::default()
-        };
-
-        assert!(should_log_local_usage_refresh(&deferred));
-    }
-
-    #[test]
-    fn compact_watcher_log_keeps_only_completed_work() {
+    fn watcher_log_reports_completed_work() {
         assert_eq!(
             local_usage_refresh_description(&session_usage::RefreshDiagnostics {
                 mode: session_usage::RefreshMode::WatcherIncremental,
@@ -1834,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_full_scan_log_omits_skipped_phases_and_zero_errors() {
+    fn scan_log_omits_empty_phases() {
         assert_eq!(
             local_usage_refresh_description(&session_usage::RefreshDiagnostics {
                 files_scanned: 176,
@@ -1849,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_refresh_log_keeps_failures_and_nonzero_errors() {
+    fn refresh_log_reports_failures() {
         assert_eq!(
             local_usage_refresh_description(&session_usage::RefreshDiagnostics {
                 mode: session_usage::RefreshMode::WatcherIncremental,
@@ -1871,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    fn local_publish_sets_today_and_complete_period_together() {
+    fn local_usage_published_together() {
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
 
@@ -1907,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn unreliable_period_does_not_clear_reliable_today() {
+    fn unreliable_period_preserves_today() {
         let state = Arc::new(Mutex::new(AppState {
             today_tokens: Some(10),
             current_period_tokens: Some(30),

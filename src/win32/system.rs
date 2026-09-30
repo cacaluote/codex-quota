@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_closest_to_the_notification_icon_size_wins() {
+    fn nearest_icon_size_selected() {
         let directory = group_directory(&[(16, 16, 1), (32, 32, 2), (48, 48, 3), (0, 0, 4)]);
 
         assert_eq!(pick_entry(&directory).map(|entry| entry.image_id), Some(2));
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn assembling_puts_the_image_right_after_a_single_entry_header() {
+    fn icon_image_follows_header() {
         let entry = IconEntry {
             width: 32,
             height: 32,

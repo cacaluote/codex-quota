@@ -19,8 +19,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::layout::{
-    SnapAnimation, anchored_destination, animation_shape_rect, dip_to_px, lerp, monitor_device,
-    monitor_info, point_in_ball, point_in_rounded_rect, point_is_outside_rounded_rect, px_to_dip,
+    SnapAnimation, anchored_destination, animation_shape_rect, clamp_to_work_area, dip_to_px, lerp,
+    monitor_device, monitor_info, point_in_ball, point_in_rounded_rect,
+    point_is_outside_rounded_rect, px_to_dip,
 };
 use super::renderer::BALL_RADIUS_DIP;
 use super::{
@@ -117,14 +118,30 @@ impl AppWindow {
             return Ok(());
         }
         self.dragging = true;
-        self.drag_velocity.sample(cursor, Instant::now());
+        let mut rect = RECT::default();
+        // SAFETY: hwnd is live and rect is initialized writable storage.
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        // 按光标所在屏幕限位，避免被起始屏幕的边界挡住跨屏拖动。
+        // SAFETY: the nearest-monitor fallback also covers gaps between displays.
+        let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+        let work = monitor_info(monitor)?.info.monitorInfo.rcWork;
+        let destination = clamp_to_work_area(
+            POINT {
+                x: self.drag_window_origin.x + dx,
+                y: self.drag_window_origin.y + dy,
+            },
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            work,
+        );
+        self.drag_velocity.sample(destination, Instant::now());
         // SAFETY: the live popup window is moved without activation or resizing.
         unsafe {
             SetWindowPos(
                 self.hwnd,
                 None,
-                self.drag_window_origin.x + dx,
-                self.drag_window_origin.y + dy,
+                destination.x,
+                destination.y,
                 0,
                 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
@@ -260,8 +277,7 @@ impl AppWindow {
             AnchorEdge::Top => y = work.top,
             AnchorEdge::Bottom => y = work.bottom - height,
         }
-        x = x.clamp(work.left, work.right - width);
-        y = y.clamp(work.top, work.bottom - height);
+        let POINT { x, y } = clamp_to_work_area(POINT { x, y }, width, height, work);
         self.config.placement.edge = edge;
         self.config.placement.monitor_device = monitor_device(&info);
         let offset_px = match edge {
@@ -487,7 +503,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mouse_button_filter_accepts_only_button_down_events() {
+    fn mouse_filter_accepts_button_down() {
         assert!(
             [
                 WM_LBUTTONDOWN,
@@ -535,7 +551,7 @@ mod tests {
     }
 }
 
-/// 拖拽期间的光标速度采样，单位 px/ms（屏幕坐标）。
+/// 拖拽期间的窗口速度采样，单位 px/ms（屏幕坐标）。
 ///
 /// 吸附要从"松手那一刻手的速度"接着滑，所以速度必须在拖拽过程中量出来。用指数
 /// 平滑而不是直接取最后一次差分：鼠标报点率常见 125–1000Hz，单次差分抖动很大，
@@ -556,13 +572,13 @@ impl DragVelocity {
         *self = Self::default();
     }
 
-    pub(super) fn sample(&mut self, cursor: POINT, now: Instant) {
+    pub(super) fn sample(&mut self, position: POINT, now: Instant) {
         if let Some((last, last_at)) = self.last {
             let elapsed_ms = now.saturating_duration_since(last_at).as_secs_f32() * 1000.0;
             if elapsed_ms > 0.0 {
                 let step = (
-                    (cursor.x - last.x) as f32 / elapsed_ms,
-                    (cursor.y - last.y) as f32 / elapsed_ms,
+                    (position.x - last.x) as f32 / elapsed_ms,
+                    (position.y - last.y) as f32 / elapsed_ms,
                 );
                 let keep = 1.0 - Self::SMOOTHING;
                 self.velocity = (
@@ -571,7 +587,7 @@ impl DragVelocity {
                 );
             }
         }
-        self.last = Some((cursor, now));
+        self.last = Some((position, now));
     }
 
     /// 松手瞬间的速度。

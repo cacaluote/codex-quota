@@ -101,6 +101,47 @@ pub(super) fn display_windows(
         .map_or((None, None), |snapshot| snapshot.active_windows(now))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum QuotaRow<'a> {
+    Ready(&'a QuotaWindow),
+    Updating,
+    Unknown,
+}
+
+impl<'a> QuotaRow<'a> {
+    fn from_window(window: Option<&'a QuotaWindow>, now: SystemTime) -> Self {
+        window.map_or(Self::Unknown, |window| {
+            if window.has_expired(now) {
+                Self::Updating
+            } else {
+                Self::Ready(window)
+            }
+        })
+    }
+
+    pub(super) fn window(self) -> Option<&'a QuotaWindow> {
+        match self {
+            Self::Ready(window) => Some(window),
+            Self::Updating | Self::Unknown => None,
+        }
+    }
+}
+
+/// 刚到期的窗口正在等待服务端更新；缺失或陈旧的快照仍按未知处理。
+pub(super) fn quota_rows(state: &AppState, now: SystemTime) -> (QuotaRow<'_>, QuotaRow<'_>) {
+    if state.is_stale(now) {
+        return (QuotaRow::Unknown, QuotaRow::Unknown);
+    }
+    let Some(snapshot) = state.snapshot.as_ref() else {
+        return (QuotaRow::Unknown, QuotaRow::Unknown);
+    };
+    let (short_term, long_term) = snapshot.quota_windows();
+    (
+        QuotaRow::from_window(short_term, now),
+        QuotaRow::from_window(long_term, now),
+    )
+}
+
 pub(super) fn display_period_total_value(state: &AppState, now: SystemTime) -> Option<f64> {
     let (_, long_term) = display_windows(state, now);
     long_term?;
@@ -430,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_rows_stay_hidden_until_usage_or_cost_is_nonzero() {
+    fn overflow_visibility_requires_usage() {
         // 默认/全零状态精简显示；不可靠（None）同样视为未发生。
         assert!(!today_overflow_visible(&AppState::default()));
 
@@ -457,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_height_shrinks_with_hidden_overflow_rows() {
+    fn panel_height_tracks_overflow_rows() {
         // 6 行 227 / 7 行 254 / 8 行 281，与 renderer 的行位排布一致。
         assert!((panel_height_dip(&AppState::default()) - 227.0).abs() < f32::EPSILON);
 
@@ -476,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_panel_height_constant_matches_the_six_row_panel() {
+    fn compact_panel_height_matches_rows() {
         // 锁损坏兜底用的常量必须与真实精简高度同源，避免再次漂移。
         assert!((COMPACT_PANEL_HEIGHT_DIP - 227.0).abs() < f32::EPSILON);
         assert!(
@@ -499,14 +540,35 @@ mod tests {
         assert_eq!(value, "08/06 00:01");
     }
 
+    // 覆盖两套单位的分档、零值和舍入；断言失败时报告输入与单位。
     #[test]
-    fn token_count_below_ten_thousand_stays_unscaled() {
-        assert_eq!(format_token_count(4_280, UnitStyle::Zh), "4280");
-    }
-
-    #[test]
-    fn token_count_uses_ten_thousand_unit() {
-        assert_eq!(format_token_count(42_803_000, UnitStyle::Zh), "4280.3万");
+    fn token_unit_formatting() {
+        for (unit, tokens, expected) in [
+            (UnitStyle::Zh, 0, "0"),
+            (UnitStyle::Zh, 4_280, "4280"),
+            (UnitStyle::Zh, 9_999, "9999"),
+            (UnitStyle::Zh, 10_000, "1万"),
+            (UnitStyle::Zh, 42_803_000, "4280.3万"),
+            (UnitStyle::Zh, 99_999_999, "10000万"),
+            (UnitStyle::Zh, 100_000_000, "1亿"),
+            (UnitStyle::Zh, 128_000_000, "1.3亿"),
+            (UnitStyle::Zh, 516_200_000, "5.2亿"),
+            (UnitStyle::En, 0, "0"),
+            (UnitStyle::En, 999, "999"),
+            (UnitStyle::En, 1_000, "1K"),
+            (UnitStyle::En, 1_240, "1.2K"),
+            (UnitStyle::En, 516_200, "516.2K"),
+            (UnitStyle::En, 999_999, "1000K"),
+            (UnitStyle::En, 1_000_000, "1M"),
+            (UnitStyle::En, 516_200_000, "516.2M"),
+            (UnitStyle::En, 1_000_000_000, "1B"),
+        ] {
+            assert_eq!(
+                format_token_count(tokens, unit),
+                expected,
+                "{unit:?}: {tokens}"
+            );
+        }
     }
 
     /// 用量值不再带 `Token` 后缀：行标签已经说明它是什么。
@@ -522,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_rate_follows_the_usage_count_when_available() {
+    fn usage_includes_cache_hit_rate() {
         assert_eq!(
             format_usage_with_cache_hit(Some(120_000_000), Some(981), UnitStyle::Zh),
             "1.2亿 · 98.1%"
@@ -546,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn usd_format_drops_cents_at_hundred_dollars_and_above() {
+    fn usd_formatting_precision() {
         assert_eq!(format_usd(Some(1.234)), "$1.23");
         assert_eq!(format_usd(Some(45.67)), "$45.67");
         assert_eq!(format_usd(Some(1145.67)), "$1146");
@@ -558,48 +620,9 @@ mod tests {
         assert_eq!(format_usd(None), "--");
     }
 
-    #[test]
-    fn token_count_uses_hundred_million_unit() {
-        assert_eq!(format_token_count(128_000_000, UnitStyle::Zh), "1.3亿");
-    }
-
-    #[test]
-    fn token_count_omits_zero_decimal() {
-        assert_eq!(format_token_count(100_000_000, UnitStyle::Zh), "1亿");
-    }
-
-    #[test]
-    fn zero_token_count_remains_zero() {
-        assert_eq!(format_token_count(0, UnitStyle::Zh), "0");
-    }
-
-    /// 西文单位的分档与边界：999/1K/999.9K/1M/1B。
-    #[test]
-    fn western_token_units_step_at_each_thousand() {
-        assert_eq!(format_token_count(999, UnitStyle::En), "999");
-        assert_eq!(format_token_count(1_000, UnitStyle::En), "1K");
-        assert_eq!(format_token_count(1_240, UnitStyle::En), "1.2K");
-        assert_eq!(format_token_count(516_200, UnitStyle::En), "516.2K");
-        assert_eq!(format_token_count(999_999, UnitStyle::En), "1000K");
-        assert_eq!(format_token_count(1_000_000, UnitStyle::En), "1M");
-        // 用户举例的那个值：516.2M。
-        assert_eq!(format_token_count(516_200_000, UnitStyle::En), "516.2M");
-        assert_eq!(format_token_count(1_000_000_000, UnitStyle::En), "1B");
-        assert_eq!(format_token_count(0, UnitStyle::En), "0");
-    }
-
-    /// 中文单位的分档边界，逐档对齐西文那一组。
-    #[test]
-    fn chinese_token_units_step_at_ten_thousand() {
-        assert_eq!(format_token_count(9_999, UnitStyle::Zh), "9999");
-        assert_eq!(format_token_count(10_000, UnitStyle::Zh), "1万");
-        assert_eq!(format_token_count(99_999_999, UnitStyle::Zh), "10000万");
-        assert_eq!(format_token_count(516_200_000, UnitStyle::Zh), "5.2亿");
-    }
-
     /// 重置列的倒计时阶梯：无空格、不带秒，天数 ≥ 10 时省掉小时以免超出列宽。
     #[test]
-    fn reset_countdown_uses_two_units_without_seconds() {
+    fn compact_countdown_formatting() {
         let minutes = |count: u64| Duration::from_mins(count);
         assert_eq!(
             format_compact_countdown(minutes(1_440) + minutes(360)),
@@ -628,7 +651,7 @@ mod tests {
 
     /// 开关关闭时只显示本地时间；开启时在其后追加倒计时。
     #[test]
-    fn reset_column_appends_the_countdown_only_when_asked() {
+    fn reset_countdown_follows_setting() {
         let now = SystemTime::now();
         let window = QuotaWindow {
             used_percent: 40.0,
@@ -643,7 +666,7 @@ mod tests {
 
     /// 期间行的前缀必须跟着长期窗口走：周窗口 → 本周，月窗口 → 本月。
     #[test]
-    fn period_label_follows_the_long_term_window() {
+    fn period_label_tracks_long_window() {
         let window = |hours: u64| QuotaWindow {
             used_percent: 40.0,
             window_duration: Duration::from_hours(hours),
@@ -662,7 +685,7 @@ mod tests {
 
     /// 窗口未知时的兜底判据必须与 `quota_window_label` 一致。
     #[test]
-    fn period_label_falls_back_the_same_way_as_the_window_label() {
+    fn period_and_quota_fallbacks_agree() {
         assert_eq!(period_label(None, Some("free")), "本月");
         assert_eq!(period_label(None, Some("plus")), "本周");
         assert_eq!(period_label(None, None), "本周");
@@ -675,7 +698,7 @@ mod tests {
     /// 这是把上一次那个「月额度 + 本周使用」钉死的测试：标签只允许来自同一个
     /// 分类器，手写第二份阶梯就会在这里红。
     #[test]
-    fn period_label_agrees_with_the_window_label_for_every_duration() {
+    fn period_and_quota_labels_agree() {
         for hours in [5, 24, 24 * 3, 24 * 7, 24 * 14, 24 * 30, 24 * 31, 24 * 90] {
             let window = QuotaWindow {
                 used_percent: 40.0,
@@ -701,7 +724,7 @@ mod tests {
     /// 这条是补课：曾经把「本周使用」误传成前缀「本周」，像素测试和宽度测试
     /// 都发现不了（少一截照样画得下），只有断言内容才拦得住。
     #[test]
-    fn period_row_labels_carry_the_full_row_name() {
+    fn period_row_label_suffixes() {
         let window = |hours: u64| QuotaWindow {
             used_percent: 40.0,
             window_duration: Duration::from_hours(hours),
@@ -746,12 +769,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_type_uses_friendly_pro_label() {
-        assert_eq!(plan_type_label("pro"), "Pro");
+    fn plan_label_aliases() {
+        for (plan, expected) in [
+            ("pro", "Pro"),
+            ("self_serve_business_usage_based", "Business"),
+        ] {
+            assert_eq!(plan_type_label(plan), expected, "{plan}");
+        }
     }
 
     #[test]
-    fn online_title_includes_plan_without_quota_suffix() {
+    fn online_title_includes_plan() {
         let state = AppState {
             status: ConnectionStatus::Online,
             plan_type: Some("plus".to_owned()),
@@ -762,30 +790,18 @@ mod tests {
     }
 
     #[test]
-    fn usage_based_business_plan_uses_short_label() {
-        assert_eq!(
-            plan_type_label("self_serve_business_usage_based"),
-            "Business"
-        );
+    fn plan_color_aliases() {
+        for (plan, expected) in [
+            ("plus", PlanColor::Plus),
+            ("ent26", PlanColor::Enterprise),
+            ("future_plan", PlanColor::Unknown),
+        ] {
+            assert_eq!(plan_type_color(plan), expected, "{plan}");
+        }
     }
 
     #[test]
-    fn plus_plan_uses_blue_accent() {
-        assert_eq!(plan_type_color("plus"), PlanColor::Plus);
-    }
-
-    #[test]
-    fn enterprise_alias_uses_enterprise_accent() {
-        assert_eq!(plan_type_color("ent26"), PlanColor::Enterprise);
-    }
-
-    #[test]
-    fn unrecognized_plan_uses_unknown_accent() {
-        assert_eq!(plan_type_color("future_plan"), PlanColor::Unknown);
-    }
-
-    #[test]
-    fn lone_long_window_leaves_short_term_slot_empty() {
+    fn lone_long_window_classification() {
         let snapshot = QuotaSnapshot {
             limit_id: "codex".to_owned(),
             primary: window(Duration::from_hours(168)),
@@ -797,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn shorter_window_is_classified_as_five_hour_quota() {
+    fn shorter_window_classification() {
         let snapshot = QuotaSnapshot {
             limit_id: "codex".to_owned(),
             primary: window(Duration::from_hours(168)),
@@ -813,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn free_plan_uses_monthly_fallback_for_missing_long_window() {
+    fn free_plan_monthly_fallback() {
         assert_eq!(quota_window_label(None, Some("free"), false), "月额度");
     }
 
@@ -846,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_tracks_primary_window_while_not_blocked() {
+    fn ball_tracks_primary_window() {
         // Fresh 5h window with an unconstrained weekly window: the ball keeps
         // tracking the primary value instead of freezing on the weekly one.
         let state = ball_snapshot(
@@ -861,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_reads_zero_while_any_active_window_is_exhausted() {
+    fn blocked_account_shows_zero() {
         let state = ball_snapshot(
             quota_window(85.0, Duration::from_hours(5)),
             Some(quota_window(100.0, Duration::from_hours(168))),
@@ -874,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_reads_zero_when_the_only_window_is_exhausted() {
+    fn exhausted_single_window_shows_zero() {
         let state = ball_snapshot(quota_window(100.0, Duration::from_hours(168)), None);
 
         assert_eq!(
@@ -884,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_falls_back_to_the_long_window_while_short_is_expired() {
+    fn ball_uses_long_window_fallback() {
         let state = ball_snapshot(
             expired_quota_window(50.0, Duration::from_hours(5)),
             Some(quota_window(70.0, Duration::from_hours(168))),
@@ -893,6 +909,78 @@ mod tests {
         assert_eq!(
             ball_quota(&state, UNIX_EPOCH),
             ("30".to_owned(), 30.0, QuotaColor::Warning)
+        );
+    }
+
+    #[test]
+    fn short_reset_preserves_long_row() {
+        let mut state = ball_snapshot(
+            quota_window(50.0, Duration::from_hours(5)),
+            Some(quota_window(70.0, Duration::from_hours(168))),
+        );
+        state.snapshot.as_mut().unwrap().primary.resets_at = UNIX_EPOCH + Duration::from_mins(1);
+        let long_term = state.snapshot.as_ref().unwrap().secondary.as_ref().unwrap();
+        let now = UNIX_EPOCH + Duration::from_mins(1);
+
+        assert_eq!(
+            quota_rows(&state, now),
+            (QuotaRow::Updating, QuotaRow::Ready(long_term))
+        );
+    }
+
+    #[test]
+    fn long_reset_preserves_short_row() {
+        let state = ball_snapshot(
+            quota_window(50.0, Duration::from_hours(5)),
+            Some(expired_quota_window(70.0, Duration::from_hours(168))),
+        );
+        let short_term = &state.snapshot.as_ref().unwrap().primary;
+
+        assert_eq!(
+            quota_rows(&state, UNIX_EPOCH),
+            (QuotaRow::Ready(short_term), QuotaRow::Updating)
+        );
+    }
+
+    #[test]
+    fn expired_rows_show_pending_update() {
+        let state = ball_snapshot(
+            expired_quota_window(50.0, Duration::from_hours(5)),
+            Some(expired_quota_window(70.0, Duration::from_hours(168))),
+        );
+
+        assert_eq!(
+            quota_rows(&state, UNIX_EPOCH),
+            (QuotaRow::Updating, QuotaRow::Updating),
+            "重试等待时没有在途请求，额度行仍应显示更新中"
+        );
+    }
+
+    #[test]
+    fn missing_or_stale_rows_remain_unknown() {
+        let state = ball_snapshot(expired_quota_window(50.0, Duration::from_hours(5)), None);
+
+        for (state, now) in [
+            (&AppState::default(), UNIX_EPOCH),
+            (&state, UNIX_EPOCH + Duration::from_mins(31)),
+        ] {
+            assert_eq!(
+                quota_rows(state, now),
+                (QuotaRow::Unknown, QuotaRow::Unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn new_window_restores_quota_row() {
+        let mut state = ball_snapshot(expired_quota_window(50.0, Duration::from_hours(5)), None);
+        assert_eq!(quota_rows(&state, UNIX_EPOCH).0, QuotaRow::Updating);
+
+        state.snapshot.as_mut().unwrap().primary = quota_window(0.0, Duration::from_hours(5));
+        let short_term = &state.snapshot.as_ref().unwrap().primary;
+        assert_eq!(
+            quota_rows(&state, UNIX_EPOCH).0,
+            QuotaRow::Ready(short_term)
         );
     }
 
@@ -911,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_refresh_clears_the_ball_so_only_the_spinner_speaks() {
+    fn manual_refresh_clears_ball_reading() {
         use crate::quota::QuotaPull;
 
         let now = SystemTime::now();
@@ -949,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_spinner_only_covers_pulls_that_are_worth_showing() {
+    fn ball_spinner_visibility_policy() {
         use crate::quota::QuotaPull;
 
         let with = |status, pull| AppState {
@@ -999,7 +1087,7 @@ mod tests {
     /// 否则本地日志全量扫描那 2.8 秒里，球是个一动不动的 `--`，看着像卡死；
     /// 面板同一时刻写的是「正在连接 Codex」。
     #[test]
-    fn ball_spins_while_starting_up_before_the_first_pull() {
+    fn startup_shows_ball_spinner() {
         use crate::quota::QuotaPull;
 
         let starting = AppState {
@@ -1023,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn ball_and_panel_withhold_percentages_while_the_snapshot_is_stale() {
+    fn stale_snapshot_hides_quota() {
         // A snapshot hours old may predate a server-side reset or another
         // device's usage; its percentages must not render at all.
         let state = ball_snapshot(quota_window(0.0, Duration::from_hours(5)), None);
@@ -1037,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_period_estimate_disappears_when_snapshot_becomes_stale() {
+    fn stale_snapshot_hides_period_estimate() {
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(168)), None);
         state.period_total_value_estimate = Some(100.0);
         assert_eq!(display_period_total_value(&state, UNIX_EPOCH), Some(100.0));
@@ -1048,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_period_estimate_disappears_when_long_window_expires() {
+    fn long_reset_hides_period_estimate() {
         let mut long_term = quota_window(10.0, Duration::from_hours(168));
         long_term.resets_at = UNIX_EPOCH + Duration::from_mins(1);
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(5)), Some(long_term));
@@ -1061,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_period_estimate_requires_a_long_window() {
+    fn period_estimate_requires_long_window() {
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(5)), None);
         state.period_total_value_estimate = Some(100.0);
         assert_eq!(display_period_total_value(&state, UNIX_EPOCH), None);
@@ -1071,7 +1159,7 @@ mod tests {
 
     /// 满额 token 估算：本期 token ÷ 已用%，与美元估算同源。
     #[test]
-    fn period_token_estimate_scales_period_usage_to_a_full_window() {
+    fn token_estimate_scales_period_usage() {
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(168)), None);
         state.current_period_tokens = Some(3_000_000);
 
@@ -1103,7 +1191,7 @@ mod tests {
     /// 快照过期后百分比不再可信，放大出来的 token 数同样不可信；没有长期窗口时
     /// 期间行本身就不成立。两道门控与美元列一致。
     #[test]
-    fn period_token_estimate_needs_a_fresh_long_window() {
+    fn token_estimate_requires_fresh_window() {
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(168)), None);
         state.current_period_tokens = Some(3_000_000);
         assert!(display_period_total_token_estimate(&state, UNIX_EPOCH).is_some());
@@ -1123,7 +1211,7 @@ mod tests {
 
     /// token 列不依赖价格表：美元列算不出来（`--`）时它照样有值。
     #[test]
-    fn period_token_estimate_stands_without_a_price_table() {
+    fn token_estimate_without_prices() {
         let mut state = ball_snapshot(quota_window(10.0, Duration::from_hours(168)), None);
         state.current_period_tokens = Some(3_000_000);
         state.current_period_cost = None;

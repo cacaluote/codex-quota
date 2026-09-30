@@ -45,15 +45,15 @@ use super::layout::{
     pulse_opacity,
 };
 use super::presentation::{
-    FIRST_ROW_TOP_DIP, PlanColor, ROW_STEP_DIP, ball_is_pulling, ball_quota,
-    display_period_total_token_estimate, display_period_total_value, display_windows,
-    format_local_timestamp, format_reset_column, format_token_usage, format_usage_with_cache_hit,
-    format_usd, panel_title, period_labels, period_overflow_visible, plan_type_color,
-    plan_type_label, quota_window_label, today_overflow_visible,
+    FIRST_ROW_TOP_DIP, PlanColor, QuotaRow, ROW_STEP_DIP, ball_is_pulling, ball_quota,
+    display_period_total_token_estimate, display_period_total_value, format_local_timestamp,
+    format_reset_column, format_token_usage, format_usage_with_cache_hit, format_usd, panel_title,
+    period_labels, period_overflow_visible, plan_type_color, plan_type_label, quota_rows,
+    quota_window_label, today_overflow_visible,
 };
 use crate::config::{ColorStyle, UnitStyle};
 use crate::error::AppError;
-use crate::quota::{AppState, QuotaColor, QuotaPull, QuotaWindow};
+use crate::quota::{AppState, QuotaColor, QuotaPull};
 
 const BACKGROUND_RGB: (u8, u8, u8) = (0x12, 0x17, 0x20);
 const BACKGROUND: D2D1_COLOR_F = rgba(BACKGROUND_RGB.0, BACKGROUND_RGB.1, BACKGROUND_RGB.2, 0.94);
@@ -981,7 +981,8 @@ impl Renderer {
             );
         }
 
-        let (short_term, long_term) = display_windows(state, SystemTime::now());
+        let (short_row, long_row) = quota_rows(state, SystemTime::now());
+        let (short_term, long_term) = (short_row.window(), long_row.window());
         let short_term_label = quota_window_label(short_term, state.plan_type.as_deref(), true);
         let long_term_label = quota_window_label(long_term, state.plan_type.as_deref(), false);
         // 期间行的前缀与上面那行的窗口名同源（周额度 → 本周，月额度 → 本月），
@@ -992,7 +993,7 @@ impl Renderer {
         let mut top = FIRST_ROW_TOP_DIP;
         self.draw_quota_row(
             &short_term_label,
-            short_term,
+            short_row,
             top,
             width,
             opacity,
@@ -1001,7 +1002,7 @@ impl Renderer {
         top += ROW_STEP_DIP;
         self.draw_quota_row(
             &long_term_label,
-            long_term,
+            long_row,
             top,
             width,
             opacity,
@@ -1072,7 +1073,7 @@ impl Renderer {
     fn draw_quota_row(
         &self,
         label: &str,
-        window: Option<&QuotaWindow>,
+        row: QuotaRow<'_>,
         top: f32,
         width: f32,
         opacity: f32,
@@ -1090,9 +1091,13 @@ impl Renderer {
             },
             opacity,
         );
-        let Some(window) = window else {
+        let Some(window) = row.window() else {
             self.draw_text_with_opacity(
-                "--",
+                if matches!(row, QuotaRow::Updating) {
+                    "更新中"
+                } else {
+                    "--"
+                },
                 &self.body_format,
                 &self.brushes.unknown,
                 D2D_RECT_F {
@@ -1660,7 +1665,7 @@ mod tests {
     };
 
     #[test]
-    fn first_known_value_sweeps_in_from_zero() {
+    fn initial_value_sweeps_from_zero() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
 
@@ -1677,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn value_reappearing_after_unknown_snaps_without_a_sweep() {
+    fn unknown_recovery_skips_sweep() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
@@ -1695,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn appearance_makes_the_next_value_sweep_again() {
+    fn appearance_restarts_value_sweep() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
@@ -1711,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_animations_also_skip_the_appearance_sweep() {
+    fn disabled_animations_skip_sweep() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.set_enabled(false);
@@ -1723,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_value_tweens_and_stops_asking_for_frames_when_settled() {
+    fn settled_value_stops_frames() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
@@ -1744,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn retargeting_mid_tween_restarts_from_the_interpolated_value() {
+    fn retargeting_preserves_current_value() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.5), start);
@@ -1771,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_zero_target_drops_the_arc_without_tweening() {
+    fn unknown_and_zero_drop_arc() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.3), start);
@@ -1799,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn pulse_runs_only_while_enabled_and_requested() {
+    fn pulse_requires_enabled_request() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
 
@@ -1818,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn label_rolls_on_its_own_shorter_duration_while_the_arc_keeps_sweeping() {
+    fn label_roll_precedes_arc_completion() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
 
@@ -1839,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn label_rolls_from_the_value_it_currently_shows_when_the_target_changes() {
+    fn label_retargeting_preserves_current_value() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.5), start);
@@ -1863,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn label_does_not_roll_when_the_target_becomes_unknown() {
+    fn unknown_target_stops_label_roll() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.4), start);
@@ -1876,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn disabling_animations_stops_the_label_roll_too() {
+    fn disabled_animations_stop_label_roll() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.5), start);
@@ -1904,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn tween_frame_rate_wins_while_a_tween_and_pulse_overlap() {
+    fn tween_frames_take_priority() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
         ring.retarget(Some(0.2), start);
@@ -1917,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_tween_fades_in_and_stops_asking_for_frames() {
+    fn settled_hover_stops_frames() {
         let start = Instant::now();
         let mut pointer = PointerState::new();
 
@@ -1935,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_tween_fades_out_from_wherever_it_was() {
+    fn hover_fade_preserves_current_value() {
         let start = Instant::now();
         let mut pointer = PointerState::new();
         pointer.set_targets(true, false, start);
@@ -1951,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn press_scales_in_faster_than_it_releases() {
+    fn press_faster_than_release() {
         let start = Instant::now();
         let mut pointer = PointerState::new();
 
@@ -1971,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_animations_jump_the_pointer_state_to_its_target() {
+    fn disabled_pointer_animation_snaps() {
         let start = Instant::now();
         let mut pointer = PointerState::new();
         pointer.set_enabled(false);
@@ -1986,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn spinner_rotates_while_pulling_and_stops_asking_for_frames() {
+    fn spinner_frames_follow_pull_state() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
 
@@ -2011,7 +2016,7 @@ mod tests {
     /// 手动刷新时环被清空：球上只剩"正在刷新"这一件事，不再同时出现一条
     /// 说"这是当前读数"的额度弧。
     #[test]
-    fn manual_refresh_paints_no_quota_arc_on_the_ring() {
+    fn manual_refresh_hides_quota_arc() {
         use crate::win32::layout::dip_to_px;
 
         let now = SystemTime::now();
@@ -2055,7 +2060,7 @@ mod tests {
     /// 0% 不呼吸：它是冻结状态，动效不携带新信息，而且**没有帧**——应用因此
     /// 可以在卡死期间彻底停表，这正是它停留最久的状态。
     #[test]
-    fn exhausted_never_pulses_and_never_asks_for_frames() {
+    fn exhausted_quota_stops_frames() {
         let start = Instant::now();
         let mut ring = RingState::new(start);
 
@@ -2124,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_snapshot_is_opaque_without_rounded_corners() {
+    fn panel_snapshot_has_opaque_corners() {
         let (mut renderer, state, width, height) = offscreen_panel_renderer();
         let bitmap = renderer.panel_snapshot(&state).expect("渲染面板");
 
@@ -2352,7 +2357,7 @@ mod tests {
 
     /// 悬停把底色提亮、按下把球缩小：两者都不依赖动画帧，关掉动效也照样指示。
     #[test]
-    fn pointer_state_brightens_and_shrinks_the_ball() {
+    fn pointer_feedback_changes_ball() {
         use crate::win32::layout::dip_to_px;
 
         let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
@@ -2385,7 +2390,7 @@ mod tests {
     /// 旋转弧是动效，动效关闭时它连同别的动画一起消失（`set_animations_enabled`
     /// 会把它关掉），所以这一帧必须开着动效画。
     #[test]
-    fn spinner_appears_on_the_inner_ring_only_while_pulling() {
+    fn pull_spinner_uses_inner_ring() {
         use crate::win32::layout::dip_to_px;
 
         let center = dip_to_px(crate::win32::COLLAPSED_DIP, 96) / 2;
@@ -2506,7 +2511,7 @@ mod tests {
     /// 状态走到了那三支笔刷；中性球（没有快照，整只球只有轨道、底和文字）则
     /// 一个字节都不许变，说明换配色没有顺手把底色文字也换掉。
     #[test]
-    fn color_style_switch_repaints_only_the_quota_colors() {
+    fn color_style_preserves_neutral_pixels() {
         use crate::win32::COLLAPSED_DIP;
         use crate::win32::layout::dip_to_px;
 

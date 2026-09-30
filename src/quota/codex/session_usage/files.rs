@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn session_partition_before_period_is_not_selected() {
+    fn pre_period_partition_excluded() {
         let path = Path::new("C:\\Users\\test\\.codex\\sessions\\2026\\08\\08\\rollout.jsonl");
 
         assert!(!is_date_partition_in_range(
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_reader_allows_session_to_be_appended_and_archived() {
+    fn shared_reader_allows_append_and_archive() {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "codex-quota-shared-session-{}-{sequence}",

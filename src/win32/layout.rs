@@ -538,6 +538,14 @@ fn clamp_axis(position: i32, extent: i32, work_start: i32, work_end: i32) -> i32
     }
 }
 
+/// 按窗口的实际像素尺寸限位，工作区坐标可为负数（副屏位于主屏左侧或上方）。
+pub(super) fn clamp_to_work_area(position: POINT, width: i32, height: i32, work: RECT) -> POINT {
+    POINT {
+        x: clamp_axis(position.x, width, work.left, work.right),
+        y: clamp_axis(position.y, height, work.top, work.bottom),
+    }
+}
+
 pub(super) fn dip_to_px(value: f32, dpi: u32) -> i32 {
     (value * dpi as f32 / 96.0).round() as i32
 }
@@ -668,7 +676,7 @@ mod tests {
     use crate::win32::{COLLAPSE_ANIMATION_DURATION, EXPAND_ANIMATION_DURATION};
 
     #[test]
-    fn expanding_animation_starts_with_only_ball_content_visible() {
+    fn expansion_starts_with_ball() {
         let sample = animation_sample(true, 0.0);
         assert!(
             sample.expansion.abs() < f32::EPSILON
@@ -679,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn expanding_animation_finishes_with_only_panel_content_visible() {
+    fn expansion_finishes_with_panel() {
         let sample = animation_sample(true, 1.0);
         assert!(
             (sample.expansion - 1.0).abs() < f32::EPSILON
@@ -690,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsing_animation_finishes_with_only_ball_content_visible() {
+    fn collapse_finishes_with_ball() {
         let sample = animation_sample(false, 1.0);
         assert!(
             sample.expansion.abs() < f32::EPSILON
@@ -701,12 +709,12 @@ mod tests {
     }
 
     #[test]
-    fn panel_width_interpolation_reaches_midpoint_at_half_expansion() {
+    fn panel_width_interpolation_midpoint() {
         assert!((lerp(COLLAPSED_DIP, PANEL_WIDTH_DIP, 0.5) - 172.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn collapsed_animation_shape_stays_inside_fixed_right_anchored_canvas() {
+    fn collapsed_shape_fits_right_canvas() {
         let animation = PanelAnimation {
             started_at: Instant::now(),
             duration: COLLAPSE_ANIMATION_DURATION,
@@ -741,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_animation_shape_follows_the_dynamic_panel_height() {
+    fn expanded_shape_tracks_panel_height() {
         // 展开终点高度由调用方按数据传入：无超额 227、双行超额 281。
         let animation = PanelAnimation {
             started_at: Instant::now(),
@@ -791,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_ball_hit_test_matches_the_drawn_radius() {
+    fn ball_hit_test_matches_radius() {
         use super::point_in_ball;
         use crate::win32::renderer::BALL_RADIUS_DIP;
 
@@ -806,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_tween_starts_at_the_old_value_and_settles_on_the_new_one() {
+    fn ring_tween_start_and_end() {
         let start = Instant::now();
         let animation = Tween::new(0.42, 0.08, start);
 
@@ -829,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_sweep_fills_from_zero_over_the_longer_sweep_duration() {
+    fn ring_sweep_start_and_end() {
         let start = Instant::now();
         let sweep = Tween::sweep(0.65, start);
 
@@ -843,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn label_rolls_are_shorter_than_the_arc_motion_they_accompany() {
+    fn label_roll_precedes_arc_motion() {
         use std::hint::black_box;
 
         // 不变式：数字必须比同场景的弧先落定，否则出现"环已静止、数字还在滚"。
@@ -853,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_tween_eases_out_so_it_is_past_halfway_at_midpoint() {
+    fn ring_tween_eases_out() {
         let start = Instant::now();
         let animation = Tween::new(0.0, 1.0, start);
 
@@ -863,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn ease_out_cubic_pins_both_ends_and_clamps_out_of_range_input() {
+    fn cubic_easing_endpoints_and_bounds() {
         assert!(ease_out_cubic(0.0).abs() < f32::EPSILON);
         assert!((ease_out_cubic(1.0) - 1.0).abs() < f32::EPSILON);
         assert!(ease_out_cubic(-1.0).abs() < f32::EPSILON);
@@ -871,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn snap_animation_slides_from_the_release_point_to_the_edge() {
+    fn snap_start_and_end() {
         let start = Instant::now();
         let from = POINT { x: 400, y: 220 };
         let to = POINT { x: 0, y: 200 };
@@ -961,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn snap_animation_reports_a_noop_when_it_is_already_at_the_edge() {
+    fn snap_detects_identical_endpoints() {
         let start = Instant::now();
         let point = POINT { x: 32, y: 64 };
 
@@ -973,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn snap_duration_grows_with_distance_and_stops_at_a_cap() {
+    fn snap_duration_scales_with_distance() {
         let origin = POINT { x: 0, y: 0 };
         let near = duration_for(origin, POINT { x: 40, y: 0 });
         let middle = duration_for(origin, POINT { x: 400, y: 0 });
@@ -993,7 +1001,7 @@ mod tests {
     /// 固定 140ms + 三次缓出时，900px 的滑动在第一个 16ms 帧里就走掉三成（约
     /// 270px），看起来是"跳"而不是"滑"——这正是"吸附不流畅"的来源之一。
     #[test]
-    fn long_snap_moves_less_than_a_tenth_in_its_first_frame() {
+    fn long_snap_first_frame_bounded() {
         let start = Instant::now();
         let from = POINT { x: 900, y: 400 };
         let to = POINT { x: 0, y: 400 };
@@ -1010,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_at_keeps_its_precision_after_a_million_periods() {
+    fn phase_precision_after_long_runtime() {
         let start = Instant::now();
         let mut epoch = start;
         // 约 18 天之后（1e6 个 1.6 秒周期）：不重新锚定的话 f32 秒数在这个
@@ -1028,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn pulse_opacity_cycles_between_full_and_minimum() {
+    fn pulse_opacity_range() {
         assert!((pulse_opacity(Duration::ZERO) - 1.0).abs() < 1e-6);
         assert!((pulse_opacity(PULSE_PERIOD / 2) - PULSE_MIN_OPACITY).abs() < 1e-6);
         assert!((pulse_opacity(PULSE_PERIOD) - 1.0).abs() < 1e-6);
@@ -1059,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn point_inside_card_does_not_request_outside_collapse() {
+    fn inside_point_preserves_panel() {
         assert!(!point_is_outside_rounded_rect(
             POINT { x: 146, y: 74 },
             RECT {
@@ -1095,6 +1103,93 @@ mod tests {
     }
 
     #[test]
+    fn drag_respects_work_area_edges() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        for (requested, expected) in [
+            (POINT { x: -30, y: 100 }, POINT { x: 0, y: 100 }),
+            (POINT { x: 1900, y: 100 }, POINT { x: 1864, y: 100 }),
+            (POINT { x: 100, y: -30 }, POINT { x: 100, y: 0 }),
+            (POINT { x: 100, y: 1020 }, POINT { x: 100, y: 984 }),
+            (POINT { x: 100, y: 100 }, POINT { x: 100, y: 100 }),
+        ] {
+            assert_eq!(clamp_to_work_area(requested, 56, 56, work), expected);
+        }
+    }
+
+    #[test]
+    fn drag_respects_taskbar_insets() {
+        let work = RECT {
+            left: 40,
+            top: 48,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert_eq!(
+            clamp_to_work_area(POINT { x: 0, y: 0 }, 56, 56, work),
+            POINT { x: 40, y: 48 }
+        );
+    }
+
+    #[test]
+    fn drag_supports_negative_coordinates() {
+        let work = RECT {
+            left: -1920,
+            top: -1080,
+            right: 0,
+            bottom: -40,
+        };
+        for (requested, expected) in [
+            (POINT { x: -50, y: -80 }, POINT { x: -56, y: -96 }),
+            (POINT { x: -2000, y: -1200 }, POINT { x: -1920, y: -1080 }),
+            (POINT { x: -1500, y: -500 }, POINT { x: -1500, y: -500 }),
+        ] {
+            assert_eq!(clamp_to_work_area(requested, 56, 56, work), expected);
+        }
+    }
+
+    #[test]
+    fn drag_respects_scaled_window_size() {
+        let work = RECT {
+            left: 1920,
+            top: 0,
+            right: 4480,
+            bottom: 1400,
+        };
+        for (dpi, expected) in [
+            (96, POINT { x: 4424, y: 1344 }),
+            (144, POINT { x: 4396, y: 1316 }),
+            (192, POINT { x: 4368, y: 1288 }),
+        ] {
+            let side = dip_to_px(COLLAPSED_DIP, dpi);
+            assert_eq!(
+                clamp_to_work_area(POINT { x: 4500, y: 1420 }, side, side, work),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn drag_handles_small_work_area() {
+        let work = RECT {
+            left: -20,
+            top: 10,
+            right: 20,
+            bottom: 40,
+        };
+
+        assert_eq!(
+            clamp_to_work_area(POINT { x: 100, y: 100 }, 56, 56, work),
+            POINT { x: -20, y: 10 }
+        );
+    }
+
+    #[test]
     fn right_anchored_expansion_preserves_outer_edge() {
         let (destination, alignment) = expanded_destination(
             RECT {
@@ -1120,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn top_anchored_expansion_flips_left_when_right_side_does_not_fit() {
+    fn top_expansion_flips_left() {
         let (destination, alignment) = expanded_destination(
             RECT {
                 left: 1860,
@@ -1145,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_restores_far_edge_after_leftward_expansion() {
+    fn leftward_collapse_restores_far_edge() {
         let destination = anchored_destination(
             RECT {
                 left: 1640,

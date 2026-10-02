@@ -11,7 +11,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use app_server::AppServerSession;
-pub(crate) use app_server::find_codex_executable;
 use protocol::{
     local_calendar_date, local_calendar_date_at, parse_account_result, parse_rate_limits_result,
 };
@@ -22,6 +21,7 @@ use super::model::{
     AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaPull, QuotaSnapshot,
 };
 use super::pricing::PriceTable;
+use crate::codex_install::find_app_server_backend;
 use crate::error::AppError;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -561,8 +561,13 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     let _in_flight = PullInFlight::new(state, notify, forced);
-    let executable = find_codex_executable()?;
-    let mut session = AppServerSession::spawn(&executable, Arc::clone(cancelled))?;
+    let backend = find_app_server_backend()?;
+    crate::logging::log(&format!(
+        "额度查询后端：{}，路径：{}",
+        backend.source.label(),
+        backend.path.display()
+    ));
+    let mut session = AppServerSession::spawn(&backend.path, Arc::clone(cancelled))?;
     let mut next_id = initialize_session(&mut session)?;
     let result = read_rate_limits_and_publish(&mut session, &mut next_id, state, notify);
     if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
@@ -1224,7 +1229,65 @@ fn next_request_id(next: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_install::{BackendSource, find_cli_executable};
     use crate::quota::QuotaWindow;
+
+    #[test]
+    #[ignore = "requires installed Desktop, cached ChatGPT login, and no discoverable standalone CLI"]
+    fn desktop_backend_refreshes_live_quota() {
+        assert!(find_cli_executable().is_none());
+        let backend = find_app_server_backend().unwrap();
+        assert_eq!(backend.source, BackendSource::Desktop);
+        assert!(backend.path.is_absolute());
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        pull_rpc_snapshot(&state, &notify, &cancelled, true).unwrap();
+
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_some() && current.plan_type.is_some());
+        assert_eq!(current.quota_pull, QuotaPull::Idle);
+    }
+
+    #[test]
+    #[ignore = "requires installed standalone Codex CLI and a cached ChatGPT login"]
+    fn cli_backend_reads_live_quota() {
+        let executable = find_cli_executable().unwrap();
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut session = AppServerSession::spawn(&executable, cancelled).unwrap();
+        let mut next_id = initialize_session(&mut session).unwrap();
+
+        let quota_result =
+            read_rate_limits_and_publish(&mut session, &mut next_id, &state, &notify);
+        let account_result = read_account_and_publish(&mut session, &mut next_id, &state, &notify);
+        session.shutdown();
+
+        quota_result.unwrap();
+        account_result.unwrap();
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_some() && current.plan_type.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires installed Desktop and CODEX_HOME with file auth configured but no login"]
+    fn desktop_backend_respects_empty_codex_home() {
+        assert!(std::env::var_os("CODEX_HOME").is_some());
+        let backend = find_app_server_backend().unwrap();
+        assert_eq!(backend.source, BackendSource::Desktop);
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let notify = Arc::new(|| {});
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let result = pull_rpc_snapshot(&state, &notify, &cancelled, true);
+
+        assert!(matches!(result, Err(AppError::Authentication(_))));
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_none() && current.plan_type.is_none());
+        assert_eq!(current.quota_pull, QuotaPull::Idle);
+    }
 
     fn quota_snapshot(received_at: SystemTime) -> QuotaSnapshot {
         QuotaSnapshot {

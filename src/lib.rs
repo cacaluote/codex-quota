@@ -1,3 +1,5 @@
+mod codex_install;
+
 pub mod config;
 pub mod error;
 pub mod logging;

@@ -23,31 +23,6 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use super::protocol::classify_rpc_error;
 use crate::error::AppError;
 
-pub(crate) fn find_codex_executable() -> Result<PathBuf, AppError> {
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let installed = PathBuf::from(local_app_data)
-            .join("Programs")
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin")
-            .join("codex.exe");
-        if installed.is_file() {
-            return Ok(installed);
-        }
-    }
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path) {
-            let candidate = directory.join("codex.exe");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    Err(AppError::CliNotFound)
-}
-
 pub(super) struct AppServerSession {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -325,6 +300,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn invalid_backend_preserves_spawn_failure() {
+        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let result = AppServerSession::spawn(&executable, cancelled);
+
+        assert!(matches!(result, Err(AppError::Spawn(_))));
+    }
 
     fn read_matching_response<R: BufRead>(reader: &mut R, id: u64) -> Result<Value, AppError> {
         for line in reader.lines() {

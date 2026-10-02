@@ -2,7 +2,7 @@ use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("未找到可用的 Codex CLI")]
+    #[error("未找到可用的 Codex 后端，请安装 Codex Desktop 或 CLI")]
     CliNotFound,
     #[error("无法启动 Codex app-server：{0}")]
     Spawn(String),

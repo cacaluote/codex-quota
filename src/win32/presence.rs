@@ -25,10 +25,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PWSTR;
 
+use crate::codex_install::{CODEX_APP_PACKAGE_FAMILY, find_cli_executable};
 use crate::error::AppError;
-use crate::quota::find_codex_executable;
 
-const CODEX_APP_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
 const CLI_MINIMUM_LIFETIME: Duration = Duration::from_millis(800);
 const EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const CLI_PATH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -294,7 +293,7 @@ fn minimum_timeout(
 }
 
 fn resolve_cli_path() -> Option<ResolvedCliPath> {
-    let path = find_codex_executable().ok()?;
+    let path = find_cli_executable()?;
     Some(ResolvedCliPath {
         normalized: normalize_path(&path),
         path,

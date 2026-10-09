@@ -13,6 +13,7 @@ use super::model::{
     RateLimitWindowEntry, RootMeta, TokenCounters, TokenEvent, TokenSignature, UsageHighWater,
 };
 use crate::quota::codex::protocol::local_calendar_date_at;
+use crate::quota::pricing::ServiceTier;
 
 pub(super) fn update_candidate_cache(
     candidate: &CandidateFile,
@@ -62,6 +63,7 @@ pub(super) fn update_candidate_cache(
         let previous_parse_errors = cache.parse_errors;
         let previous_rate_limits = cache.latest_rate_limits.clone();
         let previous_current_model = cache.current_model.clone();
+        let previous_service_tier = cache.current_service_tier.clone();
         let previous_balance_observations = cache.balance_observations.clone();
         diagnostics.files_read = diagnostics.files_read.saturating_add(1);
         if parse_file_append(candidate, &mut cache).is_err() {
@@ -81,12 +83,37 @@ pub(super) fn update_candidate_cache(
             || previous_parse_errors != cache.parse_errors
             || previous_rate_limits != cache.latest_rate_limits
             || previous_current_model != cache.current_model
+            || previous_service_tier != cache.current_service_tier
             || previous_balance_observations != cache.balance_observations;
     }
     cache.length = candidate.length;
     cache.last_write_time = candidate.last_write_time;
     caches.insert(key, cache);
     cache_dirty
+}
+
+/// Rebuild history without exposing an incomplete timeline if the source
+/// cannot be read. Keep its trim marker so the next refresh retries recovery.
+pub(super) fn restore_candidate_cache(
+    candidate: &CandidateFile,
+    caches: &mut HashMap<String, FileCache>,
+    diagnostics: &mut RefreshDiagnostics,
+) {
+    let key = path_key(&candidate.path);
+    let Some(mut previous) = caches.remove(&key) else {
+        return;
+    };
+    caches.insert(key.clone(), FileCache::empty(candidate));
+    update_candidate_cache(candidate, caches, diagnostics);
+    if let Some(rebuilt) = caches.get(&key)
+        && rebuilt.uncertain
+    {
+        previous.uncertain = true;
+        previous.parse_errors = previous.parse_errors.saturating_add(rebuilt.parse_errors);
+        caches.insert(key, previous);
+    } else {
+        diagnostics.history_files_restored = diagnostics.history_files_restored.saturating_add(1);
+    }
 }
 
 fn parse_file_append(candidate: &CandidateFile, cache: &mut FileCache) -> io::Result<()> {
@@ -151,6 +178,7 @@ fn parse_relevant_line(
     if !line.contains("\"session_meta\"")
         && !line.contains("\"turn_context\"")
         && !line.contains("\"token_count\"")
+        && !line.contains("\"thread_settings_applied\"")
     {
         return;
     }
@@ -188,6 +216,22 @@ fn parse_relevant_line(
             {
                 cache.current_model = Some(model.to_owned());
             }
+            if let Some(tier) = value.pointer("/payload/service_tier") {
+                cache.current_service_tier = parse_service_tier(tier);
+            }
+        }
+        Some("event_msg")
+            if value.pointer("/payload/type").and_then(Value::as_str)
+                == Some("thread_settings_applied") =>
+        {
+            if let Some(settings) = value
+                .pointer("/payload/thread_settings")
+                .filter(|settings| settings.is_object())
+            {
+                // 完整设置快照：缺失/null 清除旧档位，未支持的字符串保留原值。
+                cache.current_service_tier =
+                    settings.get("service_tier").and_then(parse_service_tier);
+            }
         }
         Some("event_msg") => parse_token_event(
             value.get("payload"),
@@ -197,6 +241,14 @@ fn parse_relevant_line(
             signatures_by_source,
         ),
         _ => {}
+    }
+}
+
+fn parse_service_tier(value: &Value) -> Option<ServiceTier> {
+    match value {
+        Value::Null => None,
+        Value::String(tier) => Some(ServiceTier::from_codex(tier)),
+        _ => Some(ServiceTier::Unknown(value.to_string())),
     }
 }
 
@@ -309,6 +361,7 @@ fn parse_token_event(
         delta_cached_input,
         delta_output,
         model: cache.current_model.clone(),
+        service_tier: cache.current_service_tier.clone(),
         primary_percent,
         secondary_percent,
     });
@@ -508,22 +561,13 @@ fn remember_source_signature(
     model: Option<String>,
     signature: &TokenSignature,
 ) {
-    let Some(total) = signature.total.as_ref() else {
-        return;
-    };
     // Older snapshots can arrive after a higher cumulative total. Keep the
     // peak so a later partial recovery is not treated as a new turn——峰值
     // 按模型隔离，跨模型的更低累计是新计数器，必须覆盖。
-    if let Some(baseline) = signatures_by_source.get(&source)
-        && baseline.model == model
-        && baseline
-            .signature
-            .total
-            .as_ref()
-            .is_some_and(|previous_total| {
-                total.effective_total() <= previous_total.effective_total()
-            })
-    {
+    let previous = signatures_by_source
+        .get(&source)
+        .map(|baseline| (&baseline.signature, baseline.model.as_deref()));
+    if !source_peak_advances(previous, signature, model.as_deref()) {
         return;
     }
     signatures_by_source.insert(
@@ -533,6 +577,25 @@ fn remember_source_signature(
             model,
         },
     );
+}
+
+/// Shared by parsing and pruning so a retained checkpoint follows the same
+/// per-source, per-model peak rule as an unpruned timeline.
+pub(super) fn source_peak_advances(
+    previous: Option<(&TokenSignature, Option<&str>)>,
+    signature: &TokenSignature,
+    model: Option<&str>,
+) -> bool {
+    let Some(total) = signature.total.as_ref() else {
+        return false;
+    };
+    previous.is_none_or(|(signature, previous_model)| {
+        previous_model != model
+            || signature
+                .total
+                .as_ref()
+                .is_none_or(|previous| total.effective_total() > previous.effective_total())
+    })
 }
 
 fn cumulative_did_not_advance(
@@ -690,6 +753,9 @@ mod tests {
             Some(ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 198,
                     cached_input: 0,
                     output: 2
@@ -903,11 +969,350 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_scan_modes_agree() {
-        let prices = crate::quota::pricing::PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"model-a":{"cost":{"input":1,"cache_read":0.1,"output":2}},"model-b":{"cost":{"input":10,"cache_read":1,"output":20}}}}}"#,
+    fn fast_switch_scan_modes_agree() {
+        let prices = crate::quota::pricing::PriceTable::from_pricing_md(
+            crate::quota::pricing::OFFICIAL_PRICING,
         )
         .unwrap();
+        for incremental in [false, true] {
+            let context = TestContext::new("fast-switch");
+            let file = context.rollout(PARENT_ID);
+            let initial = [
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                turn_context_model(&context.at(1), "gpt-6.1-sol"),
+                thread_settings_tier(&context.at(1), Some("default")),
+                token_count_buckets(&context.at(2), 1_000, 500, 100, 0, Some("codex")),
+            ];
+            write_jsonl(&file, &initial);
+            let boundary = crate::quota::codex::PeriodBoundary::from_start(
+                super::system_time_from_unix_nanos(
+                    super::parse_timestamp_nanos(Some(&serde_json::Value::String(context.at(5))))
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let mut tracker = context.tracker();
+            if incremental {
+                tracker.enable_incremental_for_test();
+                tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+            }
+            append_jsonl(
+                &file,
+                &thread_settings_tier(&context.at(3), Some("priority")),
+            );
+            if incremental {
+                tracker.mark_changed_for_test(file.clone());
+                let (_, diagnostics) = tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+                assert_eq!(diagnostics.token_events_added, 0);
+                // 设置单独写入并保存缓存后，重启仍要把下一条增量归到 Fast。
+                tracker = context.tracker();
+                tracker.enable_incremental_for_test();
+                tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+            }
+            for event in [
+                // 切换档位后的旧用量快照仍应去重，不能重新计一次 Fast。
+                token_count_buckets(&context.at(4), 1_000, 500, 100, 0, Some("codex")),
+                turn_context_model(&context.at(5), "gpt-6.1-sol"),
+                token_count_buckets(&context.at(6), 2_000, 1_000, 200, 0, Some("codex")),
+                thread_settings_tier(&context.at(7), Some("default")),
+                token_count_buckets(&context.at(8), 3_000, 1_500, 300, 0, Some("codex")),
+            ] {
+                append_jsonl(&file, &event);
+            }
+            if incremental {
+                tracker.mark_changed_for_test(file);
+            }
+            let (snapshot, diagnostics) = tracker
+                .refresh_for_period(&context.date, Some(&boundary))
+                .unwrap();
+            assert_eq!(
+                (snapshot.today_tokens, snapshot.current_period_tokens),
+                (6_600, 5_500),
+                "incremental={incremental}"
+            );
+            let today = snapshot.today_volume.unwrap();
+            assert_eq!(today.cache_hit_percent_tenths(), Some(500));
+            assert_eq!(today.0.len(), 2, "普通档与 Fast 必须分桶");
+            assert!(
+                (today.cost(&prices).unwrap() - 0.0164).abs() < 1e-12,
+                "incremental={incremental}"
+            );
+            assert!(
+                (snapshot.period_volume.unwrap().cost(&prices).unwrap() - 0.01435).abs() < 1e-12,
+                "incremental={incremental}"
+            );
+            if incremental {
+                assert_eq!(
+                    diagnostics.mode,
+                    super::super::RefreshMode::WatcherIncremental
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_tier_aliases_and_resets() {
+        use crate::quota::pricing::ServiceTier;
+        let prices = crate::quota::pricing::PriceTable::from_pricing_md(
+            crate::quota::pricing::OFFICIAL_PRICING,
+        )
+        .unwrap();
+        for (label, value, expected, cost) in [
+            (
+                "priority",
+                Some("priority"),
+                Some(ServiceTier::Fast),
+                Some(0.0123),
+            ),
+            ("fast", Some("fast"), Some(ServiceTier::Fast), Some(0.0123)),
+            (
+                "default",
+                Some("default"),
+                Some(ServiceTier::Standard),
+                Some(0.0082),
+            ),
+            ("null", None, None, Some(0.0082)),
+            ("missing", None, None, Some(0.0082)),
+            (
+                "unknown",
+                Some("future-tier"),
+                Some(ServiceTier::Unknown("future-tier".to_owned())),
+                None,
+            ),
+            (
+                "ultrafast",
+                Some("ultrafast"),
+                Some(ServiceTier::Ultrafast),
+                None,
+            ),
+            (
+                "number",
+                None,
+                Some(ServiceTier::Unknown("1".to_owned())),
+                None,
+            ),
+            (
+                "blank",
+                Some(""),
+                Some(ServiceTier::Unknown(String::new())),
+                None,
+            ),
+        ] {
+            let context = TestContext::new("tier-alias-reset");
+            let mut setting = thread_settings_tier(&context.at(3), value);
+            if label == "missing" {
+                setting["payload"]["thread_settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("service_tier");
+            } else if label == "number" {
+                setting["payload"]["thread_settings"]["service_tier"] = serde_json::json!(1);
+            }
+            write_jsonl(
+                &context.rollout(PARENT_ID),
+                &[
+                    session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                    turn_context_model(&context.at(1), "gpt-6.1-sol"),
+                    thread_settings_tier(&context.at(1), Some("priority")),
+                    token_count_buckets(&context.at(2), 1_000, 500, 100, 0, Some("codex")),
+                    setting,
+                    token_count_buckets(&context.at(4), 2_000, 1_000, 200, 0, Some("codex")),
+                ],
+            );
+            let mut tracker = context.tracker();
+            let snapshot = tracker.refresh_for_date(&context.date).unwrap().0;
+            assert_eq!(
+                tracker.cache.files[0].events.last().unwrap().service_tier,
+                expected,
+                "{label}"
+            );
+            let actual = snapshot.today_volume.unwrap().cost(&prices);
+            assert_eq!(actual.is_some(), cost.is_some(), "{label}");
+            if let (Some(actual), Some(expected)) = (actual, cost) {
+                assert!((actual - expected).abs() < 1e-12, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn speed_context_scan_modes_agree() {
+        use crate::quota::pricing::{ContextBand, PriceTable, ServiceTier};
+        let prices = PriceTable::from_pricing_md(crate::quota::pricing::OFFICIAL_PRICING).unwrap();
+        for incremental in [false, true] {
+            let context = TestContext::new("speed-context");
+            let file = context.rollout(PARENT_ID);
+            write_jsonl(
+                &file,
+                &[
+                    session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                    turn_context_model(&context.at(1), "gpt-6-astra"),
+                    thread_settings_tier(&context.at(1), Some("default")),
+                    token_count_buckets(&context.at(2), 272_000, 100_000, 100, 0, Some("codex")),
+                ],
+            );
+            let boundary = crate::quota::codex::PeriodBoundary::from_start(
+                super::system_time_from_unix_nanos(
+                    super::parse_timestamp_nanos(Some(&serde_json::Value::String(context.at(3))))
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let mut tracker = context.tracker();
+            if incremental {
+                tracker.enable_incremental_for_test();
+                tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+            }
+            for event in [
+                thread_settings_tier(&context.at(3), Some("fast")),
+                token_count_buckets(&context.at(4), 272_001, 100_000, 200, 0, Some("codex")),
+                thread_settings_tier(&context.at(5), Some("ultrafast")),
+            ] {
+                append_jsonl(&file, &event);
+            }
+            if incremental {
+                tracker.mark_changed_for_test(file.clone());
+                tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+                tracker = context.tracker();
+                tracker.enable_incremental_for_test();
+                tracker
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+                assert_eq!(
+                    tracker.cache.files[0].current_service_tier,
+                    Some(ServiceTier::Ultrafast)
+                );
+            }
+            let mut small_request =
+                token_count_buckets(&context.at(8), 100_000, 50_000, 100, 0, Some("codex"));
+            // 累计量超过阈值，并不代表这次 100K 输入请求应走长上下文价。
+            small_request["payload"]["info"]["total_token_usage"] = serde_json::json!({
+                "input_tokens": 10_000_000, "cached_input_tokens": 5_000_000,
+                "output_tokens": 10_000, "total_tokens": 10_010_000,
+            });
+            for event in [
+                // 设置切换后的旧快照仍然去重。
+                token_count_buckets(&context.at(6), 272_001, 100_000, 200, 0, Some("codex")),
+                token_count_buckets(&context.at(7), 300_000, 200_000, 300, 0, Some("codex")),
+                small_request,
+            ] {
+                append_jsonl(&file, &event);
+            }
+            if incremental {
+                tracker.mark_changed_for_test(file);
+            }
+            let (snapshot, _) = tracker
+                .refresh_for_period(&context.date, Some(&boundary))
+                .unwrap();
+            assert_eq!(
+                (snapshot.today_tokens, snapshot.current_period_tokens),
+                (944_701, 672_601),
+                "incremental={incremental}"
+            );
+            let today = snapshot.today_volume.unwrap();
+            assert_eq!(today.cache_hit_percent_tenths(), Some(477));
+            assert_eq!(today.0.len(), 4);
+            assert!(today.0.iter().any(|(_, volume)| volume.service_tier
+                == Some(ServiceTier::Ultrafast)
+                && volume.context == ContextBand::Short));
+            assert!(
+                (today.cost(&prices).unwrap() - 27.00004).abs() < 1e-10,
+                "incremental={incremental}"
+            );
+            assert!(
+                (snapshot.period_volume.unwrap().cost(&prices).unwrap() - 25.17504).abs() < 1e-10,
+                "incremental={incremental}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_tier_survives_cached_restart() {
+        use crate::quota::pricing::ServiceTier;
+        let context = TestContext::new("unknown-tier-cache");
+        let file = context.rollout(PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                turn_context_model(&context.at(1), "gpt-6.1-sol"),
+                thread_settings_tier(&context.at(2), Some("flex")),
+            ],
+        );
+        context.tracker().refresh_for_date(&context.date).unwrap();
+        append_jsonl(
+            &file,
+            &token_count_buckets(&context.at(3), 1_000, 500, 100, 0, Some("codex")),
+        );
+        let mut tracker = context.tracker();
+        let (snapshot, _) = tracker.refresh_for_date(&context.date).unwrap();
+        assert_eq!(
+            tracker.cache.files[0].events[0].service_tier,
+            Some(ServiceTier::Unknown("flex".to_owned()))
+        );
+        let prices = crate::quota::pricing::PriceTable::from_pricing_md(
+            crate::quota::pricing::OFFICIAL_PRICING,
+        )
+        .unwrap();
+        let volumes = snapshot.today_volume.unwrap();
+        assert_eq!(volumes.cost(&prices), None);
+        assert!(volumes.price_issues(&prices).0.is_empty());
+        assert_eq!(snapshot.today_tokens, 1_100);
+    }
+
+    #[test]
+    fn ultrafast_cache_upgrade_reparses_logs() {
+        let context = TestContext::new("ultrafast-cache-upgrade");
+        write_jsonl(
+            &context.rollout(PARENT_ID),
+            &[
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                turn_context_model(&context.at(1), "gpt-6-astra"),
+                thread_settings_tier(&context.at(1), Some("ultrafast")),
+                token_count_buckets(&context.at(2), 1_000, 500, 100, 0, Some("codex")),
+            ],
+        );
+        context.tracker().refresh_for_date(&context.date).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&context.cache).unwrap()).unwrap();
+        legacy["version"] = serde_json::json!(9);
+        for file in legacy["files"].as_array_mut().unwrap() {
+            // v9 已把无法识别的 Ultrafast 保存为普通档位的 None。
+            file["current_service_tier"] = serde_json::Value::Null;
+            for event in file["events"].as_array_mut().unwrap() {
+                event["service_tier"] = serde_json::Value::Null;
+            }
+        }
+        fs::write(&context.cache, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let prices = crate::quota::pricing::PriceTable::from_pricing_md(
+            crate::quota::pricing::OFFICIAL_PRICING,
+        )
+        .unwrap();
+        let (snapshot, diagnostics) = context.tracker().refresh_for_date(&context.date).unwrap();
+        assert_eq!(
+            (diagnostics.files_read, diagnostics.token_events_added),
+            (1, 1)
+        );
+        assert!((snapshot.today_volume.unwrap().cost(&prices).unwrap() - 0.063).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model_switch_scan_modes_agree() {
+        let prices = crate::quota::pricing::PriceTable::for_test(&[
+            ("model-a", 1.0, 0.1, 2.0),
+            ("model-b", 10.0, 1.0, 20.0),
+        ]);
         for incremental in [false, true] {
             for source in ["codex", "codex-other"] {
                 let context = TestContext::new("identical-model-switch");
@@ -971,6 +1376,9 @@ mod tests {
                 (
                     Some("gpt-5.6-sol".to_owned()),
                     TokenVolume {
+                        context: crate::quota::pricing::ContextBand::Short,
+                        details_missing: false,
+                        service_tier: None,
                         uncached_input: 25_445 - 18_176,
                         cached_input: 18_176,
                         output: 182
@@ -979,6 +1387,9 @@ mod tests {
                 (
                     Some("gpt-6-astra".to_owned()),
                     TokenVolume {
+                        context: crate::quota::pricing::ContextBand::Short,
+                        details_missing: false,
+                        service_tier: None,
                         uncached_input: 2_000,
                         cached_input: 8_000,
                         output: 100
@@ -1006,6 +1417,9 @@ mod tests {
             Some(ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 1_000,
                     cached_input: 0,
                     output: 10
@@ -1043,6 +1457,9 @@ mod tests {
             Some(ModelVolumes(vec![(
                 Some("gpt-5.6-sol".to_owned()),
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Unknown,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 1_490,
                     cached_input: 0,
                     output: 10

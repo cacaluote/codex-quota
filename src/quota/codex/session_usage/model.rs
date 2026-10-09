@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::CACHE_VERSION;
+use crate::quota::pricing::ServiceTier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct UsageCacheV1 {
@@ -54,6 +55,10 @@ pub(super) struct FileCache {
     pub(super) offset: u64,
     pub(super) root: Option<RootMeta>,
     pub(super) events: Vec<TokenEvent>,
+    /// Historical entries before this UTC boundary may have been pruned;
+    /// retained events still reconstruct the parser's continuation state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) history_start_nanos: Option<i64>,
     pub(super) high_water: Option<UsageHighWater>,
     pub(super) max_timestamp_nanos: Option<i64>,
     pub(super) token_without_timestamp: bool,
@@ -62,6 +67,9 @@ pub(super) struct FileCache {
     pub(super) latest_rate_limits: Option<RateLimitSnapshotEntry>,
     /// 最近一次 `turn_context.payload.model`，用于给后续 `token_count` 事件归属模型。
     pub(super) current_model: Option<String>,
+    /// 最近一次线程设置中的请求档位；旧日志缺失时为 None。
+    #[serde(default)]
+    pub(super) current_service_tier: Option<ServiceTier>,
     /// 本文件解析出的全部 credits 余额观测（含无 Token 明细的纯额度快照），
     /// 独立于 Token 事件——它们是账户余额时间线的原始素材。
     #[serde(default)]
@@ -86,6 +94,7 @@ impl FileCache {
             offset: 0,
             root: None,
             events: Vec::new(),
+            history_start_nanos: None,
             high_water: None,
             max_timestamp_nanos: None,
             token_without_timestamp: false,
@@ -93,6 +102,7 @@ impl FileCache {
             parse_errors: 0,
             latest_rate_limits: None,
             current_model: None,
+            current_service_tier: None,
             balance_observations: Vec::new(),
         }
     }
@@ -195,6 +205,9 @@ pub(super) struct TokenEvent {
     pub(super) delta_output: u64,
     /// 事件归属的模型（最近一次 `turn_context.payload.model`；会话中途可切换）。
     pub(super) model: Option<String>,
+    /// 请求档位设置，不是服务端逐请求的最终计费回执。
+    #[serde(default)]
+    pub(super) service_tier: Option<ServiceTier>,
     /// 事件自带的 codex 额度快照：5h/周窗口进度。服务端封顶 100（10k+ 真实
     /// 事件无一越界），触顶后冻结不再增长——溢出用量由此可识别。
     #[serde(default)]

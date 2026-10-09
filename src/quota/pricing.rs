@@ -1,93 +1,301 @@
-//! models.dev 价格表：把分桶 token 用量换算成 API 牌价等价美元。
-//!
-//! 数据两层兜底：app-data 里的上次成功拉取 → 空表（成本列显示 `--`）。
-//! 没有内置快照——新模型月月发布，静态清单必然过期；首次安装离线时
-//! 成本列为 `--` 是诚实未知，联网后 30 秒内由在线刷新补齐。
+//! 官方 API 价格：下载 Markdown，校验后保存结构化缓存。
+
+mod markdown;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-const MODELS_DEV_URL: &str = "https://models.dev/api.json";
-const CACHE_FILE_NAME: &str = "models-dev-openai.json";
+const PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing.md";
+const CACHE_FILE_NAME: &str = "openai-pricing-v1.json";
+const CACHE_VERSION: u32 = 1;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SHORT_CONTEXT_LIMIT: u64 = 272_000;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceTier {
+    Standard,
+    Fast,
+    Ultrafast,
+    Unknown(String),
+}
+
+impl ServiceTier {
+    pub(crate) fn from_codex(value: &str) -> Self {
+        match value {
+            "default" | "standard" => Self::Standard,
+            "priority" | "fast" => Self::Fast,
+            "ultrafast" => Self::Ultrafast,
+            _ => Self::Unknown(value.to_owned()),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Fast => "Fast",
+            Self::Ultrafast => "Ultrafast",
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ContextBand {
+    Short,
+    Long,
+    #[default]
+    Unknown,
+}
+
+impl ContextBand {
+    pub(crate) fn from_input(input: Option<u64>) -> Self {
+        match input {
+            Some(value) if value <= SHORT_CONTEXT_LIMIT => Self::Short,
+            Some(_) => Self::Long,
+            None => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Short => "短上下文",
+            Self::Long => "长上下文",
+            Self::Unknown => "上下文未知",
+        }
+    }
+}
+
+/// USD / 1M tokens。缺失单价只在对应的 token 数非零时阻止计价。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ModelPrice {
-    /// 未缓存 input，USD / 1M tokens。
-    pub(crate) input: f64,
-    /// 缓存命中的 input（`cache_read`），USD / 1M tokens。
-    pub(crate) cached_input: f64,
-    /// output（含 reasoning），USD / 1M tokens。
-    pub(crate) output: f64,
+    pub(crate) input: Option<f64>,
+    pub(crate) cached_input: Option<f64>,
+    pub(crate) output: Option<f64>,
+}
+
+impl ModelPrice {
+    fn has_price(self) -> bool {
+        self.input.is_some() || self.cached_input.is_some() || self.output.is_some()
+    }
+
+    fn valid(self) -> bool {
+        [self.input, self.cached_input, self.output]
+            .into_iter()
+            .flatten()
+            .all(|price| price.is_finite() && price >= 0.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ContextPrices {
+    Flat {
+        price: ModelPrice,
+    },
+    Split {
+        short: ModelPrice,
+        long: Option<ModelPrice>,
+    },
+}
+
+impl ContextPrices {
+    fn lookup(&self, band: ContextBand) -> Result<ModelPrice, LookupError> {
+        match (self, band) {
+            (Self::Flat { price }, _) | (Self::Split { short: price, .. }, ContextBand::Short) => {
+                Ok(*price)
+            }
+            (Self::Split { long, .. }, ContextBand::Long) => {
+                long.ok_or(LookupError::MissingContext)
+            }
+            (Self::Split { .. }, ContextBand::Unknown) => Err(LookupError::UnknownContext),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        match self {
+            Self::Flat { price } => price.valid(),
+            Self::Split { short, long } => short.valid() && long.is_none_or(ModelPrice::valid),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct ModelPrices {
+    standard: Option<ContextPrices>,
+    fast: Option<ContextPrices>,
+    ultrafast: Option<ContextPrices>,
+}
+
+impl ModelPrices {
+    fn get(&self, tier: &ServiceTier) -> Option<&ContextPrices> {
+        match tier {
+            ServiceTier::Standard => self.standard.as_ref(),
+            ServiceTier::Fast => self.fast.as_ref(),
+            ServiceTier::Ultrafast => self.ultrafast.as_ref(),
+            ServiceTier::Unknown(_) => None,
+        }
+    }
+
+    fn insert(&mut self, tier: &ServiceTier, prices: ContextPrices) -> Result<(), String> {
+        let slot = match tier {
+            ServiceTier::Standard => &mut self.standard,
+            ServiceTier::Fast => &mut self.fast,
+            ServiceTier::Ultrafast => &mut self.ultrafast,
+            ServiceTier::Unknown(_) => return Err("未支持的价格档位".to_owned()),
+        };
+        if slot.as_ref().is_some_and(|existing| *existing != prices) {
+            return Err(format!("{} 重复价格冲突", tier.label()));
+        }
+        *slot = Some(prices);
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        [&self.standard, &self.fast, &self.ultrafast]
+            .into_iter()
+            .flatten()
+            .all(ContextPrices::valid)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LookupError {
+    MissingModel,
+    MissingTier,
+    MissingContext,
+    UnknownTier,
+    UnknownContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum PriceField {
+    Model,
+    Tier,
+    Context,
+    Input,
+    CachedInput,
+    Output,
+}
+
+/// 补拉和闭环必须检查同一模型、档位、上下文及价格项。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PriceGap {
+    pub(crate) model: String,
+    pub(crate) tier: ServiceTier,
+    pub(crate) context: ContextBand,
+    pub(crate) field: PriceField,
+}
+
+impl PriceGap {
+    pub(crate) fn description(&self) -> String {
+        let field = match self.field {
+            PriceField::Model => "模型条目",
+            PriceField::Tier => "档位价格",
+            PriceField::Context => "上下文价格",
+            PriceField::Input => "输入价格",
+            PriceField::CachedInput => "缓存输入价格",
+            PriceField::Output => "输出价格",
+        };
+        format!(
+            "{} / {} / {} / {field}",
+            self.model,
+            self.tier.label(),
+            self.context.label()
+        )
+    }
+
+    pub(crate) fn resolved(&self, table: &PriceTable) -> bool {
+        let Ok(price) = table.lookup(Some(&self.model), Some(&self.tier), self.context) else {
+            return false;
+        };
+        match self.field {
+            PriceField::Model | PriceField::Tier | PriceField::Context => true,
+            PriceField::Input => price.input.is_some(),
+            PriceField::CachedInput => price.cached_input.is_some(),
+            PriceField::Output => price.output.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct PriceTable {
-    models: HashMap<String, ModelPrice>,
-    /// 最近一次成功拉取的 UNIX 秒时间戳；None 表示从未拉取过。
+    models: HashMap<String, ModelPrices>,
     fetched_at: Option<u64>,
 }
 
 impl PriceTable {
-    /// app-data 上次成功拉取的价格表；没有（首次安装/文件损坏）时为
-    /// 空表，成本列显示 `--`，等在线刷新补齐。
     pub(crate) fn load() -> Self {
         crate::config::app_data_dir()
             .ok()
-            .and_then(|directory| std::fs::read_to_string(directory.join(CACHE_FILE_NAME)).ok())
-            .and_then(|text| serde_json::from_str::<PriceSnapshot>(&text).ok())
-            .map(PriceSnapshot::into_table)
+            .map(|directory| Self::load_from(&directory.join(CACHE_FILE_NAME)))
             .unwrap_or_default()
     }
 
-    /// 上次成功拉取的 UNIX 秒时间戳；从未拉取过则为 None。
+    fn load_from(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<PriceSnapshot>(&text).ok())
+            .filter(|snapshot| {
+                snapshot.version == CACHE_VERSION
+                    && snapshot.models.values().all(ModelPrices::valid)
+            })
+            .map(|snapshot| Self {
+                models: snapshot.models,
+                fetched_at: snapshot.fetched_at,
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn fetched_at(&self) -> Option<u64> {
         self.fetched_at
     }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.models.is_empty()
     }
 
-    /// 模型匹配回退链：精确 → 去日期后缀 → 逐段剥右侧变体后缀（-max/-spark 等
-    /// 回退到 base 模型价）。None 表示不计价——宁可少算不虚算。
-    pub(crate) fn lookup(&self, model: Option<&str>) -> Option<ModelPrice> {
-        let model = model?;
-        if let Some(price) = self.models.get(model) {
-            return Some(*price);
+    pub(crate) fn lookup(
+        &self,
+        model: Option<&str>,
+        tier: Option<&ServiceTier>,
+        context: ContextBand,
+    ) -> Result<ModelPrice, LookupError> {
+        let tier = tier.unwrap_or(&ServiceTier::Standard);
+        if matches!(tier, ServiceTier::Unknown(_)) {
+            return Err(LookupError::UnknownTier);
         }
-        if let Some((base, suffix)) = model.rsplit_once('-')
-            && is_release_date(suffix)
-            && let Some(price) = self.models.get(base)
-        {
-            return Some(*price);
-        }
-        let mut prefix = model;
-        while let Some((stripped, _)) = prefix.rsplit_once('-') {
-            prefix = stripped;
-            if let Some(price) = self.models.get(prefix) {
-                return Some(*price);
-            }
-        }
-        None
+        let model = model.ok_or(LookupError::MissingModel)?;
+        let prices = self
+            .models
+            .get(model)
+            .or_else(|| release_base(model).and_then(|base| self.models.get(base)))
+            .ok_or(LookupError::MissingModel)?;
+        prices
+            .get(tier)
+            .ok_or(LookupError::MissingTier)?
+            .lookup(context)
     }
 
-    /// 从 models.dev 拉取并替换内存价格表，成功后写入 app-data 缓存。
-    /// 失败时保留现有表，由调用方决定是否记录日志。
+    /// 解析完全成功才替换旧表；网络和格式错误均保留成功缓存。
     pub(crate) fn refresh(&mut self) -> Result<(), AppError> {
-        // Windows 上 native-tls 走系统 SChannel：不打包 rustls+ring，
-        // 证书验证用系统证书库。provider 默认是 Rustls 且不会被自动
-        // 拾取，必须显式设置。
+        self.refresh_from(PRICING_URL, crate::config::app_data_dir().ok().as_deref())
+    }
+
+    fn refresh_from(&mut self, url: &str, directory: Option<&Path>) -> Result<(), AppError> {
+        let body = Self::fetch_markdown(url)?;
+        self.replace_markdown(&body, directory)
+    }
+
+    fn fetch_markdown(url: &str) -> Result<String, AppError> {
         let agent = ureq::Agent::config_builder()
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .provider(ureq::tls::TlsProvider::NativeTls)
-                    // 用系统证书库（Windows 证书存储随系统更新），而非
-                    // 打包 Mozilla 根证书数据。
                     .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                     .build(),
             )
@@ -95,101 +303,85 @@ impl PriceTable {
             .build()
             .new_agent();
         let mut response = agent
-            .get(MODELS_DEV_URL)
+            .get(url)
+            .header("User-Agent", "codex-quota")
+            .header("Accept", "text/markdown")
             .call()
-            .map_err(|error| AppError::Protocol(format!("models.dev 拉取失败：{error}")))?;
-        let body = response
+            .map_err(|error| AppError::Protocol(format!("OpenAI 价格拉取失败：{error}")))?;
+        response
             .body_mut()
             .read_to_string()
-            .map_err(|error| AppError::Protocol(format!("models.dev 响应读取失败：{error}")))?;
-        let table = Self::from_models_dev(&body)
-            .ok_or_else(|| AppError::Protocol("models.dev 响应缺少 openai 价格".to_owned()))?;
-        if let Ok(directory) = crate::config::app_data_dir()
-            && let Ok(json) = serde_json::to_string(&PriceSnapshot::from(&table))
+            .map_err(|error| AppError::Protocol(format!("OpenAI 价格响应读取失败：{error}")))
+    }
+
+    fn replace_markdown(&mut self, body: &str, directory: Option<&Path>) -> Result<(), AppError> {
+        let table = Self::from_pricing_md(body)
+            .map_err(|error| AppError::Protocol(format!("OpenAI 价格解析失败：{error}")))?;
+        if let Some(directory) = directory
+            && let Err(error) = table.save_to(&directory.join(CACHE_FILE_NAME))
         {
-            let _ = std::fs::write(directory.join(CACHE_FILE_NAME), json);
+            crate::logging::log(&format!("OpenAI 价格缓存写入失败：{error}"));
         }
         *self = table;
         Ok(())
     }
 
-    pub(crate) fn from_models_dev(text: &str) -> Option<Self> {
-        let api: ModelsDevApi = serde_json::from_str(text).ok()?;
-        let provider = api.openai?;
-        Some(Self {
-            models: provider
-                .models
-                .into_iter()
-                .filter_map(|(id, model)| {
-                    let cost = model.cost?;
-                    Some((
-                        id,
-                        ModelPrice {
-                            input: cost.input,
-                            // models.dev 缺 cache_read 时按原价上界处理。
-                            cached_input: cost.cache_read.unwrap_or(cost.input),
-                            output: cost.output,
-                        },
-                    ))
-                })
-                .collect(),
+    fn save_to(&self, path: &Path) -> Result<(), std::io::Error> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::PCWSTR;
+        let directory = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("价格缓存没有父目录"))?;
+        std::fs::create_dir_all(directory)?;
+        let snapshot = PriceSnapshot {
+            version: CACHE_VERSION,
+            fetched_at: self.fetched_at,
+            models: self.models.clone(),
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)?;
+        let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: 两个缓冲区均以 NUL 结尾，并在调用期间存活。
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(std::io::Error::other)
+    }
+
+    pub(crate) fn from_pricing_md(text: &str) -> Result<Self, String> {
+        Ok(Self {
+            models: markdown::parse_prices(text)?,
             fetched_at: Some(unix_now()),
         })
     }
-}
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct PriceSnapshot {
-    #[serde(default)]
-    models: HashMap<String, ModelPriceEntry>,
-    /// 拉取时刻的 UNIX 秒时间戳；旧格式文件缺此字段按从未拉取处理。
-    #[serde(default)]
-    fetched_at: Option<u64>,
-}
-
-impl PriceSnapshot {
-    fn into_table(self) -> PriceTable {
-        PriceTable {
-            fetched_at: self.fetched_at,
-            models: self
-                .models
-                .into_iter()
-                .map(|(id, entry)| {
-                    (
-                        id,
-                        ModelPrice {
-                            input: entry.input,
-                            cached_input: entry.cached_input,
-                            output: entry.output,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<&PriceTable> for PriceSnapshot {
-    fn from(table: &PriceTable) -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: &[(&str, f64, f64, f64)]) -> Self {
         Self {
-            fetched_at: table.fetched_at,
-            models: table
-                .models
+            fetched_at: None,
+            models: entries
                 .iter()
-                .map(|(id, price)| {
+                .map(|(id, input, cached, output)| {
                     (
-                        id.clone(),
-                        ModelPriceEntry {
-                            input: price.input,
-                            cached_input: price.cached_input,
-                            output: price.output,
+                        (*id).to_owned(),
+                        ModelPrices {
+                            standard: Some(ContextPrices::Flat {
+                                price: ModelPrice {
+                                    input: Some(*input),
+                                    cached_input: Some(*cached),
+                                    output: Some(*output),
+                                },
+                            }),
+                            ..ModelPrices::default()
                         },
                     )
                 })
@@ -199,165 +391,32 @@ impl From<&PriceTable> for PriceSnapshot {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ModelPriceEntry {
-    input: f64,
-    cached_input: f64,
-    output: f64,
+struct PriceSnapshot {
+    version: u32,
+    fetched_at: Option<u64>,
+    models: HashMap<String, ModelPrices>,
 }
 
-#[derive(Deserialize, Default)]
-struct ModelsDevApi {
-    #[serde(default)]
-    openai: Option<ModelsDevProvider>,
+fn release_base(model: &str) -> Option<&str> {
+    let start = model.len().checked_sub(11)?;
+    if model.as_bytes()[start] != b'-' {
+        return None;
+    }
+    let date = model.get(start + 1..)?;
+    let format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]").ok()?;
+    time::Date::parse(date, &format).ok()?;
+    model.get(..start)
 }
 
-#[derive(Deserialize, Default)]
-struct ModelsDevProvider {
-    #[serde(default)]
-    models: HashMap<String, ModelsDevModel>,
-}
-
-#[derive(Deserialize, Default)]
-struct ModelsDevModel {
-    #[serde(default)]
-    cost: Option<ModelsDevCost>,
-}
-
-#[derive(Deserialize)]
-struct ModelsDevCost {
-    input: f64,
-    output: f64,
-    #[serde(default)]
-    cache_read: Option<f64>,
-}
-
-/// 形如 `2026-01-15` 的发布日期后缀。
-fn is_release_date(suffix: &str) -> bool {
-    suffix.len() == 10
-        && suffix.starts_with('2')
-        && suffix
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '-')
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) const OFFICIAL_PRICING: &str = include_str!("pricing/fixtures/openai-pricing.md");
 
-    fn table_with(entries: &[(&str, f64, f64, f64)]) -> PriceTable {
-        PriceTable {
-            fetched_at: None,
-            models: entries
-                .iter()
-                .map(|(id, input, cached, output)| {
-                    (
-                        (*id).to_owned(),
-                        ModelPrice {
-                            input: *input,
-                            cached_input: *cached,
-                            output: *output,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn lookup_matches_exact_model() {
-        let table = table_with(&[("gpt-5.6-sol", 4.0, 0.4, 20.0)]);
-
-        assert_eq!(
-            table.lookup(Some("gpt-5.6-sol")),
-            Some(ModelPrice {
-                input: 4.0,
-                cached_input: 0.4,
-                output: 20.0
-            })
-        );
-    }
-
-    #[test]
-    fn lookup_strips_variant_suffixes() {
-        let table = table_with(&[("gpt-5.1", 1.10, 0.11, 9.0)]);
-
-        assert_eq!(
-            table.lookup(Some("gpt-5.1-codex-max")),
-            Some(ModelPrice {
-                input: 1.10,
-                cached_input: 0.11,
-                output: 9.0
-            })
-        );
-    }
-
-    #[test]
-    fn lookup_strips_release_date_suffix() {
-        let table = table_with(&[("gpt-5.6-sol", 4.0, 0.4, 20.0)]);
-
-        assert!(table.lookup(Some("gpt-5.6-sol-2026-01-15")).is_some());
-    }
-
-    #[test]
-    fn lookup_fallbacks_and_missing_names() {
-        let table = table_with(&[("gpt-5.6-sol", 4.0, 0.4, 20.0)]);
-
-        assert_eq!(table.lookup(Some("claude-opus")), None);
-        // 逐段剥离回退是设计行为：未知后缀（-x9）按 base 模型价近似。
-        assert_eq!(
-            table.lookup(Some("gpt-5.6-sol-x9")),
-            Some(ModelPrice {
-                input: 4.0,
-                cached_input: 0.4,
-                output: 20.0
-            })
-        );
-        assert_eq!(table.lookup(None), None);
-    }
-
-    #[test]
-    fn price_response_allows_unknown_fields() {
-        // 真实响应带 tiers/modes/experimental 等字段，反序列化必须容忍。
-        let text = r#"{"openai":{"id":"openai","models":{"gpt-5.6-sol":{"id":"gpt-5.6-sol","cost":{"input":4,"output":20,"cache_read":0.4,"cache_write":5,"tiers":[{"input":8}]},"experimental":{}},"gpt-no-cache":{"cost":{"input":2,"output":8}}}}}"#;
-
-        let table = PriceTable::from_models_dev(text).expect("应解析出 openai 价格表");
-
-        assert_eq!(
-            table.lookup(Some("gpt-5.6-sol")),
-            Some(ModelPrice {
-                input: 4.0,
-                cached_input: 0.4,
-                output: 20.0
-            })
-        );
-        // 缺 cache_read 的条目按原价上界处理。
-        assert_eq!(
-            table.lookup(Some("gpt-no-cache")),
-            Some(ModelPrice {
-                input: 2.0,
-                cached_input: 2.0,
-                output: 8.0
-            })
-        );
-    }
-
-    #[test]
-    fn price_response_requires_openai() {
-        assert!(PriceTable::from_models_dev(r#"{"other":{}}"#).is_none());
-    }
-
-    #[test]
-    fn price_timestamp_roundtrip() {
-        let table = PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-        )
-        .expect("应解析出价格表");
-
-        let fetched_at = table.fetched_at().expect("解析时刻应被记录");
-        let json = serde_json::to_string(&PriceSnapshot::from(&table)).unwrap();
-        let parsed: PriceSnapshot = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.fetched_at, Some(fetched_at));
-        assert_eq!(parsed.into_table().fetched_at(), Some(fetched_at));
-    }
-}
+#[cfg(test)]
+mod tests;

@@ -20,7 +20,7 @@ use session_usage::{ModelVolumes, SessionUsageTracker};
 use super::model::{
     AppState, ConnectionStatus, DEFAULT_REFRESH_INTERVAL, QuotaPull, QuotaSnapshot,
 };
-use super::pricing::PriceTable;
+use super::pricing::{PriceGap, PriceTable};
 use crate::codex_install::find_app_server_backend;
 use crate::error::AppError;
 
@@ -33,11 +33,11 @@ const PRICE_REFRESH_START_DELAY: Duration = Duration::from_secs(30);
 const PRICE_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
 const PRICE_FAILURE_SLOW_AFTER: Duration = Duration::from_hours(6);
 const PRICE_FAILURE_SLOW_INTERVAL: Duration = Duration::from_hours(6);
-/// 缺价触发的补拉之间至少隔这么久：新模型发布当天 models.dev 往往还没上价，
+/// 缺价触发的补拉之间至少隔这么久：新模型发布当天官方文档可能尚未同步价格，
 /// 没有冷却就会每轮本地刷新都发一次请求。日调度仍在兜底。
 const PRICE_GAP_MIN_INTERVAL: Duration = Duration::from_hours(1);
 /// 缺价模型的补拉窗口：从首次见到它起这么久内允许按 `PRICE_GAP_MIN_INTERVAL`
-/// 反复补拉（最长 6 小时），之后停手等日调度。models.dev 可能永远不会上价的
+/// 反复补拉（最长 6 小时），之后停手等日调度。官方可能永远不会上价的
 /// 模型名（本地变体后缀之类）不该让程序每小时发请求直到永远。
 const PRICE_GAP_RETRY_WINDOW: Duration = Duration::from_hours(6);
 const PULL_RETRY_SECONDS: [u64; 3] = [1, 2, 5];
@@ -401,6 +401,7 @@ impl PricePipeline {
             self.last_attempt = Some(Instant::now());
             match self.table.refresh() {
                 Ok(()) => {
+                    crate::logging::log("OpenAI 官方 API 价格已更新：pricing.md");
                     self.failures = 0;
                     self.first_failure = None;
                     self.next_refresh = Instant::now() + PRICE_REFRESH_INTERVAL;
@@ -416,7 +417,7 @@ impl PricePipeline {
                             self.failures,
                             now.saturating_duration_since(first),
                         );
-                    crate::logging::log(&format!("models.dev 价格刷新失败：{error}"));
+                    crate::logging::log(&format!("OpenAI 官方价格刷新失败：{error}"));
                 }
             }
             return;
@@ -439,7 +440,7 @@ impl PricePipeline {
     }
 }
 
-/// 一个缺价模型的等待状态。
+/// 一个价格缺口的等待状态。
 struct PendingGap {
     /// 首次观测到"有用量但没价"的时刻，补拉窗口从这里起算。
     first_seen: Instant,
@@ -449,40 +450,52 @@ struct PendingGap {
 
 /// 价格表缺口的观测状态，worker 线程局部、随主循环存活。
 ///
-/// 一份状态服务三件事：按模型去重的"缺价"日志、价格表补齐后的闭环日志，
-/// 以及"要不要提前补拉一次"的触发与停手判定。日志按模型去重（而不是每轮
-/// 本地刷新各报一次），所以它既不会刷屏，也不会因为补拉冷却而漏报。
+/// 按模型、档位、上下文及价格项去重日志，价格补齐后关闭对应缺口，
+/// 同时决定是否提前补拉。日志明细问题独立去重，不触发价格补拉。
 #[derive(Default)]
 struct PriceGaps {
-    /// 已经报过缺价、当前仍缺价的模型名（补价后移出，于是再次缺价会重报）。
-    reported: HashSet<String>,
-    /// 报过缺价、还在等价格表补齐的模型名 → 等待状态。
-    pending: HashMap<String, PendingGap>,
+    /// 已报过且仍缺失的价格项；补价后移出，再次缺价时重新报告。
+    reported: HashSet<PriceGap>,
+    diagnostic_reported: HashSet<String>,
+    /// 各价格项的等待状态。
+    pending: HashMap<PriceGap, PendingGap>,
     /// 还有"未停手"的缺口：主循环据此提前拉一次价格表（冷却见
     /// `PRICE_GAP_MIN_INTERVAL`）。
     wants_pull: bool,
 }
 
 impl PriceGaps {
+    fn observe_diagnostics(&mut self, diagnostics: &[String]) -> Vec<String> {
+        self.diagnostic_reported
+            .retain(|message| diagnostics.contains(message));
+        let mut lines = Vec::new();
+        for message in diagnostics {
+            if self.diagnostic_reported.insert(message.clone()) {
+                lines.push(message.clone());
+            }
+        }
+        lines.sort();
+        lines
+    }
+
     /// 用一次本地刷新的观测结果更新状态，返回本次要写进日志的行。
     ///
     /// 返回文本而不是直接写日志：日志是进程级单例，只有把"该说什么"和
     /// "写到哪"分开，测试才能断言前者。
     ///
-    /// `unpriced` 是本次刷新观测到的缺价模型名，可能同时来自今日与本期两个
+    /// `unpriced` 是本次刷新观测到的价格缺口，可能同时来自今日与本期两个
     /// 窗口（于是有重复）；去重与"报过没有"都在这里判定。结算与观测分开：
-    /// 先拿当前价格表结清所有还在等的模型——包括本次窗口里已经没有用量的
-    /// 那些——否则一个用完就不再出现的模型会让程序一直以为缺口还在。
-    fn observe(&mut self, unpriced: &[&str], prices: &PriceTable, now: Instant) -> Vec<String> {
+    /// 先拿当前价格表结清仍在等待的价格项，包括已离开当前窗口的用量。
+    fn observe(&mut self, unpriced: &[PriceGap], prices: &PriceTable, now: Instant) -> Vec<String> {
         let mut lines = Vec::new();
-        let mut tracked: Vec<String> = self.pending.keys().cloned().collect();
+        let mut tracked: Vec<PriceGap> = self.pending.keys().cloned().collect();
         // `HashMap` 迭代顺序不定，排序只为让日志行序稳定（测试断言得动）。
         tracked.sort_unstable();
         for model in tracked {
-            if prices.lookup(Some(&model)).is_some() {
+            if model.resolved(prices) && !unpriced.contains(&model) {
                 self.pending.remove(&model);
                 self.reported.remove(&model);
-                lines.push(format!("价格表已补齐：{model}"));
+                lines.push(format!("价格表已补齐：{}", model.description()));
                 continue;
             }
             if let Some(gap) = self.pending.get_mut(&model)
@@ -490,20 +503,21 @@ impl PriceGaps {
                 && now.saturating_duration_since(gap.first_seen) >= PRICE_GAP_RETRY_WINDOW
             {
                 gap.gave_up = true;
-                lines.push(format!("价格表仍缺模型：{model}（暂停补拉，等每日刷新）"));
+                lines.push(format!(
+                    "价格项仍缺失：{}（暂停补拉，等每日刷新）",
+                    model.description()
+                ));
             }
         }
         for name in unpriced {
-            // `insert` 返回 false 说明这个名字已经报过——日志只留一条开头。
-            if self.reported.insert((*name).to_owned()) {
-                lines.push(format!("价格表缺模型：{name}"));
+            // `insert` 返回 false 说明这个价格项已报告。
+            if self.reported.insert(name.clone()) {
+                lines.push(format!("价格项缺失：{}", name.description()));
             }
-            self.pending
-                .entry((*name).to_owned())
-                .or_insert(PendingGap {
-                    first_seen: now,
-                    gave_up: false,
-                });
+            self.pending.entry(name.clone()).or_insert(PendingGap {
+                first_seen: now,
+                gave_up: false,
+            });
         }
         self.wants_pull = self.pending.values().any(|gap| !gap.gave_up);
         lines
@@ -894,10 +908,9 @@ fn publish_local_usage_snapshot<F>(
         .period_volume
         .as_ref()
         .and_then(ModelVolumes::cache_hit_percent_tenths);
-    // 成本静默少算的唯一出口：把"有用量但价格表里没有"的模型交给缺口状态机
-    // （按模型名去重、并决定要不要提前补拉一次）。放在发布显示值之前，日志的
-    // 时序才与"这一份快照"对应。
-    let mut unpriced: Vec<&str> = Vec::new();
+    // 先观测各价格缺口和日志诊断，再发布同一份快照的显示值。
+    let mut unpriced = Vec::new();
+    let mut diagnostics = Vec::new();
     for volumes in [
         snapshot.today_volume.as_ref(),
         snapshot.period_volume.as_ref(),
@@ -905,12 +918,17 @@ fn publish_local_usage_snapshot<F>(
     .into_iter()
     .flatten()
     {
-        unpriced.extend(volumes.unpriced_models(&prices.table));
+        let (gaps, messages) = volumes.price_issues(&prices.table);
+        unpriced.extend(gaps);
+        diagnostics.extend(messages);
     }
     for line in prices
         .gaps
         .observe(&unpriced, &prices.table, Instant::now())
     {
+        crate::logging::log(&line);
+    }
+    for line in prices.gaps.observe_diagnostics(&diagnostics) {
         crate::logging::log(&line);
     }
     publish_local_cost(
@@ -1060,6 +1078,9 @@ fn period_total_value_estimate(
 fn should_log_local_usage_refresh(diagnostics: &session_usage::RefreshDiagnostics) -> bool {
     diagnostics.mode != session_usage::RefreshMode::WatcherIncremental
         || diagnostics.token_events_added != 0
+        || diagnostics.history_files_restored != 0
+        || diagnostics.token_events_pruned != 0
+        || diagnostics.balance_observations_pruned != 0
         || diagnostics.cache_write_failed
         || diagnostics.discovery_errors != 0
         || diagnostics.parse_errors != 0
@@ -1137,6 +1158,20 @@ fn local_usage_refresh_description(diagnostics: &session_usage::RefreshDiagnosti
             description,
             "；文件 {}/{}，新增 Token 事件 {}",
             diagnostics.files_scanned, diagnostics.files_read, diagnostics.token_events_added
+        );
+    }
+    if diagnostics.history_files_restored != 0 {
+        let _ = write!(
+            description,
+            "；历史恢复 {} 文件",
+            diagnostics.history_files_restored
+        );
+    }
+    if diagnostics.token_events_pruned != 0 || diagnostics.balance_observations_pruned != 0 {
+        let _ = write!(
+            description,
+            "；裁剪 {} Token 事件、{} 余额观测",
+            diagnostics.token_events_pruned, diagnostics.balance_observations_pruned
         );
     }
     if diagnostics.discovery_errors != 0
@@ -1985,6 +2020,15 @@ mod tests {
         );
     }
 
+    fn price_gap(model: &str) -> PriceGap {
+        PriceGap {
+            model: model.to_owned(),
+            tier: crate::quota::pricing::ServiceTier::Standard,
+            context: crate::quota::pricing::ContextBand::Short,
+            field: crate::quota::pricing::PriceField::Model,
+        }
+    }
+
     /// 缺价日志按模型名去重：一轮本地扫描每几秒就可能重跑一次，逐轮上报会把
     /// 日志刷满，也就没人看得见"到底缺哪个模型"。
     #[test]
@@ -1994,45 +2038,121 @@ mod tests {
         let prices = PriceTable::default();
 
         assert_eq!(
-            gaps.observe(&["gpt-new"], &prices, now),
-            vec!["价格表缺模型：gpt-new"]
+            gaps.observe(&[price_gap("gpt-new")], &prices, now),
+            vec![format!(
+                "价格项缺失：{}",
+                price_gap("gpt-new").description()
+            )]
         );
         assert!(gaps.wants_pull, "有缺口就该安排一次提前补拉");
 
         assert!(
-            gaps.observe(&["gpt-new"], &prices, now + Duration::from_mins(1))
-                .is_empty()
+            gaps.observe(
+                &[price_gap("gpt-new")],
+                &prices,
+                now + Duration::from_mins(1)
+            )
+            .is_empty()
         );
         assert!(gaps.wants_pull, "缺口还在，补拉意图应保持");
     }
 
-    /// "少算了"必须有闭合的另一半：价格表补齐时回写一条，并且缺口关上之后
-    /// 不再安排补拉——否则模型用完不再出现，程序会以为缺口永远在。
+    #[test]
+    fn tier_gap_keeps_log_deduplicated() {
+        let prices = crate::quota::pricing::PriceTable::for_test(&[("gpt-new", 2.0, 0.1, 10.0)]);
+        let mut gaps = PriceGaps::default();
+        let now = Instant::now();
+        let fast = PriceGap {
+            tier: crate::quota::pricing::ServiceTier::Fast,
+            field: crate::quota::pricing::PriceField::Tier,
+            ..price_gap("gpt-new")
+        };
+        gaps.observe(std::slice::from_ref(&fast), &prices, now);
+        assert!(
+            gaps.observe(
+                std::slice::from_ref(&fast),
+                &prices,
+                now + Duration::from_mins(1)
+            )
+            .is_empty(),
+            "普通价存在不代表 Fast 缺价已补齐"
+        );
+        assert!(gaps.wants_pull);
+    }
+
+    #[test]
+    fn tier_context_gaps_resolve_independently() {
+        use crate::quota::pricing::{ContextBand, PriceField, ServiceTier};
+        let mut gaps = PriceGaps::default();
+        let now = Instant::now();
+        let ultra = PriceGap {
+            model: "gpt-6.1-sol".to_owned(),
+            tier: ServiceTier::Ultrafast,
+            context: ContextBand::Short,
+            field: PriceField::Tier,
+        };
+        let long = PriceGap {
+            model: "gpt-5.5".to_owned(),
+            tier: ServiceTier::Fast,
+            context: ContextBand::Long,
+            field: PriceField::Context,
+        };
+        let original =
+            PriceTable::from_pricing_md(crate::quota::pricing::OFFICIAL_PRICING).unwrap();
+        assert_eq!(
+            gaps.observe(&[ultra.clone(), long.clone()], &original, now)
+                .len(),
+            2
+        );
+        let updated = crate::quota::pricing::OFFICIAL_PRICING.replace("| gpt-6-astra | $60.00", "| gpt-6.1-sol | $12.00 | $0.60 | - | $60.00 | $24.00 | $1.20 | - | $90.00 |\n| gpt-6-astra | $60.00");
+        let partial = PriceTable::from_pricing_md(&updated).unwrap();
+        assert_eq!(
+            gaps.observe(
+                std::slice::from_ref(&long),
+                &partial,
+                now + Duration::from_secs(1)
+            ),
+            vec![format!("价格表已补齐：{}", ultra.description())]
+        );
+        assert!(gaps.wants_pull);
+        let updated = updated.replace("| gpt-5.5 (<272K context length) | $12.50 | $1.25 | - | $75.00 | - | - | - | - |", "| gpt-5.5 (<272K context length) | $12.50 | $1.25 | - | $75.00 | $25.00 | $2.50 | - | $112.50 |");
+        let complete = PriceTable::from_pricing_md(&updated).unwrap();
+        assert_eq!(
+            gaps.observe(&[], &complete, now + Duration::from_secs(2)),
+            vec![format!("价格表已补齐：{}", long.description())]
+        );
+        assert!(!gaps.wants_pull);
+    }
+
+    /// 价格表补齐时回写一条，并在缺口关闭后停止补拉。
     #[test]
     fn resolved_price_gap_closes_log() {
         let mut gaps = PriceGaps::default();
         let now = Instant::now();
 
-        gaps.observe(&["gpt-new"], &PriceTable::default(), now);
-        let prices = PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"gpt-new":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-        )
-        .expect("应解析出价格表");
+        gaps.observe(&[price_gap("gpt-new")], &PriceTable::default(), now);
+        let prices = crate::quota::pricing::PriceTable::for_test(&[("gpt-new", 4.0, 0.4, 20.0)]);
 
         // 本窗口已经不再出现这个模型，闭环仍要报出来。
         assert_eq!(
             gaps.observe(&[], &prices, now + Duration::from_secs(90)),
-            vec!["价格表已补齐：gpt-new"]
+            vec![format!(
+                "价格表已补齐：{}",
+                price_gap("gpt-new").description()
+            )]
         );
         assert!(!gaps.wants_pull, "缺口关闭后不该再补拉");
         // 同一个模型再次缺价时重新开一轮（不是一次报过就永远沉默）。
         assert_eq!(
             gaps.observe(
-                &["gpt-new"],
+                &[price_gap("gpt-new")],
                 &PriceTable::default(),
                 now + Duration::from_mins(2)
             ),
-            vec!["价格表缺模型：gpt-new"]
+            vec![format!(
+                "价格项缺失：{}",
+                price_gap("gpt-new").description()
+            )]
         );
     }
 
@@ -2044,21 +2164,33 @@ mod tests {
         let now = Instant::now();
         let prices = PriceTable::default();
 
-        gaps.observe(&["gpt-never"], &prices, now);
+        gaps.observe(&[price_gap("gpt-never")], &prices, now);
         let just_inside_window = PRICE_GAP_RETRY_WINDOW.saturating_sub(Duration::from_secs(1));
-        let inside_window = gaps.observe(&["gpt-never"], &prices, now + just_inside_window);
+        let inside_window =
+            gaps.observe(&[price_gap("gpt-never")], &prices, now + just_inside_window);
         assert!(inside_window.is_empty());
         assert!(gaps.wants_pull, "窗口内继续补拉");
 
         assert_eq!(
-            gaps.observe(&["gpt-never"], &prices, now + PRICE_GAP_RETRY_WINDOW),
-            vec!["价格表仍缺模型：gpt-never（暂停补拉，等每日刷新）"]
+            gaps.observe(
+                &[price_gap("gpt-never")],
+                &prices,
+                now + PRICE_GAP_RETRY_WINDOW
+            ),
+            vec![format!(
+                "价格项仍缺失：{}（暂停补拉，等每日刷新）",
+                price_gap("gpt-never").description()
+            )]
         );
         assert!(!gaps.wants_pull, "停手之后不再提前补拉");
         // 停手只报一次。
         assert!(
-            gaps.observe(&["gpt-never"], &prices, now + PRICE_GAP_RETRY_WINDOW * 2)
-                .is_empty()
+            gaps.observe(
+                &[price_gap("gpt-never")],
+                &prices,
+                now + PRICE_GAP_RETRY_WINDOW * 2
+            )
+            .is_empty()
         );
     }
 

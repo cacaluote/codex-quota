@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::model::{FileCache, ParentLink, TokenEvent, TokenSignature};
 use super::parser::{event_is_on_date, ts_is_on_date};
-use crate::quota::pricing::PriceTable;
+use crate::quota::pricing::{
+    ContextBand, LookupError, PriceField, PriceGap, PriceTable, ServiceTier,
+};
 
 impl ModelVolumes {
     /// 套餐内输入 token 的缓存命中率，以百分比的十分之一为单位（0–1000）。
@@ -22,100 +24,170 @@ impl ModelVolumes {
         u16::try_from(rounded.min(1000)).ok()
     }
 
-    /// 按 models.dev 牌价把分桶用量换算成美元。空价格表返回 None
-    /// （无法计价）；表内查不到的模型按 0 贡献（宁可少算不虚算）。
-    // 真实 token 计数远低于 2^53，u64→f64 的精度损失在这里不可能出现。
-    #[allow(clippy::cast_precision_loss)]
+    /// 任一非零用量桶无法完整计价时，整窗口返回未知。
     pub(in crate::quota::codex) fn cost(&self, table: &PriceTable) -> Option<f64> {
         if table.is_empty() {
             return None;
         }
-        Some(
-            self.0
-                .iter()
-                .filter_map(|(model, volume)| {
-                    table.lookup(model.as_deref()).map(|price| {
-                        price.input * volume.uncached_input as f64 / 1_000_000.0
-                            + price.cached_input * volume.cached_input as f64 / 1_000_000.0
-                            + price.output * volume.output as f64 / 1_000_000.0
-                    })
-                })
-                // f64::sum 对空迭代器的折叠恒等值是 -0.0，会渲染成 $-0.00；
-                // 显式以 +0.0 折叠。
-                .fold(0.0, |sum, value| sum + value),
-        )
+        self.0
+            .iter()
+            .filter(|(_, volume)| volume.has_tokens())
+            .try_fold(0.0, |sum, (model, volume)| {
+                Some(sum + volume.cost(model.as_deref(), table).ok()?)
+            })
     }
 
-    /// 本窗口**确有用量**、但价格表里查不到价格的模型名（去重、字典序）。
-    ///
-    /// 这是"价值静默少算"唯一的可观测出口：`cost` 用 `filter_map` 把这类模型
-    /// 整桶丢掉，只要表非空，金额照样是个 `Some`，看数字看不出漏了谁。
-    ///
-    /// 三条刻意不报的情形：**空表**——那是整列 `--` 的已知状态（且已有拉取失败
-    /// 的日志），逐个模型再报一遍只会刷屏；**`None` 桶**——那是"事件之前没有
-    /// `turn_context`"的模型未知，与"新模型还没进价格表"是两回事；**零用量的
-    /// 桶**——它对金额没有贡献，报出来是假警报。
-    pub(in crate::quota::codex) fn unpriced_models(&self, table: &PriceTable) -> Vec<&str> {
-        if table.is_empty() {
-            return Vec::new();
+    /// 日志明细问题和缺价分开：前者不能通过补拉价格修复。
+    pub(in crate::quota::codex) fn price_issues(
+        &self,
+        table: &PriceTable,
+    ) -> (Vec<PriceGap>, Vec<String>) {
+        let mut gaps = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (model, volume) in self.0.iter().filter(|(_, volume)| volume.has_tokens()) {
+            match volume.cost(model.as_deref(), table) {
+                Err(PricingIssue::Gap(gap)) if !table.is_empty() => gaps.push(gap),
+                Err(PricingIssue::Diagnostic(message)) => diagnostics.push(message),
+                _ => {}
+            }
         }
-        let mut names: Vec<&str> = self
-            .0
-            .iter()
-            .filter(|(model, volume)| {
-                (volume.uncached_input != 0 || volume.cached_input != 0 || volume.output != 0)
-                    && model
-                        .as_deref()
-                        .is_some_and(|model| table.lookup(Some(model)).is_none())
-            })
-            .filter_map(|(model, _)| model.as_deref())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        names
+        gaps.sort();
+        gaps.dedup();
+        diagnostics.sort();
+        diagnostics.dedup();
+        (gaps, diagnostics)
     }
+}
+
+enum PricingIssue {
+    Gap(PriceGap),
+    Diagnostic(String),
 }
 
 /// 分桶用量：计价时 `uncached_input` 按原价、`cached_input` 按 `cache_read` 价、
 /// `output` 按 output 价（`reasoning` ⊆ `output`）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(in crate::quota::codex) struct TokenVolume {
+    pub(super) context: ContextBand,
+    pub(super) details_missing: bool,
+    pub(super) service_tier: Option<ServiceTier>,
     pub(super) uncached_input: u64,
     pub(super) cached_input: u64,
     pub(super) output: u64,
 }
 
-/// 按模型分桶；`None` 表示事件前没有 `turn_context` 记录、模型未知。
+impl TokenVolume {
+    fn has_tokens(&self) -> bool {
+        self.details_missing
+            || self.uncached_input != 0
+            || self.cached_input != 0
+            || self.output != 0
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn cost(&self, model: Option<&str>, table: &PriceTable) -> Result<f64, PricingIssue> {
+        if self.details_missing {
+            return Err(PricingIssue::Diagnostic(format!(
+                "无法计价：{} 缺少输入或输出用量明细",
+                model.unwrap_or("模型未知")
+            )));
+        }
+        let tier = self.service_tier.as_ref().unwrap_or(&ServiceTier::Standard);
+        if let ServiceTier::Unknown(value) = tier {
+            return Err(PricingIssue::Diagnostic(format!(
+                "未支持的服务档位：{} / {value}",
+                model.unwrap_or("模型未知")
+            )));
+        }
+        let Some(model) = model else {
+            return Err(PricingIssue::Diagnostic(
+                "无法计价：日志缺少模型归属".to_owned(),
+            ));
+        };
+        let gap = |field| {
+            PricingIssue::Gap(PriceGap {
+                model: model.to_owned(),
+                tier: tier.clone(),
+                context: self.context,
+                field,
+            })
+        };
+        let price = table
+            .lookup(Some(model), Some(tier), self.context)
+            .map_err(|error| match error {
+                LookupError::MissingModel => gap(PriceField::Model),
+                LookupError::MissingTier => gap(PriceField::Tier),
+                LookupError::MissingContext => gap(PriceField::Context),
+                LookupError::UnknownContext => PricingIssue::Diagnostic(format!(
+                    "无法分档：{model} / {} 缺少单次请求输入量",
+                    tier.label()
+                )),
+                LookupError::UnknownTier => PricingIssue::Diagnostic(format!(
+                    "未支持的服务档位：{model} / {}",
+                    tier.label()
+                )),
+            })?;
+        let mut cost = 0.0;
+        for (tokens, rate, field) in [
+            (self.uncached_input, price.input, PriceField::Input),
+            (
+                self.cached_input,
+                price.cached_input,
+                PriceField::CachedInput,
+            ),
+            (self.output, price.output, PriceField::Output),
+        ] {
+            if tokens != 0 {
+                cost += rate.ok_or_else(|| gap(field))? * tokens as f64 / 1_000_000.0;
+            }
+        }
+        Ok(cost)
+    }
+}
+
+/// 按模型、请求档位和单次输入上下文分桶。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(in crate::quota::codex) struct ModelVolumes(
     pub(in crate::quota::codex) Vec<(Option<String>, TokenVolume)>,
 );
 
-fn accumulate_volume(
-    volumes: &mut ModelVolumes,
-    model: Option<&str>,
-    uncached_input: u64,
-    cached_input: u64,
-    output: u64,
-) {
-    let index = volumes
-        .0
-        .iter()
-        .position(|(existing, _)| existing.as_deref() == model);
+fn accumulate_volume(volumes: &mut ModelVolumes, event: &TokenEvent) {
+    let model = event.model.as_deref();
+    let service_tier = event.service_tier.as_ref();
+    let context =
+        ContextBand::from_input(event.signature.last.as_ref().and_then(|last| last.input));
+    let index = volumes.0.iter().position(|(existing, volume)| {
+        existing.as_deref() == model
+            && volume.service_tier.as_ref() == service_tier
+            && volume.context == context
+    });
     let volume = if let Some(index) = index {
         &mut volumes.0[index].1
     } else {
-        volumes
-            .0
-            .push((model.map(str::to_owned), TokenVolume::default()));
+        volumes.0.push((
+            model.map(str::to_owned),
+            TokenVolume {
+                context,
+                service_tier: service_tier.cloned(),
+                ..TokenVolume::default()
+            },
+        ));
         let Some((_, volume)) = volumes.0.last_mut() else {
             return;
         };
         volume
     };
-    volume.uncached_input = volume.uncached_input.saturating_add(uncached_input);
-    volume.cached_input = volume.cached_input.saturating_add(cached_input);
-    volume.output = volume.output.saturating_add(output);
+    volume.details_missing |= event
+        .signature
+        .last
+        .as_ref()
+        .or(event.signature.total.as_ref())
+        .is_none_or(|counters| counters.input.is_none() || counters.output.is_none());
+    volume.uncached_input = volume
+        .uncached_input
+        .saturating_add(event.delta_uncached_input);
+    volume.cached_input = volume.cached_input.saturating_add(event.delta_cached_input);
+    volume.output = volume.output.saturating_add(event.delta_output);
 }
 
 pub(super) fn cache_has_tokens_on_date(cache: &FileCache, date: &str) -> bool {
@@ -383,13 +455,7 @@ fn tally_timeline<F>(
             aggregate.overflow_tokens = aggregate.overflow_tokens.saturating_add(event.delta_total);
         } else {
             aggregate.tokens = aggregate.tokens.saturating_add(event.delta_total);
-            accumulate_volume(
-                &mut aggregate.volumes,
-                event.model.as_deref(),
-                event.delta_uncached_input,
-                event.delta_cached_input,
-                event.delta_output,
-            );
+            accumulate_volume(&mut aggregate.volumes, event);
         }
     }
 }
@@ -455,6 +521,7 @@ fn replay_prefix(
     for path in parent_paths {
         let parent = caches.get(path).ok_or(())?;
         if parent.token_without_timestamp
+            || parent.history_start_nanos.is_some()
             || parent
                 .max_timestamp_nanos
                 .is_none_or(|timestamp| timestamp < cutoff)
@@ -530,6 +597,9 @@ mod tests {
             (
                 Some("model-a".to_owned()),
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 2,
                     cached_input: 98,
                     output: 900,
@@ -538,6 +608,9 @@ mod tests {
             (
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 0,
                     cached_input: 98,
                     output: 0,
@@ -549,6 +622,9 @@ mod tests {
             ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 19,
                     cached_input: 981,
                     output: 900,
@@ -561,6 +637,9 @@ mod tests {
             ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     output: 100,
                     ..TokenVolume::default()
                 },
@@ -572,13 +651,13 @@ mod tests {
 
     #[test]
     fn cost_weights_token_categories() {
-        let table = PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-        )
-        .expect("应解析出价格表");
+        let table = crate::quota::pricing::PriceTable::for_test(&[("m", 4.0, 0.4, 20.0)]);
         let volumes = ModelVolumes(vec![(
             Some("m".to_owned()),
             TokenVolume {
+                context: crate::quota::pricing::ContextBand::Short,
+                details_missing: false,
+                service_tier: None,
                 uncached_input: 1_000_000,
                 cached_input: 9_000_000,
                 output: 100_000,
@@ -593,14 +672,14 @@ mod tests {
 
     #[test]
     fn unpriced_model_detection() {
-        let table = PriceTable::from_models_dev(
-            r#"{"openai":{"models":{"m":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-        )
-        .expect("应解析出价格表");
+        let table = crate::quota::pricing::PriceTable::for_test(&[("m", 4.0, 0.4, 20.0)]);
         let bucket = |model: Option<&str>, tokens: u64| {
             (
                 model.map(str::to_owned),
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: tokens,
                     cached_input: 0,
                     output: 0,
@@ -619,9 +698,135 @@ mod tests {
         ]);
 
         // 名字去重与字典序一起钉住：`gpt-new` 出现两次也只报一次。
-        assert_eq!(volumes.unpriced_models(&table), vec!["gpt-new"]);
+        let (gaps, diagnostics) = volumes.price_issues(&table);
+        assert_eq!(
+            gaps.iter()
+                .map(|gap| gap.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-new"]
+        );
+        assert_eq!(diagnostics, vec!["无法计价：日志缺少模型归属"]);
+        assert_eq!(volumes.cost(&table), None);
         // 空表是"整列 --"的已知状态，不逐模型上报。
-        assert!(volumes.unpriced_models(&PriceTable::default()).is_empty());
+        assert!(volumes.price_issues(&PriceTable::default()).0.is_empty());
+    }
+
+    #[test]
+    fn missing_fast_price_is_reported() {
+        let prices = crate::quota::pricing::PriceTable::for_test(&[("gpt-new", 2.0, 0.1, 10.0)]);
+        let volume = ModelVolumes(vec![(
+            Some("gpt-new".to_owned()),
+            TokenVolume {
+                context: crate::quota::pricing::ContextBand::Short,
+                details_missing: false,
+                service_tier: Some(crate::quota::pricing::ServiceTier::Fast),
+                uncached_input: 1_000,
+                ..TokenVolume::default()
+            },
+        )]);
+        assert_eq!(
+            volume.price_issues(&prices).0[0].field,
+            crate::quota::pricing::PriceField::Tier
+        );
+        assert_eq!(volume.cost(&prices), None);
+    }
+
+    #[test]
+    fn pricing_gaps_and_diagnostics_differ() {
+        use crate::quota::pricing::{ContextBand, PriceField, ServiceTier};
+        let prices = PriceTable::from_pricing_md(crate::quota::pricing::OFFICIAL_PRICING).unwrap();
+        for (label, model, tier, context, cached, details_missing, gap_field) in [
+            (
+                "missing long Fast",
+                "gpt-5.5",
+                ServiceTier::Fast,
+                ContextBand::Long,
+                0,
+                false,
+                Some(PriceField::Context),
+            ),
+            (
+                "missing cached rate",
+                "gpt-5.5-pro",
+                ServiceTier::Standard,
+                ContextBand::Short,
+                1,
+                false,
+                Some(PriceField::CachedInput),
+            ),
+            (
+                "missing model",
+                "future-model",
+                ServiceTier::Standard,
+                ContextBand::Short,
+                0,
+                false,
+                Some(PriceField::Model),
+            ),
+            (
+                "unknown context",
+                "gpt-6.1-sol",
+                ServiceTier::Standard,
+                ContextBand::Unknown,
+                0,
+                false,
+                None,
+            ),
+            (
+                "Flex",
+                "gpt-6.1-sol",
+                ServiceTier::Unknown("flex".to_owned()),
+                ContextBand::Short,
+                0,
+                false,
+                None,
+            ),
+            (
+                "missing details",
+                "gpt-6.1-sol",
+                ServiceTier::Standard,
+                ContextBand::Short,
+                0,
+                true,
+                None,
+            ),
+        ] {
+            let volumes = ModelVolumes(vec![(
+                Some(model.to_owned()),
+                TokenVolume {
+                    context,
+                    service_tier: Some(tier),
+                    details_missing,
+                    uncached_input: 1_000,
+                    cached_input: cached,
+                    output: 100,
+                },
+            )]);
+            assert_eq!(volumes.cost(&prices), None, "{label}");
+            let (gaps, diagnostics) = volumes.price_issues(&prices);
+            assert_eq!(gaps.first().map(|gap| gap.field), gap_field, "{label}");
+            assert_eq!(diagnostics.is_empty(), gap_field.is_some(), "{label}");
+        }
+        let volumes = ModelVolumes(vec![(
+            Some("gpt-5.5-pro".to_owned()),
+            TokenVolume {
+                context: ContextBand::Short,
+                uncached_input: 1_000,
+                output: 1_000,
+                ..TokenVolume::default()
+            },
+        )]);
+        assert!((volumes.cost(&prices).unwrap() - 0.21).abs() < 1e-12);
+        let empty = ModelVolumes(vec![(
+            None,
+            TokenVolume {
+                service_tier: Some(ServiceTier::Unknown("future".to_owned())),
+                ..TokenVolume::default()
+            },
+        )]);
+        assert_eq!(empty.cost(&prices), Some(0.0));
+        assert!(empty.price_issues(&prices).0.is_empty());
+        assert!(empty.price_issues(&prices).1.is_empty());
     }
 
     #[test]
@@ -659,6 +864,9 @@ mod tests {
             Some(ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 148,
                     cached_input: 0,
                     output: 2

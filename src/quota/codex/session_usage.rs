@@ -2,6 +2,7 @@ mod aggregate;
 mod files;
 mod model;
 mod parser;
+mod retention;
 mod watcher;
 
 use std::collections::{HashMap, HashSet};
@@ -23,16 +24,19 @@ use model::{
     CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry, RateLimitWindowEntry,
     UsageCacheV1,
 };
-use parser::{event_is_on_date, system_time_from_unix_nanos, update_candidate_cache};
+use parser::{
+    event_is_on_date, restore_candidate_cache, system_time_from_unix_nanos, update_candidate_cache,
+};
+use retention::{compact_history, needs_history, protected_paths, required_start_nanos};
 use watcher::SessionChangeWatcher;
 
 use super::PeriodBoundary;
 use super::protocol::{local_calendar_date, local_calendar_date_at};
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
-// v8: 只统计同一窗口内的余额差，移除跨窗口基线。
-const CACHE_VERSION: u32 = 8;
-const CACHE_FILENAME: &str = "usage-cache-v1.json";
+// YYMMDDNN：仅在缓存格式或解析规则需要重建时更新。
+const CACHE_VERSION: u32 = 26_100_301;
+const CACHE_FILENAME: &str = "usage-cache.json";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LocalUsageSnapshot {
@@ -67,6 +71,9 @@ pub(super) struct RefreshDiagnostics {
     pub(super) files_scanned: usize,
     pub(super) files_read: usize,
     pub(super) token_events_added: usize,
+    pub(super) history_files_restored: usize,
+    pub(super) token_events_pruned: usize,
+    pub(super) balance_observations_pruned: usize,
     pub(super) parse_errors: usize,
     pub(super) discovery_errors: usize,
     pub(super) deferred_files: usize,
@@ -246,49 +253,12 @@ impl ScanContext {
             .into_iter()
             .map(|cache| (cache.path.clone(), cache))
             .collect();
-        // 跨天文件：事件时间戳可能领先文件 mtime（服务端时间戳/写入延迟），
-        // 昨天修改过的文件也纳入今天的选择；是否属于今天由聚合层按事件
-        // 时间戳过滤。
-        let yesterday = previous_date(today).unwrap_or_else(|| today.to_owned());
-        let today_selected = candidates
-            .iter()
-            .filter_map(|candidate| {
-                let key = path_key(&candidate.path);
-                let cached_today = caches
-                    .get(&key)
-                    .is_some_and(|cache| cache_has_tokens_on_date(cache, today));
-                (cached_today
-                    || is_date_partition(&candidate.path, today)
-                    || modified_on_or_after_date(candidate, &yesterday))
-                .then_some(key)
-            })
-            .collect();
-        let period_selected = boundary.map_or_else(HashSet::new, |boundary| {
-            candidates
-                .iter()
-                .filter_map(|candidate| {
-                    let key = path_key(&candidate.path);
-                    let cached_period = caches.get(&key).is_some_and(|cache| {
-                        cache_has_tokens_in_period(cache, boundary.start_nanos())
-                    });
-                    (cached_period
-                        || is_date_partition_in_range(
-                            &candidate.path,
-                            boundary.local_date(),
-                            today,
-                        )
-                        || modified_on_or_after_date(candidate, boundary.local_date()))
-                    .then_some(key)
-                })
-                .collect()
-        });
-
-        Self {
+        let mut context = Self {
             candidate_by_path,
             rollout_index,
             caches,
-            today_selected,
-            period_selected,
+            today_selected: HashSet::new(),
+            period_selected: HashSet::new(),
             dependencies: HashSet::new(),
             diagnostics: RefreshDiagnostics {
                 mode,
@@ -301,18 +271,80 @@ impl ScanContext {
                 ..RefreshDiagnostics::default()
             },
             cache_dirty: false,
+        };
+        context.select_files(today, boundary);
+        context
+    }
+
+    fn select_files(&mut self, today: &str, boundary: Option<&PeriodBoundary>) {
+        // 服务端事件时间可能领先 mtime，保留昨天修改过的跨天文件。
+        let yesterday = previous_date(today).unwrap_or_else(|| today.to_owned());
+        let required_start = required_start_nanos(today, boundary);
+        self.today_selected = self
+            .candidate_by_path
+            .iter()
+            .filter_map(|(key, candidate)| {
+                let cached_today = self.caches.get(key).is_some_and(|cache| {
+                    cache_has_tokens_on_date(cache, today) || needs_history(cache, required_start)
+                });
+                (cached_today
+                    || is_date_partition(&candidate.path, today)
+                    || modified_on_or_after_date(candidate, &yesterday))
+                .then(|| key.clone())
+            })
+            .collect();
+        self.period_selected = boundary.map_or_else(HashSet::new, |boundary| {
+            self.candidate_by_path
+                .iter()
+                .filter_map(|(key, candidate)| {
+                    let cached_period = self.caches.get(key).is_some_and(|cache| {
+                        cache_has_tokens_in_period(cache, boundary.start_nanos())
+                            || needs_history(cache, required_start)
+                    });
+                    (cached_period
+                        || is_date_partition_in_range(
+                            &candidate.path,
+                            boundary.local_date(),
+                            today,
+                        )
+                        || modified_on_or_after_date(candidate, boundary.local_date()))
+                    .then(|| key.clone())
+                })
+                .collect()
+        });
+    }
+
+    fn restore_history(&mut self, paths: &[String]) {
+        for path in paths {
+            if let Some(candidate) = self.candidate_by_path.get(path) {
+                restore_candidate_cache(candidate, &mut self.caches, &mut self.diagnostics);
+                self.cache_dirty = true;
+            }
         }
     }
 
-    fn parse_selected_and_dependencies(&mut self) {
-        let selected_roots: Vec<String> = self
-            .today_selected
-            .union(&self.period_selected)
-            .cloned()
+    fn parse_selected_and_dependencies(&mut self, today: &str, boundary: Option<&PeriodBoundary>) {
+        let required_start = required_start_nanos(today, boundary);
+        let compacted_paths: HashSet<_> = self
+            .caches
+            .iter()
+            .filter(|(_, cache)| cache.history_start_nanos.is_some())
+            .map(|(path, _)| path.clone())
             .collect();
-        let mut dependencies = HashSet::new();
-        self.parse_roots(selected_roots, &mut dependencies);
-        self.dependencies = dependencies;
+        let missing_history: Vec<_> = self
+            .caches
+            .iter()
+            .filter(|(_, cache)| needs_history(cache, required_start))
+            .map(|(path, _)| path.clone())
+            .collect();
+        self.restore_history(&missing_history);
+        if !missing_history.is_empty() {
+            // Re-evaluate selection using restored timestamps. Failed restores
+            // stay selected through the coverage gap and report unknown usage.
+            self.select_files(today, boundary);
+        }
+        let mut attempted: HashSet<_> = missing_history.into_iter().collect();
+        self.parse_selected_roots();
 
         // 全量扫描解析所有候选文件（增量扫描只解析选中与依赖文件）：额度
         // 快照可能躺在未被今日/本期选中的旧文件里——数日未用 codex 后的
@@ -321,6 +353,43 @@ impl ScanContext {
             let all_roots: Vec<String> = self.candidate_by_path.keys().cloned().collect();
             self.parse_roots(all_roots, &mut HashSet::new());
         }
+        if self.caches.iter().any(|(path, cache)| {
+            cache.history_start_nanos.is_some() && !compacted_paths.contains(path)
+        }) {
+            // A content-preserving archive rename inherits its checkpoints
+            // during parsing. Select it again using the migrated timestamps.
+            self.select_files(today, boundary);
+            self.parse_selected_roots();
+        }
+        // Metadata parsed above can introduce a new fork or copy. Restore all
+        // affected timelines before aggregation, including newly found ancestors.
+        loop {
+            let protected = protected_paths(&self.caches, &self.rollout_index, &self.dependencies);
+            let missing_history: Vec<_> = self
+                .caches
+                .iter()
+                .filter(|(path, cache)| {
+                    !attempted.contains(*path)
+                        && (needs_history(cache, required_start)
+                            || (protected.contains(*path) && cache.history_start_nanos.is_some()))
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            if missing_history.is_empty() {
+                break;
+            }
+            attempted.extend(missing_history.iter().cloned());
+            self.restore_history(&missing_history);
+            self.select_files(today, boundary);
+            self.parse_selected_roots();
+        }
+    }
+
+    fn parse_selected_roots(&mut self) {
+        let roots = self.selected().into_iter().collect();
+        let mut dependencies = HashSet::new();
+        self.parse_roots(roots, &mut dependencies);
+        self.dependencies = dependencies;
     }
 
     fn parse_roots(&mut self, roots: Vec<String>, visited: &mut HashSet<String>) {
@@ -463,11 +532,28 @@ impl ScanContext {
             .map(|cache| cache.parse_errors)
             .sum();
 
+        let protected = protected_paths(&self.caches, &self.rollout_index, &self.dependencies);
         let dependencies = self.dependencies;
         let mut retained = selected.clone();
         retained.extend(dependencies.iter().cloned());
         self.caches
             .retain(|key, _| retained.contains(key) && self.candidate_by_path.contains_key(key));
+        // Wait for the quota period instead of pruning to today during startup
+        // and immediately re-reading history when its boundary arrives.
+        if boundary.is_some()
+            && self.diagnostics.discovery_errors == 0
+            && let Some(start) = required_start_nanos(today, boundary)
+        {
+            for (path, cache) in &mut self.caches {
+                if protected.contains(path) {
+                    continue;
+                }
+                let pruned = compact_history(cache, start);
+                self.cache_dirty |= pruned.events != 0 || pruned.balances != 0;
+                self.diagnostics.token_events_pruned += pruned.events;
+                self.diagnostics.balance_observations_pruned += pruned.balances;
+            }
+        }
         let mut files: Vec<_> = self.caches.into_values().collect();
         files.sort_by(|left, right| left.path.cmp(&right.path));
         ScanResult {
@@ -733,7 +819,7 @@ impl SessionUsageTracker {
         scan.diagnostics.discovery_elapsed = discovery_started.elapsed();
 
         let read_parse_started = Instant::now();
-        scan.parse_selected_and_dependencies();
+        scan.parse_selected_and_dependencies(date, period_boundary);
         scan.diagnostics.read_parse_elapsed = read_parse_started.elapsed();
 
         let reused = self.reusable_aggregation(&scan, &scope);
@@ -1084,6 +1170,20 @@ mod test_support {
         })
     }
 
+    pub(super) fn thread_settings_tier(timestamp: &str, tier: Option<&str>) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {
+                    "model": "gpt-6.1-sol",
+                    "service_tier": tier,
+                }
+            }
+        })
+    }
+
     /// 带分桶明细的 `token_count`：`total` 与 `last` 相同（单次请求快照）。
     pub(super) fn token_count_buckets(
         timestamp: &str,
@@ -1170,6 +1270,69 @@ mod tests {
     fn timestamp_as_system_time(timestamp: &str) -> Option<SystemTime> {
         parse_timestamp_nanos(Some(&Value::String(timestamp.to_owned())))
             .and_then(system_time_from_unix_nanos)
+    }
+
+    #[test]
+    fn incomplete_period_publishes_unknown_cost() {
+        use super::super::{PricePipeline, publish_local_usage_snapshot};
+        use crate::quota::AppState;
+        use crate::quota::pricing::{ContextBand, PriceTable, ServiceTier};
+        use std::sync::{Arc, Mutex};
+        let today_volume = ModelVolumes(vec![(
+            Some("gpt-6-astra".to_owned()),
+            TokenVolume {
+                context: ContextBand::Short,
+                uncached_input: 500,
+                cached_input: 500,
+                output: 100,
+                ..TokenVolume::default()
+            },
+        )]);
+        let mut incomplete = today_volume.clone();
+        incomplete.0.push((
+            Some("gpt-6-astra".to_owned()),
+            TokenVolume {
+                context: ContextBand::Short,
+                service_tier: Some(ServiceTier::Unknown("flex".to_owned())),
+                uncached_input: 1_000,
+                ..TokenVolume::default()
+            },
+        ));
+        let snapshot = LocalUsageSnapshot {
+            today_tokens: 1_100,
+            today_overflow_tokens: 0,
+            today_credits_spent: 0.0,
+            today_reliable: true,
+            current_period_tokens: 2_100,
+            current_period_overflow_tokens: 0,
+            current_period_credits_spent: 0.0,
+            current_period_reliable: true,
+            today_volume: Some(today_volume),
+            period_volume: Some(incomplete),
+            quota: None,
+            plan_type: None,
+        };
+        let state = Arc::new(Mutex::new(AppState {
+            current_period_cost: Some(99.0),
+            period_total_value_estimate: Some(200.0),
+            ..AppState::default()
+        }));
+        let mut prices = PricePipeline::new(
+            PriceTable::from_pricing_md(crate::quota::pricing::OFFICIAL_PRICING).unwrap(),
+        );
+        publish_local_usage_snapshot(&state, &snapshot, &mut prices, &Arc::new(|| {}));
+        let current = state.lock().unwrap();
+        assert!((current.today_cost.unwrap() - 0.0105).abs() < 1e-12);
+        assert_eq!(current.current_period_cost, None);
+        assert_eq!(current.period_total_value_estimate, None);
+        assert_eq!(
+            (current.today_tokens, current.current_period_tokens),
+            (Some(1_100), Some(2_100))
+        );
+        assert_eq!(current.today_cache_hit_percent_tenths, Some(500));
+        assert!(!prices.gaps.wants_pull);
+        let message = "未支持的服务档位：gpt-6-astra / flex".to_owned();
+        assert!(prices.gaps.observe_diagnostics(&[message]).is_empty());
     }
 
     #[test]
@@ -2076,7 +2239,6 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::quota::AppState;
-        use crate::quota::pricing::PriceTable;
 
         use super::super::{LocalPipeline, LocalUsageStatus, PricePipeline, refresh_local_usage};
 
@@ -2122,12 +2284,12 @@ mod tests {
             tracker: context.tracker(),
             status: LocalUsageStatus::default(),
         };
-        let mut prices = PricePipeline::new(
-            PriceTable::from_models_dev(
-                r#"{"openai":{"models":{"gpt-5.6-sol":{"cost":{"input":4,"output":20,"cache_read":0.4}}}}}"#,
-            )
-            .unwrap(),
-        );
+        let mut prices = PricePipeline::new(crate::quota::pricing::PriceTable::for_test(&[(
+            "gpt-5.6-sol",
+            4.0,
+            0.4,
+            20.0,
+        )]));
 
         refresh_local_usage(&mut local, &mut prices, &state, &notify);
 
@@ -2244,6 +2406,9 @@ mod tests {
             Some(ModelVolumes(vec![(
                 None,
                 TokenVolume {
+                    context: crate::quota::pricing::ContextBand::Short,
+                    details_missing: false,
+                    service_tier: None,
                     uncached_input: 247,
                     cached_input: 0,
                     output: 3

@@ -30,7 +30,7 @@ pub(super) struct ChangedDiscovery {
     pub(super) errors: usize,
 }
 
-pub(super) fn codex_home() -> Option<PathBuf> {
+pub(in crate::quota::codex) fn codex_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -243,6 +243,8 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
 
 fn thread_id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
+    // Resumed rollouts may append _<rollout UUID> after the thread UUID.
+    let stem = stem.split('_').next()?;
     let candidate = stem.rsplit('-').take(5).collect::<Vec<_>>();
     if candidate.len() != 5 {
         return None;
@@ -264,6 +266,19 @@ mod tests {
     use super::*;
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn rollout_suffix_preserves_thread_id() {
+        let thread_id = "11111111-1111-4111-8111-111111111111";
+        for suffix in ["", "_22222222-2222-4222-8222-222222222222"] {
+            let filename = format!("rollout-2026-10-15T10-49-29-{thread_id}{suffix}.jsonl");
+            assert_eq!(
+                thread_id_from_filename(Path::new(&filename)).as_deref(),
+                Some(thread_id),
+                "{filename}"
+            );
+        }
+    }
 
     #[test]
     fn session_partition_inside_period_is_selected() {

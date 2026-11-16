@@ -2022,6 +2022,7 @@ mod tests {
         let now = SystemTime::now();
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
                     used_percent: 38.0,
@@ -2180,6 +2181,7 @@ mod tests {
         let now = SystemTime::now();
         AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
                     used_percent: 100.0,
@@ -2444,6 +2446,7 @@ mod tests {
         // 剩余 3%：弧很短，端的形状决定它能不能被看见。
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
                     used_percent: 97.0,
@@ -2523,6 +2526,7 @@ mod tests {
         let arc_pixel = |used_percent: f64, color_style| {
             let state = AppState {
                 snapshot: Some(QuotaSnapshot {
+                    account_id: None,
                     limit_id: "codex".to_owned(),
                     primary: QuotaWindow {
                         used_percent,

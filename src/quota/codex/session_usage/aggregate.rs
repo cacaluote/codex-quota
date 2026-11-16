@@ -517,35 +517,39 @@ fn replay_prefix(
     };
     let cutoff = root.timestamp_nanos.ok_or(())?;
     let parent_paths = rollout_index.get(parent_id).ok_or(())?;
-    let mut timelines = Vec::with_capacity(parent_paths.len());
+    let mut parents = Vec::with_capacity(parent_paths.len());
     for path in parent_paths {
         let parent = caches.get(path).ok_or(())?;
-        if parent.token_without_timestamp
+        if parent.uncertain
+            || parent.token_without_timestamp
             || parent.history_start_nanos.is_some()
-            || parent
-                .max_timestamp_nanos
-                .is_none_or(|timestamp| timestamp < cutoff)
         {
             return Err(());
         }
-        timelines.push(
-            parent
-                .events
-                .iter()
-                .filter(|event| {
-                    event
-                        .timestamp_nanos
-                        .is_some_and(|timestamp| timestamp <= cutoff)
-                })
-                .map(|event| event.signature.clone())
-                .collect::<Vec<_>>(),
-        );
+        parents.push(parent);
     }
-    let first = timelines.first().ok_or(())?;
-    if timelines.iter().skip(1).any(|timeline| timeline != first) {
+    // A resumed parent spans sequential rollouts. Only its combined history
+    // must reach the fork cutoff; completed older segments cannot reach it.
+    if !parents.iter().any(|parent| {
+        parent
+            .max_timestamp_nanos
+            .is_some_and(|timestamp| timestamp >= cutoff)
+    }) {
         return Err(());
     }
-    Ok(matching_replay_prefix(&cache.events, first))
+    parents.sort_by_key(|parent| std::cmp::Reverse(parent.events.len()));
+    let timelines = sequential_timelines(&parents).ok_or(())?;
+    let signatures: Vec<_> = timelines
+        .iter()
+        .flat_map(|parent| &parent.events)
+        .filter(|event| {
+            event
+                .timestamp_nanos
+                .is_some_and(|timestamp| timestamp <= cutoff)
+        })
+        .map(|event| event.signature.clone())
+        .collect();
+    Ok(matching_replay_prefix(&cache.events, &signatures))
 }
 
 fn matching_replay_prefix(child: &[TokenEvent], parent: &[TokenSignature]) -> usize {
@@ -890,6 +894,109 @@ mod tests {
         let result = context.tracker().refresh_for_date(&context.date);
 
         assert_eq!(result.ok().map(|value| value.0.today_reliable), Some(false));
+    }
+
+    #[test]
+    fn resumed_parent_supports_child_usage() {
+        use super::super::parser::{parse_timestamp_nanos, system_time_from_unix_nanos};
+        use crate::quota::codex::PeriodBoundary;
+        use serde_json::json;
+
+        for replay in [false, true] {
+            let context = TestContext::new("resumed-parent-child");
+            let original = [
+                session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                turn_context_model(&context.at(0), "gpt-6.1-sol"),
+                token_count(&context.at(1), 100, Some(100), Some("codex")),
+                turn_context(&context.at(2)),
+            ];
+            write_jsonl(&context.rollout(PARENT_ID), &original);
+            write_jsonl(&context.archived_rollout(PARENT_ID), &original);
+            // Codex appends a rollout UUID when resuming the same thread.
+            let resumed = context.rollout(PARENT_ID).with_file_name(format!(
+                "rollout-2000-01-01T00-00-03-{PARENT_ID}_{CHILD_ID}.jsonl"
+            ));
+            write_jsonl(
+                &resumed,
+                &[
+                    session_meta(&context.at(3), PARENT_ID, Some("openai"), None),
+                    turn_context_model(&context.at(3), "gpt-6.1-sol"),
+                    token_count(&context.at(4), 150, Some(50), Some("codex")),
+                    turn_context(&context.at(8)),
+                ],
+            );
+            let mut meta = session_meta(&context.at(5), CHILD_ID, Some("openai"), Some(PARENT_ID));
+            meta["payload"]["source"] = json!({
+                "subagent": { "thread_spawn": { "parent_thread_id": PARENT_ID } }
+            });
+            let mut child = vec![meta, turn_context_model(&context.at(5), "gpt-6.1-sol")];
+            if replay {
+                child.extend([
+                    token_count(&context.at(5), 100, Some(100), Some("codex")),
+                    token_count(&context.at(5), 150, Some(50), Some("codex")),
+                ]);
+            }
+            child.push(token_count(&context.at(6), 180, Some(30), Some("codex")));
+            write_jsonl(&context.rollout(CHILD_ID), &child);
+            let boundary = parse_timestamp_nanos(Some(&json!(context.timestamp)))
+                .and_then(system_time_from_unix_nanos)
+                .and_then(PeriodBoundary::from_start)
+                .unwrap();
+
+            // Check both a fresh scan and persisted-cache reuse.
+            for _ in 0..2 {
+                let (snapshot, diagnostics) = context
+                    .tracker()
+                    .refresh_for_period(&context.date, Some(&boundary))
+                    .unwrap();
+                assert_eq!(
+                    (
+                        snapshot.today_tokens,
+                        snapshot.current_period_tokens,
+                        snapshot.today_reliable,
+                        snapshot.current_period_reliable,
+                        diagnostics.deferred_files,
+                    ),
+                    (180, 180, true, true, 0),
+                    "replay={replay}"
+                );
+                assert!(snapshot.period_volume.is_some(), "replay={replay}");
+            }
+        }
+    }
+
+    #[test]
+    fn resumed_parent_conflicts_remain_unknown() {
+        for (label, original_end, resumed_end) in [("uncovered", 2, 4), ("overlap", 6, 8)] {
+            let context = TestContext::new(label);
+            write_jsonl(
+                &context.rollout(PARENT_ID),
+                &[
+                    session_meta(&context.at(0), PARENT_ID, Some("openai"), None),
+                    token_count(&context.at(1), 100, Some(100), Some("codex")),
+                    token_count(&context.at(original_end), 120, Some(20), Some("codex")),
+                ],
+            );
+            write_jsonl(
+                &context.archived_rollout(PARENT_ID),
+                &[
+                    session_meta(&context.at(3), PARENT_ID, Some("openai"), None),
+                    token_count(&context.at(4), 150, Some(30), Some("codex")),
+                    turn_context(&context.at(resumed_end)),
+                ],
+            );
+            write_jsonl(
+                &context.rollout(CHILD_ID),
+                &[
+                    session_meta(&context.at(5), CHILD_ID, Some("openai"), Some(PARENT_ID)),
+                    token_count(&context.at(7), 30, Some(30), Some("codex")),
+                ],
+            );
+            let (snapshot, diagnostics) =
+                context.tracker().refresh_for_date(&context.date).unwrap();
+            assert!(!snapshot.today_reliable, "{label}");
+            assert!(diagnostics.deferred_files > 0, "{label}");
+        }
     }
 
     #[test]

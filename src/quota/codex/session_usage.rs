@@ -15,10 +15,10 @@ use aggregate::{
     WindowAggregate, aggregate_period, aggregate_today, cache_has_tokens_in_period,
     cache_has_tokens_on_date,
 };
+pub(super) use files::codex_home;
 use files::{
-    codex_home, discover_candidates, inspect_changed_candidates, is_date_partition,
-    is_date_partition_in_range, load_cache, modified_on_or_after_date, path_key, previous_date,
-    save_cache,
+    discover_candidates, inspect_changed_candidates, is_date_partition, is_date_partition_in_range,
+    load_cache, modified_on_or_after_date, path_key, previous_date, save_cache,
 };
 use model::{
     CandidateFile, FileCache, ParentLink, RateLimitSnapshotEntry, RateLimitWindowEntry,
@@ -35,7 +35,7 @@ use super::protocol::{local_calendar_date, local_calendar_date_at};
 use crate::quota::{QuotaSnapshot, QuotaWindow};
 
 // YYMMDDNN：仅在缓存格式或解析规则需要重建时更新。
-const CACHE_VERSION: u32 = 26_100_301;
+const CACHE_VERSION: u32 = 26_101_501;
 const CACHE_FILENAME: &str = "usage-cache.json";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -955,6 +955,7 @@ fn quota_snapshot_from_entry(entry: &RateLimitSnapshotEntry) -> Option<QuotaSnap
         None => None,
     };
     Some(QuotaSnapshot {
+        account_id: None,
         limit_id: entry.limit_id.clone(),
         primary: quota_window_from_entry(&entry.primary)?,
         secondary,

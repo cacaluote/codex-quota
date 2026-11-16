@@ -22,7 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use super::layout::{ExpansionAlignment, system_animations_enabled};
-use super::notify::{self, Notification, NotificationSwitches, Notifier};
+#[cfg(debug_assertions)]
+use super::notify::Notification;
+use super::notify::{self, NotificationSwitches, Notifier};
 use super::presence::CodexPresenceWatcher;
 use super::presentation::{display_windows, period_label};
 use super::renderer::Renderer;
@@ -322,13 +324,16 @@ impl AppWindow {
         if outcome.state_dirty {
             crate::notify_state::save(&self.notify_state);
         }
-        for notification in outcome.notifications {
-            self.show_notification(&notification);
+        for (title, body) in
+            notify::notification_texts(&outcome.notifications, &self.period_prefix())
+        {
+            self.show_tray_balloon(title, &body);
         }
     }
 
     /// 弹一条通知气泡。判定与去重都在 `Notifier` 里，这里只管投递，
     /// 因此调试入口可以复用它而不碰任何判定状态。
+    #[cfg(debug_assertions)]
     fn show_notification(&self, notification: &Notification) {
         let (title, body) = notification.balloon_text(&self.period_prefix());
         self.show_tray_balloon(title, &body);
@@ -739,6 +744,7 @@ mod tests {
             today_tokens: Some(1_000),
             today_cache_hit_percent_tenths: Some(981),
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
                     used_percent: 10.0,

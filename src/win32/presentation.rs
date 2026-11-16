@@ -803,6 +803,7 @@ mod tests {
     #[test]
     fn lone_long_window_classification() {
         let snapshot = QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: window(Duration::from_hours(168)),
             secondary: None,
@@ -815,6 +816,7 @@ mod tests {
     #[test]
     fn shorter_window_classification() {
         let snapshot = QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: window(Duration::from_hours(168)),
             secondary: Some(window(Duration::from_hours(5))),
@@ -852,6 +854,7 @@ mod tests {
     fn ball_snapshot(primary: QuotaWindow, secondary: Option<QuotaWindow>) -> AppState {
         AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary,
                 secondary,
@@ -1005,6 +1008,7 @@ mod tests {
         let now = SystemTime::now();
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: QuotaWindow {
                     used_percent: 38.0,

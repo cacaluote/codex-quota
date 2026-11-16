@@ -74,6 +74,9 @@ pub enum QuotaPull {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaSnapshot {
+    /// 仅服务端查询绑定的登录账号；本地日志无法确认账号，因此为 None。
+    /// 只保存在内存中，用于避免切换账号时误报提前重置。
+    pub account_id: Option<String>,
     pub limit_id: String,
     pub primary: QuotaWindow,
     pub secondary: Option<QuotaWindow>,
@@ -357,6 +360,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
         let state = AppState {
             snapshot: Some(QuotaSnapshot {
+                account_id: None,
                 limit_id: "codex".to_owned(),
                 primary: window(10.0),
                 secondary: None,
@@ -373,6 +377,7 @@ mod tests {
     fn active_windows_exclude_expired() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200_000);
         let snapshot = QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: window(10.0),
             secondary: Some(QuotaWindow {
@@ -398,6 +403,7 @@ mod tests {
         now: SystemTime,
     ) -> QuotaSnapshot {
         QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: QuotaWindow {
                 used_percent: short_used,

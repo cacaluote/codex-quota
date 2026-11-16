@@ -46,6 +46,7 @@ const PULL_RETRY_SECONDS: [u64; 3] = [1, 2, 5];
 struct PullSchedule {
     retry_not_before: Instant,
     retry_count: usize,
+    last_attempt: Instant,
 }
 
 impl PullSchedule {
@@ -53,6 +54,7 @@ impl PullSchedule {
         Self {
             retry_not_before: now,
             retry_count: 0,
+            last_attempt: now,
         }
     }
 
@@ -63,11 +65,19 @@ impl PullSchedule {
         wall_now: SystemTime,
         now: Instant,
     ) -> Duration {
+        // 本地日志持续更新时仍按设置间隔确认账号与额度，保留提前重置的比较起点。
+        let verification_delay = state.lock().map_or(Duration::ZERO, |current| {
+            current
+                .quota_refresh_interval
+                .saturating_sub(now.saturating_duration_since(self.last_attempt))
+        });
         pull_delay(forced, state, wall_now)
+            .min(verification_delay)
             .max(self.retry_not_before.saturating_duration_since(now))
     }
 
     fn after_attempt(&mut self, needs_retry: bool, refresh_interval: Duration, now: Instant) {
+        self.last_attempt = now;
         let delay = if needs_retry {
             // 旧窗口的成功响应也消耗重试次数；低频阶段不再开启密集重试。
             let delay = PULL_RETRY_SECONDS
@@ -581,9 +591,11 @@ where
         backend.source.label(),
         backend.path.display()
     ));
+    let account_before = local_account_id();
     let mut session = AppServerSession::spawn(&backend.path, Arc::clone(cancelled))?;
     let mut next_id = initialize_session(&mut session)?;
-    let result = read_rate_limits_and_publish(&mut session, &mut next_id, state, notify);
+    let result =
+        read_rate_limits_and_publish(&mut session, &mut next_id, state, notify, account_before);
     if let Err(error) = read_account_and_publish(&mut session, &mut next_id, state, notify) {
         crate::logging::log(&format!("无法读取 Codex 方案类型：{error}"));
     }
@@ -725,6 +737,7 @@ fn read_rate_limits_and_publish<F>(
     next_id: &mut u64,
     state: &Arc<Mutex<AppState>>,
     notify: &Arc<F>,
+    account_before: Option<String>,
 ) -> Result<(), AppError>
 where
     F: Fn() + Send + Sync + 'static,
@@ -735,7 +748,9 @@ where
         "id": id
     }))?;
     let result = session.wait_for_response(id, REQUEST_TIMEOUT)?;
-    let snapshot = parse_rate_limits_result(result, SystemTime::now())?;
+    let mut snapshot = parse_rate_limits_result(result, SystemTime::now())?;
+    // 登录切换期间的查询不绑定身份，避免把两个账号的额度相互比较。
+    snapshot.account_id = unchanged_account(account_before, local_account_id().as_deref());
 
     if let Ok(mut current) = state.lock() {
         current.snapshot = Some(snapshot);
@@ -744,6 +759,26 @@ where
     }
     notify();
     Ok(())
+}
+
+fn local_account_id() -> Option<String> {
+    let path = session_usage::codex_home()?.join("auth.json");
+    let auth: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if auth
+        .get("auth_mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode != "chatgpt")
+    {
+        return None;
+    }
+    auth.pointer("/tokens/account_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn unchanged_account(before: Option<String>, after: Option<&str>) -> Option<String> {
+    before.filter(|id| Some(id.as_str()) == after)
 }
 
 fn current_period_boundary(state: &Arc<Mutex<AppState>>) -> Option<PeriodBoundary> {
@@ -1268,6 +1303,50 @@ mod tests {
     use crate::quota::QuotaWindow;
 
     #[test]
+    fn account_switch_invalidates_binding() {
+        for (before, after, expected) in [
+            (Some("a"), Some("a"), Some("a")),
+            (Some("a"), Some("b"), None),
+            (Some("a"), None, None),
+            (None, Some("a"), None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                unchanged_account(before.map(str::to_owned), after).as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_logs_preserve_verification_deadline() {
+        let wall_now = SystemTime::UNIX_EPOCH + Duration::from_hours(1);
+        let now = Instant::now();
+        let state = Arc::new(Mutex::new(AppState {
+            snapshot: Some(quota_snapshot(wall_now)),
+            quota_refresh_interval: Duration::from_mins(2),
+            ..AppState::default()
+        }));
+        let mut schedule = PullSchedule::new(now);
+        schedule.after_attempt(false, Duration::from_mins(2), now);
+        let elapsed = Duration::from_mins(2);
+        publish_local_quota(
+            &state,
+            Some(quota_snapshot(wall_now + elapsed)),
+            None,
+            &Arc::new(|| {}),
+        );
+        assert_eq!(
+            local_pull_delay(&state, wall_now + elapsed),
+            Duration::from_mins(2)
+        );
+        assert_eq!(
+            schedule.delay(false, &state, wall_now + elapsed, now + elapsed),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     #[ignore = "requires installed Desktop, cached ChatGPT login, and no discoverable standalone CLI"]
     fn desktop_backend_refreshes_live_quota() {
         assert!(find_cli_executable().is_none());
@@ -1292,11 +1371,17 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::default()));
         let notify = Arc::new(|| {});
         let cancelled = Arc::new(AtomicBool::new(false));
+        let account_before = local_account_id();
         let mut session = AppServerSession::spawn(&executable, cancelled).unwrap();
         let mut next_id = initialize_session(&mut session).unwrap();
 
-        let quota_result =
-            read_rate_limits_and_publish(&mut session, &mut next_id, &state, &notify);
+        let quota_result = read_rate_limits_and_publish(
+            &mut session,
+            &mut next_id,
+            &state,
+            &notify,
+            account_before,
+        );
         let account_result = read_account_and_publish(&mut session, &mut next_id, &state, &notify);
         session.shutdown();
 
@@ -1326,6 +1411,7 @@ mod tests {
 
     fn quota_snapshot(received_at: SystemTime) -> QuotaSnapshot {
         QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: QuotaWindow {
                 used_percent: 10.0,

@@ -68,6 +68,7 @@ pub(super) fn parse_rate_limits_result(
         .transpose()?;
 
     Ok(QuotaSnapshot {
+        account_id: None,
         limit_id: selected.limit_id,
         primary: converted_primary,
         secondary: converted_secondary,

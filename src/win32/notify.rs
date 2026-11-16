@@ -24,6 +24,9 @@ use crate::quota::{CREDITS_USD_RATE, QuotaSnapshot, QuotaWindow};
 const OVERFLOW_NOTIFY_CREDITS: f64 = 0.25;
 /// "重置时间恰好前移一个窗口长度"的容差。
 const RESET_JUMP_TOLERANCE: f64 = 0.10;
+/// 提前重置后的少量新用量，以及可区分额度回填与小幅修正的最低降幅。
+const RESTORED_MAX_USED: f64 = 1.0;
+const RESTORED_MIN_DROP: f64 = 5.0;
 /// 观测盲区下限：两次快照间隔超过它就认为中间没在看，不补发。
 const MIN_BLIND_GAP: Duration = Duration::from_mins(15);
 
@@ -82,6 +85,33 @@ impl Notification {
     }
 }
 
+/// 同一次观测里多个窗口一起重置时，只投递一条气泡，保留各窗口的实际余量。
+pub(super) fn notification_texts(
+    notifications: &[Notification],
+    period: &str,
+) -> Vec<(&'static str, String)> {
+    let reset_bodies: Vec<_> = notifications
+        .iter()
+        .filter(|notification| matches!(notification, Notification::Reset { .. }))
+        .map(|notification| notification.balloon_text(period).1)
+        .collect();
+    let mut reset_sent = false;
+    notifications
+        .iter()
+        .filter_map(|notification| {
+            if matches!(notification, Notification::Reset { .. }) {
+                if reset_sent {
+                    return None;
+                }
+                reset_sent = true;
+                Some(("额度已重置", reset_bodies.join("；")))
+            } else {
+                Some(notification.balloon_text(period))
+            }
+        })
+        .collect()
+}
+
 /// 窗口名与「窗口」之间的分隔：`5h` 这种拉丁结尾加一个空格才不挤，
 /// 纯中文的「周」「月」「3天」不加（中文之间塞空格反而别扭）。
 fn window_separator(window: &str) -> &'static str {
@@ -115,8 +145,10 @@ pub(super) struct NotifyOutcome {
 /// 通知判定状态。随 overlay 存活，`reset()` 在释放资源时清空。
 #[derive(Debug, Default)]
 pub(super) struct Notifier {
-    /// 上一次看到的快照；用于比较重置时间是否前移。
+    /// 常规换窗的比较基准；各窗口的重置时间只前进，避免迟到的旧周期覆盖它。
     observed: Option<QuotaSnapshot>,
+    /// 本地日志不携带账号身份，不能替换提前重置比较用的服务端快照。
+    observed_authenticated: Option<QuotaSnapshot>,
     /// 上一次真正观测到的时刻（墙上时钟）。休眠、断网、跟随模式收起都会
     /// 让它与当前时间拉开距离——那是"我们没在看"，不是"刚刚发生"。
     observed_at: Option<SystemTime>,
@@ -135,6 +167,7 @@ impl Notifier {
     /// 释放额度查询资源时调用：丢掉上一次快照，避免下次激活时比出假重置。
     pub(super) fn reset(&mut self) {
         self.observed = None;
+        self.observed_authenticated = None;
         self.observed_at = None;
         self.overflow_armed = false;
         self.period = None;
@@ -152,7 +185,6 @@ impl Notifier {
         refresh_interval: Duration,
         now: SystemTime,
     ) -> NotifyOutcome {
-        let mut notifications = Vec::new();
         let mut state_dirty = false;
 
         // 观测中断（休眠、断网拉不到快照、跟随模式收起）：这段时间里发生的
@@ -165,35 +197,8 @@ impl Notifier {
             self.overflow_armed = false;
         }
 
-        if let Some(next) = snapshot {
-            // 重置通知另有一道"数据连续性"检查：只有两次快照本身相隔够近，
-            // 才敢说这是刚刚换窗，而不是我们错过了中间的窗口。
-            let blind_gap = self.observed.as_ref().map_or(Duration::ZERO, |previous| {
-                next.received_at
-                    .duration_since(previous.received_at)
-                    .unwrap_or_default()
-            });
-            if let Some(previous) = self.observed.as_ref()
-                && !interrupted
-                && blind_gap <= blind_gap_limit(refresh_interval)
-            {
-                // 重置通知要的是"现在可以用了"。另一个窗口仍然打满时这次换窗
-                // 没换来任何可用容量（账号照样发不出请求），"剩余 99%"就是一句
-                // 假承诺——周额度打满后每 5 小时一次的滚动都属于这一档。真正
-                // 恢复可用的那次换窗新快照不再 blocked，照常提醒。
-                if !next.is_blocked(now) {
-                    for window in reset_windows(previous, next) {
-                        if switches.reset {
-                            notifications.push(Notification::Reset {
-                                window: window.window_short_label(),
-                                remaining_percent: window.remaining_percent(),
-                            });
-                        }
-                    }
-                }
-            }
-            self.observed = Some(next.clone());
-        }
+        let mut notifications =
+            self.observe_resets(snapshot, switches.reset, refresh_interval, now, interrupted);
 
         let period = snapshot.and_then(period_key);
         if period != self.period {
@@ -234,6 +239,136 @@ impl Notifier {
             state_dirty,
         }
     }
+
+    fn observe_resets(
+        &mut self,
+        snapshot: Option<&QuotaSnapshot>,
+        enabled: bool,
+        refresh_interval: Duration,
+        now: SystemTime,
+        interrupted: bool,
+    ) -> Vec<Notification> {
+        let Some(next) = snapshot else {
+            return Vec::new();
+        };
+        let limit = blind_gap_limit(refresh_interval);
+        let mut windows = Vec::new();
+        // 另一个窗口仍触顶时，换窗没有恢复可用容量，不发送重置通知。
+        if enabled && !interrupted && !next.is_blocked(now) {
+            if let Some(previous) = self.observed.as_ref()
+                && continuous_snapshots(previous, next, limit, now)
+                && !matches!(
+                    (&previous.account_id, &next.account_id),
+                    (Some(previous), Some(next)) if previous != next
+                )
+            {
+                windows = reset_windows(previous, next);
+            }
+            if let Some(previous) = self.observed_authenticated.as_ref()
+                && next.account_id.is_some()
+                && previous.account_id == next.account_id
+                && continuous_snapshots(previous, next, limit, now)
+            {
+                for window in restored_windows(previous, next, now) {
+                    if !windows.contains(&window) {
+                        windows.push(window);
+                    }
+                }
+            }
+        }
+        let notifications = windows
+            .into_iter()
+            .map(|window| Notification::Reset {
+                window: window.window_short_label(),
+                remaining_percent: window.remaining_percent(),
+            })
+            .collect();
+        if self
+            .observed
+            .as_ref()
+            .is_none_or(|previous| next.received_at >= previous.received_at)
+        {
+            self.observed = Some(reset_baseline(self.observed.as_ref(), next));
+        }
+        // 重复发布、旧快照和未知账号都不覆盖这个比较起点。
+        if next.account_id.is_some()
+            && self
+                .observed_authenticated
+                .as_ref()
+                .is_none_or(|previous| next.received_at > previous.received_at)
+        {
+            self.observed_authenticated = Some(next.clone());
+        }
+        notifications
+    }
+}
+
+/// 日志写入时间可能晚于 RPC，但仍携带旧周期。只为常规换窗保留各窗口见过的
+/// 最晚边界；提前重置仍比较未经合并的服务端快照，显示数据也不受影响。
+fn reset_baseline(previous: Option<&QuotaSnapshot>, next: &QuotaSnapshot) -> QuotaSnapshot {
+    let mut baseline = next.clone();
+    let Some(previous) = previous.filter(|previous| {
+        previous.limit_id == next.limit_id
+            && !matches!(
+                (&previous.account_id, &next.account_id),
+                (Some(previous), Some(next)) if previous != next
+            )
+    }) else {
+        return baseline;
+    };
+    for window in std::iter::once(&mut baseline.primary).chain(baseline.secondary.iter_mut()) {
+        if let Some(previous) = std::iter::once(&previous.primary)
+            .chain(previous.secondary.iter())
+            .find(|previous| previous.window_duration == window.window_duration)
+        {
+            window.resets_at = window.resets_at.max(previous.resets_at);
+        }
+    }
+    // 未知身份的本地日志不抹去已知账号，后续确认切号时才能重建比较基准。
+    if baseline.account_id.is_none() {
+        baseline.account_id.clone_from(&previous.account_id);
+    }
+    baseline
+}
+
+fn continuous_snapshots(
+    previous: &QuotaSnapshot,
+    next: &QuotaSnapshot,
+    limit: Duration,
+    now: SystemTime,
+) -> bool {
+    previous.limit_id == next.limit_id
+        && next.received_at > previous.received_at
+        && next
+            .received_at
+            .duration_since(previous.received_at)
+            .is_ok_and(|gap| gap <= limit)
+        && now
+            .duration_since(next.received_at)
+            .is_ok_and(|age| age <= limit)
+}
+
+fn restored_windows<'a>(
+    previous: &QuotaSnapshot,
+    next: &'a QuotaSnapshot,
+    now: SystemTime,
+) -> Vec<&'a QuotaWindow> {
+    let (previous_short, previous_long) = previous.quota_windows();
+    let (next_short, next_long) = next.quota_windows();
+    [(previous_short, next_short), (previous_long, next_long)]
+        .into_iter()
+        .filter_map(|(previous, next)| {
+            let (previous, next) = (previous?, next?);
+            (previous.window_duration == next.window_duration
+                && !window_reset(previous, next)
+                && !next.has_expired(now)
+                && (0.0..=100.0).contains(&previous.used_percent)
+                && (0.0..=RESTORED_MAX_USED).contains(&next.used_percent)
+                && previous.used_percent - next.used_percent >= RESTORED_MIN_DROP
+                && next.resets_at >= previous.resets_at)
+                .then_some(next)
+        })
+        .collect()
 }
 
 /// 盲区上限：至少 15 分钟，同时要放得下用户设置的刷新间隔，否则按时长
@@ -257,9 +392,8 @@ fn reset_windows<'a>(previous: &'a QuotaSnapshot, next: &'a QuotaSnapshot) -> Ve
 
 /// 服务端是否把这个窗口换成了下一个周期：重置时间恰好前移一个窗口长度。
 ///
-/// 只看"已过重置时间"或"百分比回落"都会误判——切账号同样会让百分比暴跌，
-/// 只有边界整整前移一个周期才是换窗的直接证据。窗口长度变了则说明是换套餐
-/// 或换账号，同样不算重置。
+/// 这是常规换窗的证据；百分比回落的提前重置另由同账号服务端快照判断。
+/// 窗口长度变化不在此处视为重置。
 fn window_reset(previous: &QuotaWindow, next: &QuotaWindow) -> bool {
     if previous.window_duration != next.window_duration {
         return false;
@@ -351,6 +485,7 @@ mod tests {
         received_at: SystemTime,
     ) -> QuotaSnapshot {
         QuotaSnapshot {
+            account_id: None,
             limit_id: "codex".to_owned(),
             primary: short,
             secondary: long,
@@ -417,6 +552,341 @@ mod tests {
                 now,
             )
             .notifications
+    }
+
+    #[test]
+    fn unified_reset_notifies_once() {
+        // 2026-10-15 本机真实观测：剩余 92% / 48% 同时恢复 100%，
+        // 两个重置时间均未推进完整周期。
+        let mut previous = snapshot(
+            window(
+                8.0,
+                FIVE_HOURS,
+                UNIX_EPOCH + Duration::from_secs(1_792_061_393),
+            ),
+            Some(window(
+                52.0,
+                WEEK,
+                UNIX_EPOCH + Duration::from_secs(1_792_472_647),
+            )),
+            UNIX_EPOCH + Duration::from_secs(1_792_044_682),
+        );
+        previous.account_id = Some("account-a".to_owned());
+        let mut next = snapshot(
+            window(
+                0.0,
+                FIVE_HOURS,
+                UNIX_EPOCH + Duration::from_secs(1_792_063_248),
+            ),
+            Some(window(
+                0.0,
+                WEEK,
+                UNIX_EPOCH + Duration::from_secs(1_792_650_048),
+            )),
+            UNIX_EPOCH + Duration::from_secs(1_792_045_256),
+        );
+        next.account_id.clone_from(&previous.account_id);
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        assert!(observe(&mut notifier, &mut state, &previous, Some(0.0)).is_empty());
+
+        // 本地日志先到，不可借用上一个服务端查询的身份直接通知。
+        let mut local = next.clone();
+        local.account_id = None;
+        assert!(observe(&mut notifier, &mut state, &local, Some(0.0)).is_empty());
+        let notifications = observe(&mut notifier, &mut state, &next, Some(0.0));
+        assert_eq!(
+            notifications,
+            vec![
+                Notification::Reset {
+                    window: "5h".to_owned(),
+                    remaining_percent: 100.0
+                },
+                Notification::Reset {
+                    window: "周".to_owned(),
+                    remaining_percent: 100.0
+                },
+            ]
+        );
+        assert_eq!(
+            notification_texts(&notifications, "本周"),
+            vec![(
+                "额度已重置",
+                "5h 窗口已重置，当前剩余 100%；周窗口已重置，当前剩余 100%".to_owned(),
+            )]
+        );
+        assert!(observe(&mut notifier, &mut state, &next, Some(0.0)).is_empty());
+        // 再次刷新、以及晚到的旧快照，都不能重复触发。
+        next.received_at += Duration::from_mins(2);
+        assert!(observe(&mut notifier, &mut state, &next, Some(0.0)).is_empty());
+        assert!(observe(&mut notifier, &mut state, &previous, Some(0.0)).is_empty());
+        next.received_at += Duration::from_mins(2);
+        assert!(observe(&mut notifier, &mut state, &next, Some(0.0)).is_empty());
+    }
+
+    #[test]
+    fn local_rollover_prevents_rpc_duplicate() {
+        let start = base();
+        let mut previous = snapshot(
+            window(80.0, FIVE_HOURS, start + Duration::from_mins(5)),
+            None,
+            start,
+        );
+        previous.account_id = Some("account-a".to_owned());
+        let mut next = previous.clone();
+        next.primary.used_percent = 0.0;
+        next.primary.resets_at += FIVE_HOURS;
+        next.received_at += Duration::from_mins(6);
+        next.account_id = None;
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        observe(&mut notifier, &mut state, &previous, Some(0.0));
+        assert_eq!(
+            observe(&mut notifier, &mut state, &next, Some(0.0)).len(),
+            1
+        );
+        next.account_id.clone_from(&previous.account_id);
+        next.received_at += Duration::from_secs(1);
+        assert!(observe(&mut notifier, &mut state, &next, Some(0.0)).is_empty());
+    }
+
+    #[test]
+    fn late_old_window_cannot_repeat_reset() {
+        // 2026-10-29：13:34:40 RPC 已见新周期，13:34:43 的日志仍带旧周期，
+        // 13:34:45 RPC 再见同一新周期；日志时间更新不代表额度周期更新。
+        for (authenticated, boundary_drift) in [(false, 0), (false, 2), (true, 0)] {
+            let reset = UNIX_EPOCH + Duration::from_secs(1_793_252_078);
+            let mut previous = snapshot(
+                window(9.0, FIVE_HOURS, reset),
+                Some(window(
+                    10.0,
+                    WEEK,
+                    UNIX_EPOCH + Duration::from_secs(1_793_776_477),
+                )),
+                reset - Duration::from_secs(8),
+            );
+            previous.account_id = Some("account-a".to_owned());
+            let mut next = previous.clone();
+            next.received_at = reset + Duration::from_secs(2);
+            next.primary = window(0.0, FIVE_HOURS, reset + FIVE_HOURS + Duration::from_secs(5));
+            let mut notifier = Notifier::default();
+            let mut state = NotifyState::default();
+            observe(&mut notifier, &mut state, &previous, None);
+            assert_eq!(observe(&mut notifier, &mut state, &next, None).len(), 1);
+
+            let mut late = previous.clone();
+            late.received_at = reset + Duration::from_secs(5);
+            late.primary.used_percent = 10.0;
+            if !authenticated {
+                late.account_id = None;
+            }
+            assert!(observe(&mut notifier, &mut state, &late, None).is_empty());
+            next.received_at = reset + Duration::from_secs(7);
+            next.primary.resets_at += Duration::from_secs(boundary_drift);
+            assert!(
+                observe(&mut notifier, &mut state, &next, None).is_empty(),
+                "authenticated={authenticated}, boundary_drift={boundary_drift}"
+            );
+
+            // 下一次真正换窗仍正常通知。
+            next.received_at = next.primary.resets_at - Duration::from_secs(1);
+            assert!(observe(&mut notifier, &mut state, &next, None).is_empty());
+            next.received_at += Duration::from_secs(2);
+            next.primary.resets_at += FIVE_HOURS;
+            assert_eq!(observe(&mut notifier, &mut state, &next, None).len(), 1);
+        }
+    }
+
+    #[test]
+    fn reset_baseline_follows_scope_changes() {
+        for scope in ["account", "bucket", "duration"] {
+            let start = base();
+            let mut previous = snapshot(window(80.0, FIVE_HOURS, start + FIVE_HOURS), None, start);
+            previous.account_id = Some("account-a".to_owned());
+            let mut notifier = Notifier::default();
+            let mut state = NotifyState::default();
+            observe(&mut notifier, &mut state, &previous, None);
+            let mut local = previous.clone();
+            local.account_id = None;
+            local.received_at += Duration::from_secs(1);
+            observe(&mut notifier, &mut state, &local, None);
+
+            let mut next = previous.clone();
+            next.received_at += Duration::from_secs(2);
+            next.primary.resets_at = start + Duration::from_secs(5);
+            match scope {
+                "account" => next.account_id = Some("account-b".to_owned()),
+                "bucket" => next.limit_id = "other".to_owned(),
+                "duration" => next.primary.window_duration = HOUR,
+                _ => unreachable!(),
+            }
+            assert!(observe(&mut notifier, &mut state, &next, None).is_empty());
+            next.received_at += Duration::from_secs(4);
+            next.primary.resets_at += next.primary.window_duration;
+            next.primary.used_percent = 0.0;
+            assert_eq!(
+                observe(&mut notifier, &mut state, &next, None).len(),
+                1,
+                "{scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn regressed_short_preserves_weekly_reset() {
+        let start = base();
+        let mut previous = snapshot(
+            window(80.0, FIVE_HOURS, start + Duration::from_secs(5)),
+            Some(window(80.0, WEEK, start + Duration::from_secs(10))),
+            start,
+        );
+        previous.account_id = Some("account-a".to_owned());
+        let mut next = previous.clone();
+        next.received_at += Duration::from_secs(6);
+        next.primary.used_percent = 0.0;
+        next.primary.resets_at += FIVE_HOURS;
+        let mut notifier = Notifier::default();
+        let mut state = NotifyState::default();
+        observe(&mut notifier, &mut state, &previous, None);
+        assert_eq!(observe(&mut notifier, &mut state, &next, None).len(), 1);
+
+        let mut late = previous.clone();
+        late.received_at += Duration::from_secs(11);
+        late.account_id = None;
+        late.secondary.as_mut().unwrap().used_percent = 0.0;
+        late.secondary.as_mut().unwrap().resets_at += WEEK;
+        assert_eq!(
+            observe(&mut notifier, &mut state, &late, None),
+            vec![Notification::Reset {
+                window: "周".to_owned(),
+                remaining_percent: 100.0,
+            }]
+        );
+        next.received_at += Duration::from_secs(6);
+        next.secondary = late.secondary;
+        assert!(observe(&mut notifier, &mut state, &next, None).is_empty());
+    }
+
+    #[test]
+    fn early_reset_accepts_small_usage() {
+        for (used, moved_boundary) in [(0.0, false), (1.0, false), (1.0, true)] {
+            let start = base();
+            let mut previous = snapshot(window(40.0, FIVE_HOURS, start + HOUR * 3), None, start);
+            previous.account_id = Some("account-a".to_owned());
+            let mut next = previous.clone();
+            next.received_at += Duration::from_mins(5);
+            next.primary.used_percent = used;
+            if moved_boundary {
+                next.primary.resets_at = next.received_at + FIVE_HOURS;
+            }
+            let mut notifier = Notifier::default();
+            let mut state = NotifyState::default();
+            observe(&mut notifier, &mut state, &previous, Some(0.0));
+            let notifications = observe(&mut notifier, &mut state, &next, Some(0.0));
+            assert_eq!(
+                notifications,
+                vec![Notification::Reset {
+                    window: "5h".to_owned(),
+                    remaining_percent: 100.0 - used,
+                }],
+                "used={used} moved_boundary={moved_boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn early_reset_rejects_uncertain_changes() {
+        for label in [
+            "different-account",
+            "missing-before-account",
+            "missing-after-account",
+            "small-drop",
+            "not-full",
+            "changed-duration",
+            "reversed-boundary",
+            "blind-gap",
+            "stale-data",
+            "expired",
+            "blocked",
+            "bucket-changed",
+            "disabled",
+        ] {
+            let start = base();
+            let mut previous = snapshot(window(40.0, FIVE_HOURS, start + HOUR * 3), None, start);
+            previous.account_id = Some("account-a".to_owned());
+            let mut next = previous.clone();
+            next.received_at += Duration::from_mins(5);
+            next.primary.used_percent = 0.0;
+            next.primary.resets_at = next.received_at + FIVE_HOURS;
+            let mut now = next.received_at;
+            let mut switches = switches();
+            match label {
+                "different-account" => next.account_id = Some("account-b".to_owned()),
+                "missing-before-account" => previous.account_id = None,
+                "missing-after-account" => next.account_id = None,
+                "small-drop" => previous.primary.used_percent = 4.0,
+                "not-full" => next.primary.used_percent = 2.0,
+                "changed-duration" => next.primary.window_duration = HOUR * 10,
+                "reversed-boundary" => next.primary.resets_at = start + HOUR * 2,
+                "blind-gap" => {
+                    next.received_at += HOUR;
+                    now = next.received_at;
+                }
+                "stale-data" => now += HOUR,
+                "expired" => next.primary.resets_at = start,
+                "blocked" => next.secondary = Some(window(100.0, WEEK, start + WEEK)),
+                "bucket-changed" => next.limit_id = "other".to_owned(),
+                "disabled" => switches.reset = false,
+                _ => unreachable!(),
+            }
+            let mut notifier = Notifier::default();
+            let mut state = NotifyState::default();
+            observe(&mut notifier, &mut state, &previous, Some(0.0));
+            let result = notifier.observe(
+                &mut state,
+                Some(&next),
+                Some(0.0),
+                switches,
+                Duration::from_mins(5),
+                now,
+            );
+            assert!(
+                result.notifications.is_empty(),
+                "{label}: {:?}",
+                result.notifications
+            );
+            // 关闭开关时也消费这次恢复，之后打开不补发。
+            next.received_at = now + Duration::from_mins(1);
+            assert!(
+                observe(&mut notifier, &mut state, &next, Some(0.0)).is_empty(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_balloon_preserves_each_window() {
+        let notifications = vec![
+            Notification::Reset {
+                window: "5h".to_owned(),
+                remaining_percent: 99.0,
+            },
+            Notification::Reset {
+                window: "周".to_owned(),
+                remaining_percent: 100.0,
+            },
+            Notification::Overflow { credits: 1.0 },
+        ];
+        let texts = notification_texts(&notifications, "本周");
+        assert_eq!(texts.len(), 2);
+        assert_eq!(
+            texts[0],
+            (
+                "额度已重置",
+                "5h 窗口已重置，当前剩余 99%；周窗口已重置，当前剩余 100%".to_owned()
+            )
+        );
+        assert_eq!(texts[1], notifications[2].balloon_text("本周"));
     }
 
     #[test]
